@@ -1,5 +1,5 @@
 /**
- * Model Manager -- Manages LLM (Ollama), STT (Granite/Whisper), and TTS (Piper) models.
+ * Model Manager -- Manages LLM (Ollama), STT (Granite/Whisper), and TTS (Kokoro/Piper) models.
  *
  * Default STT: IBM Granite 4.0 1B Speech (#1 OpenASR, keyword biasing, Apache 2.0)
  * Fallback STT: faster-whisper (can be enabled if Granite is not preferred)
@@ -175,9 +175,12 @@ export class ModelManager {
     this.config = this.defaultConfig();
   }
 
+  // Default LLM to auto-pull on first boot if no LLM is configured
+  private static readonly DEFAULT_LLM = "qwen3.5:9b";
+
   private defaultConfig(): ModelConfig {
     return {
-      activeLLM: null,
+      activeLLM: { provider: "ollama", model: ModelManager.DEFAULT_LLM },
       activeSTT: { provider: "granite", model: "ibm-granite/granite-4.0-1b-speech" },
       activeTTS: { provider: "kokoro", voice: "af_heart" },
       installedModels: {
@@ -200,6 +203,93 @@ export class ModelManager {
 
     await this.loadConfig();
     console.log("[model-manager] Initialized. Config loaded from", CONFIG_PATH);
+
+    // Auto-pull default LLM on first boot if no LLM models are installed
+    this.autoPullDefaultLLM().catch((err) => {
+      console.error("[model-manager] Auto-pull default LLM failed:", err);
+    });
+  }
+
+  /**
+   * Checks if any LLM model is installed via Ollama. If not, automatically
+   * pulls the default model (qwen3.5:9b) so the voiceserver is ready for
+   * calls immediately after first boot.
+   */
+  private async autoPullDefaultLLM(): Promise<void> {
+    const defaultModel = ModelManager.DEFAULT_LLM;
+
+    try {
+      // Check if Ollama is reachable
+      const ollamaBaseUrl = OLLAMA_URL.replace(/\/v1\/?$/, "");
+      const tagsRes = await fetch(`${ollamaBaseUrl}/api/tags`, {
+        signal: AbortSignal.timeout(5000),
+      });
+
+      if (!tagsRes.ok) {
+        console.warn("[model-manager] Ollama not reachable, skipping auto-pull");
+        return;
+      }
+
+      const data = (await tagsRes.json()) as {
+        models?: Array<{ name: string }>;
+      };
+      const installedModels = (data.models || []).map((m) => m.name);
+
+      // Check if default model (or any variant of it) is already installed
+      const hasDefault = installedModels.some(
+        (m) => m === defaultModel || m.startsWith(defaultModel.split(":")[0])
+      );
+
+      if (hasDefault) {
+        console.log(`[model-manager] Default LLM "${defaultModel}" already installed`);
+        // Ensure it's set as active
+        if (!this.config.activeLLM) {
+          const exactMatch = installedModels.find((m) => m === defaultModel) || installedModels[0];
+          this.config.activeLLM = { provider: "ollama", model: exactMatch };
+          await this.saveConfig();
+        }
+        return;
+      }
+
+      if (installedModels.length > 0) {
+        console.log(
+          `[model-manager] Found ${installedModels.length} LLM model(s) already installed, skipping auto-pull`
+        );
+        // Set first installed model as active if none set
+        if (!this.config.activeLLM) {
+          this.config.activeLLM = { provider: "ollama", model: installedModels[0] };
+          await this.saveConfig();
+        }
+        return;
+      }
+
+      // No models installed -- pull the default
+      console.log(`[model-manager] No LLM models installed. Auto-pulling "${defaultModel}"...`);
+      console.log(`[model-manager] This may take a few minutes on first boot.`);
+
+      const result = await this.pullLLMModel(defaultModel, (status, completed, total) => {
+        if (status === "downloading" && completed && total) {
+          const pct = Math.round((completed / total) * 100);
+          if (pct % 10 === 0) {
+            console.log(`[model-manager] Auto-pull ${defaultModel}: ${pct}%`);
+          }
+        }
+      });
+
+      if (result.success) {
+        console.log(`[model-manager] Auto-pull complete. Activating "${defaultModel}"...`);
+        await this.activateLLM(defaultModel);
+        console.log(`[model-manager] Default LLM "${defaultModel}" is ready for calls`);
+      } else {
+        console.error(`[model-manager] Auto-pull failed: ${result.error}`);
+        console.error(`[model-manager] You can manually pull a model via POST /models/llm/pull`);
+      }
+    } catch (err) {
+      console.warn(
+        `[model-manager] Auto-pull skipped (Ollama may not be running yet):`,
+        err instanceof Error ? err.message : String(err)
+      );
+    }
   }
 
   private async loadConfig(): Promise<void> {

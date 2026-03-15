@@ -17,6 +17,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Ollama (LLM inference server)
+RUN curl -fsSL https://ollama.com/install.sh | sh
+
 # Install faster-whisper CLI
 RUN pip3 install --no-cache-dir faster-whisper
 
@@ -52,6 +55,10 @@ RUN mkdir -p /models/piper && \
     wget -q "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json" \
       -O /models/piper/en_US-lessac-medium.onnx.json
 
+# Pre-pull default LLM (qwen3.5:9b -- best balance of speed + intelligence for sales calls)
+# Ollama needs to be running to pull, so we start it temporarily
+RUN ollama serve & sleep 3 && ollama pull qwen3.5:9b && kill %1 2>/dev/null || true
+
 # Set up app directory
 WORKDIR /app
 
@@ -80,6 +87,27 @@ ENV GRANITE_MODELS_DIR=/models/granite
 ENV KOKORO_MODELS_DIR=/models/kokoro
 ENV KOKORO_VOICE=af_heart
 ENV CLONED_VOICES_DIR=/data/cloned-voices
+ENV OLLAMA_URL=http://localhost:11434/v1
+ENV DEFAULT_LLM=qwen3.5:9b
 ENV NODE_ENV=production
 
-CMD ["node", "dist/index.js"]
+# Create startup script that launches Ollama + voiceserver together
+RUN echo '#!/bin/bash\n\
+echo "[entrypoint] Starting Ollama server..."\n\
+ollama serve &\n\
+OLLAMA_PID=$!\n\
+\n\
+# Wait for Ollama to be ready\n\
+for i in $(seq 1 30); do\n\
+  if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then\n\
+    echo "[entrypoint] Ollama is ready"\n\
+    break\n\
+  fi\n\
+  sleep 1\n\
+done\n\
+\n\
+echo "[entrypoint] Starting voiceserver..."\n\
+exec node dist/index.js\n\
+' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
+CMD ["/app/entrypoint.sh"]

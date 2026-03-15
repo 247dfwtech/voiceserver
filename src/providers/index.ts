@@ -14,7 +14,7 @@ import { modelManager } from "../model-manager";
  *
  * Free-first defaults:
  *   STT: IBM Granite 4.0 1B Speech (faster-whisper as fallback option)
- *   LLM: Ollama
+ *   LLM: Ollama (qwen3.5:9b default, auto-pulled on first boot)
  *   TTS: Kokoro-82M (Piper as fallback)
  * Optional paid providers are supported if API keys are present.
  */

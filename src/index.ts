@@ -71,8 +71,10 @@ console.log(`[voice-server] Ollama URL: ${OLLAMA_URL}`);
 console.log(`[voice-server] VapiClone API: ${VAPICLONE_API_URL || "(not configured)"}`);
 console.log(`[voice-server] -----------------------------------------------`);
 
-// Initialize model manager (loads config, creates data dir)
-modelManager.initialize().catch((err) => {
+// Initialize model manager (loads config, creates data dir, auto-pulls default LLM)
+modelManager.initialize().then(() => {
+  console.log("[voice-server] Model manager ready (default LLM: qwen3.5:9b)");
+}).catch((err) => {
   console.error("[voice-server] Model manager initialization failed:", err);
 });
 
