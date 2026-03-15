@@ -79,6 +79,7 @@ ENV WHISPER_MODEL=base.en
 ENV GRANITE_MODELS_DIR=/models/granite
 ENV KOKORO_MODELS_DIR=/models/kokoro
 ENV KOKORO_VOICE=af_heart
+ENV CLONED_VOICES_DIR=/data/cloned-voices
 ENV NODE_ENV=production
 
 CMD ["node", "dist/index.js"]

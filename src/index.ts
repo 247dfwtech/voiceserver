@@ -18,6 +18,7 @@ import { CallSession, type CallSessionConfig, type CostBreakdown } from "./voice
 import { runPostCallAnalysis } from "./voice-pipeline/analysis-runner";
 import { transferCallWithDial } from "./voice-pipeline/call-transfer";
 import { modelManager } from "./model-manager";
+import { voiceCloneManager } from "./providers/tts/kokoclone";
 
 // ---- Configuration ----
 
@@ -892,6 +893,193 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
+  // ---- Voice Cloning (KokoClone) Endpoints ----
+
+  // GET /voice-clone/status -- Check if KokoClone is installed
+  if (req.method === "GET" && url.pathname === "/voice-clone/status") {
+    voiceCloneManager
+      .isInstalled()
+      .then(async (installed) => {
+        const voices = await voiceCloneManager.listClonedVoices();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ installed, voices, count: voices.length }));
+      })
+      .catch((err) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      });
+    return;
+  }
+
+  // POST /voice-clone/install -- Install KokoClone dependencies
+  if (req.method === "POST" && url.pathname === "/voice-clone/install") {
+    voiceCloneManager
+      .install()
+      .then((result) => {
+        if (result.success) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, message: "KokoClone installed successfully" }));
+        } else {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: result.error }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      });
+    return;
+  }
+
+  // POST /voice-clone/uninstall -- Uninstall KokoClone dependencies
+  if (req.method === "POST" && url.pathname === "/voice-clone/uninstall") {
+    voiceCloneManager
+      .uninstall()
+      .then((result) => {
+        if (result.success) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, message: "KokoClone uninstalled" }));
+        } else {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: result.error }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      });
+    return;
+  }
+
+  // GET /voice-clone/voices -- List all cloned voices
+  if (req.method === "GET" && url.pathname === "/voice-clone/voices") {
+    voiceCloneManager
+      .listClonedVoices()
+      .then((voices) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ voices }));
+      })
+      .catch((err) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      });
+    return;
+  }
+
+  // POST /voice-clone/create -- Upload reference audio and create a cloned voice
+  // Expects multipart-like JSON: { name: string, audio: base64, filename: string }
+  if (req.method === "POST" && url.pathname === "/voice-clone/create") {
+    readBody(req, 10_000_000) // 10MB max for audio upload
+      .then(async (body) => {
+        const { name, audio, filename } = JSON.parse(body);
+
+        if (!name || !audio) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing 'name' and 'audio' (base64) in request body" }));
+          return;
+        }
+
+        // Decode base64 audio
+        const audioBuffer = Buffer.from(audio, "base64");
+
+        if (audioBuffer.length < 1000) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Audio file too small. Need 3-10 seconds of clear speech." }));
+          return;
+        }
+
+        if (audioBuffer.length > 5_000_000) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Audio file too large (max 5MB). Use a 3-10 second clip." }));
+          return;
+        }
+
+        const result = await voiceCloneManager.createClonedVoice(
+          name,
+          audioBuffer,
+          filename || "reference.wav"
+        );
+
+        if (result.success) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, voice: result.voice }));
+        } else {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: result.error }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
+      });
+    return;
+  }
+
+  // DELETE /voice-clone/voices/:id -- Delete a cloned voice
+  if (req.method === "DELETE" && url.pathname.startsWith("/voice-clone/voices/")) {
+    const voiceId = decodeURIComponent(url.pathname.slice("/voice-clone/voices/".length));
+    if (!voiceId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing voice ID in URL" }));
+      return;
+    }
+
+    voiceCloneManager
+      .deleteClonedVoice(voiceId)
+      .then((result) => {
+        if (result.success) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, deleted: voiceId }));
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: result.error }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      });
+    return;
+  }
+
+  // POST /voice-clone/test -- Test a cloned voice with sample text
+  if (req.method === "POST" && url.pathname === "/voice-clone/test") {
+    readBody(req, MAX_IPC_BODY_BYTES)
+      .then(async (body) => {
+        const { voiceId, text } = JSON.parse(body);
+
+        if (!voiceId || !text) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing 'voiceId' and 'text' in request body" }));
+          return;
+        }
+
+        try {
+          const { KokoCloneTTS: KCT } = await import("./providers/tts/kokoclone");
+          const tts = new KCT({ provider: "kokoclone", voiceId, speed: 1.0 });
+          const audio = await tts.synthesize(text);
+
+          // Return base64-encoded WAV-like PCM
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            ok: true,
+            audio: audio.toString("base64"),
+            sampleRate: 16000,
+            format: "pcm_s16le",
+            durationMs: Math.round((audio.length / 2) / 16000 * 1000),
+          }));
+        } catch (err) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
+      });
+    return;
+  }
+
   res.writeHead(404);
   res.end("Not found");
 }
@@ -899,7 +1087,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
 const ipcServer = createServer(handleIPC);
 // Bind to 0.0.0.0 so it's accessible from Railway and other external services
 ipcServer.listen(IPC_PORT, "0.0.0.0", () => {
-  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /sessions, /metrics, /register-call, /end-call/:id`);
+  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /sessions, /metrics, /register-call, /end-call/:id, /voice-clone/*`);
 });
 
 // ---- Call Config Registration ----
