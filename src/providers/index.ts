@@ -2,6 +2,7 @@ import type { STTConfig, STTProvider } from "./stt/interface";
 import type { TTSConfig, TTSProvider } from "./tts/interface";
 import type { LLMConfig, LLMProvider } from "./llm/interface";
 import { WhisperSTT } from "./stt/whisper";
+import { GraniteSTT } from "./stt/granite";
 import { OpenAICompatLLM } from "./llm/openai-compat";
 import { PiperTTS } from "./tts/piper";
 import { modelManager } from "../model-manager";
@@ -9,43 +10,49 @@ import { modelManager } from "../model-manager";
 /**
  * Provider factory functions.
  *
- * Free-first: defaults to Whisper (STT), Ollama (LLM), and Piper (TTS).
+ * Free-first defaults:
+ *   STT: IBM Granite 4.0 1B Speech (faster-whisper as fallback option)
+ *   LLM: Ollama
+ *   TTS: Piper
  * Optional paid providers are supported if API keys are present.
  */
 
 export function createSTTProvider(config: STTConfig): STTProvider {
-  // Use active STT model from model-manager as default if not specified in config
-  if (!config.model) {
+  // Use active STT from model-manager as default if not specified in config
+  if (!config.model && !config.provider) {
     const activeSTT = modelManager.getActiveSTT();
+    const activeProvider = modelManager.getActiveSTTProvider();
     if (activeSTT) {
-      config = { ...config, model: activeSTT };
-      console.log(`[providers] Using model-manager active STT model: ${activeSTT}`);
+      config = { ...config, model: activeSTT, provider: activeProvider || "granite" };
+      console.log(`[providers] Using model-manager active STT: ${activeProvider}/${activeSTT}`);
     }
   }
 
   switch (config.provider) {
     case "deepgram": {
-      // Dynamically import Deepgram only if requested and API key is available
       const apiKey = process.env.DEEPGRAM_API_KEY;
       if (!apiKey) {
-        console.warn("[providers] Deepgram requested but DEEPGRAM_API_KEY not set, falling back to Whisper");
-        return new WhisperSTT(config);
+        console.warn("[providers] Deepgram requested but no API key, falling back to Granite");
+        return new GraniteSTT(config);
       }
-      // Lazy require to avoid needing the SDK installed when not used
       try {
         const { DeepgramSTT } = require("./stt/deepgram");
         return new DeepgramSTT(config, apiKey);
       } catch {
-        console.warn("[providers] @deepgram/sdk not installed, falling back to Whisper");
-        return new WhisperSTT(config);
+        console.warn("[providers] @deepgram/sdk not installed, falling back to Granite");
+        return new GraniteSTT(config);
       }
     }
     case "whisper":
     case "faster-whisper":
       return new WhisperSTT(config);
+    case "granite":
+    case "granite-speech":
+    case "ibm-granite":
+      return new GraniteSTT(config);
     default:
-      // Default to Whisper (free)
-      return new WhisperSTT(config);
+      // Default to Granite (free, #1 OpenASR, keyword biasing for names)
+      return new GraniteSTT(config);
   }
 }
 

@@ -1,5 +1,8 @@
 /**
- * Model Manager -- Manages LLM (Ollama), STT (Whisper), and TTS (Piper) models.
+ * Model Manager -- Manages LLM (Ollama), STT (Granite/Whisper), and TTS (Piper) models.
+ *
+ * Default STT: IBM Granite 4.0 1B Speech (#1 OpenASR, keyword biasing, Apache 2.0)
+ * Fallback STT: faster-whisper (can be enabled if Granite is not preferred)
  *
  * Tracks installed models, active selections, and provides install/remove/activate operations.
  * Persists state to DATA_DIR/model-config.json.
@@ -13,6 +16,7 @@ import { exec } from "child_process";
 
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const WHISPER_MODELS_DIR = process.env.WHISPER_MODELS_DIR || "/models/whisper";
+const GRANITE_MODELS_DIR = process.env.GRANITE_MODELS_DIR || "/models/granite";
 const PIPER_MODELS_DIR = process.env.PIPER_MODELS_DIR || "/models/piper";
 const OLLAMA_URL = (process.env.OLLAMA_URL || "http://localhost:11434/v1").replace(/\/v1\/?$/, "");
 const CONFIG_PATH = path.join(DATA_DIR, "model-config.json");
@@ -28,13 +32,20 @@ export interface InstalledModel {
 
 export interface ModelConfig {
   activeLLM: { provider: "ollama"; model: string } | null;
-  activeSTT: { provider: "whisper"; model: string } | null;
+  activeSTT: { provider: "granite" | "whisper"; model: string } | null;
   activeTTS: { provider: "piper"; voice: string } | null;
   installedModels: {
     llm: Array<{ name: string; size: string; provider: "ollama"; installedAt: string }>;
-    stt: Array<{ name: string; size: string; provider: "whisper"; installedAt: string }>;
+    stt: Array<{ name: string; size: string; provider: "granite" | "whisper"; installedAt: string }>;
     tts: Array<{ name: string; size: string; provider: "piper"; installedAt: string }>;
   };
+}
+
+export interface STTModelInfo {
+  name: string;
+  size: string;
+  description: string;
+  provider: "granite" | "whisper";
 }
 
 export interface WhisperModelInfo {
@@ -64,6 +75,17 @@ const WHISPER_MODEL_CATALOG: WhisperModelInfo[] = [
   { name: "medium.en", size: "769MB", description: "High accuracy, English only" },
   { name: "large-v3", size: "1.5GB", description: "Best accuracy, multilingual" },
   { name: "turbo", size: "809MB", description: "Fast + accurate, multilingual" },
+];
+
+// ---- Hardcoded Granite STT model catalog ----
+
+const GRANITE_MODEL_CATALOG: STTModelInfo[] = [
+  {
+    name: "ibm-granite/granite-4.0-1b-speech",
+    size: "~2GB",
+    description: "#1 OpenASR leaderboard, keyword biasing, Apache 2.0 (DEFAULT)",
+    provider: "granite",
+  },
 ];
 
 // ---- Common Piper voices catalog ----
@@ -113,7 +135,7 @@ export class ModelManager {
   private defaultConfig(): ModelConfig {
     return {
       activeLLM: null,
-      activeSTT: null,
+      activeSTT: { provider: "granite", model: "ibm-granite/granite-4.0-1b-speech" },
       activeTTS: null,
       installedModels: {
         llm: [],
@@ -182,6 +204,10 @@ export class ModelManager {
     return this.config.activeSTT?.model ?? null;
   }
 
+  getActiveSTTProvider(): string | null {
+    return this.config.activeSTT?.provider ?? null;
+  }
+
   getActiveTTS(): string | null {
     return this.config.activeTTS?.voice ?? null;
   }
@@ -196,7 +222,7 @@ export class ModelManager {
       tts: Array<InstalledModel & { active: boolean }>;
     };
     available: {
-      stt: WhisperModelInfo[];
+      stt: STTModelInfo[];
       tts: typeof PIPER_VOICE_CATALOG;
     };
   }> {
@@ -226,7 +252,10 @@ export class ModelManager {
         })),
       },
       available: {
-        stt: WHISPER_MODEL_CATALOG,
+        stt: [
+          ...GRANITE_MODEL_CATALOG,
+          ...WHISPER_MODEL_CATALOG.map((m) => ({ ...m, provider: "whisper" as const })),
+        ],
         tts: PIPER_VOICE_CATALOG,
       },
     };
@@ -415,12 +444,53 @@ export class ModelManager {
     return { success: true };
   }
 
-  // ---- STT Management (Whisper) ----
+  // ---- STT Management (Granite + Whisper) ----
 
   async listSTTModels(): Promise<Array<InstalledModel & { active: boolean }>> {
-    const activeSTTName = this.config.activeSTT?.model ?? null;
+    const activeSTT = this.config.activeSTT;
     const installed: Array<InstalledModel & { active: boolean }> = [];
 
+    // Check for installed Granite models
+    try {
+      const graniteEntries = await fs.promises.readdir(GRANITE_MODELS_DIR, { withFileTypes: true });
+      for (const entry of graniteEntries) {
+        if (entry.isDirectory()) {
+          const catalogEntry = GRANITE_MODEL_CATALOG.find((c) => entry.name.includes(c.name.split("/").pop()!));
+          const modelName = catalogEntry?.name || `ibm-granite/${entry.name}`;
+          installed.push({
+            name: modelName,
+            size: catalogEntry?.size || "unknown",
+            provider: "granite",
+            installedAt: "",
+            active: activeSTT?.provider === "granite" && activeSTT?.model === modelName,
+          });
+        }
+      }
+    } catch {
+      // Directory may not exist yet
+    }
+
+    // Also check for Granite via Python (model cached by HuggingFace transformers)
+    if (installed.filter((m) => m.provider === "granite").length === 0) {
+      try {
+        const { stdout } = await runCommand(
+          `python3 -c "from transformers import AutoProcessor; AutoProcessor.from_pretrained('ibm-granite/granite-4.0-1b-speech', local_files_only=True); print('ok')" 2>/dev/null`
+        );
+        if (stdout.includes("ok")) {
+          installed.push({
+            name: "ibm-granite/granite-4.0-1b-speech",
+            size: "~2GB",
+            provider: "granite",
+            installedAt: "",
+            active: activeSTT?.provider === "granite" && activeSTT?.model === "ibm-granite/granite-4.0-1b-speech",
+          });
+        }
+      } catch {
+        // Granite not installed via transformers cache
+      }
+    }
+
+    // Check for installed Whisper models
     try {
       const entries = await fs.promises.readdir(WHISPER_MODELS_DIR, { withFileTypes: true });
       for (const entry of entries) {
@@ -428,7 +498,6 @@ export class ModelManager {
           const catalogEntry = WHISPER_MODEL_CATALOG.find((c) => entry.name.includes(c.name));
           const modelName = catalogEntry?.name || entry.name;
 
-          // Get directory size (approximate)
           let size = catalogEntry?.size || "unknown";
           try {
             const stat = await fs.promises.stat(path.join(WHISPER_MODELS_DIR, entry.name));
@@ -444,7 +513,7 @@ export class ModelManager {
             size,
             provider: "whisper",
             installedAt: "",
-            active: modelName === activeSTTName,
+            active: activeSTT?.provider === "whisper" && activeSTT?.model === modelName,
           });
         }
       }
@@ -452,11 +521,11 @@ export class ModelManager {
       // Directory may not exist yet
     }
 
-    // Also sync the config's installed list
+    // Sync the config's installed list
     this.config.installedModels.stt = installed.map((m) => ({
       name: m.name,
       size: m.size,
-      provider: "whisper" as const,
+      provider: m.provider as "granite" | "whisper",
       installedAt: m.installedAt,
     }));
     await this.saveConfig();
@@ -464,12 +533,64 @@ export class ModelManager {
     return installed;
   }
 
-  getSTTCatalog(): WhisperModelInfo[] {
-    return WHISPER_MODEL_CATALOG;
+  getSTTCatalog(): STTModelInfo[] {
+    return [
+      ...GRANITE_MODEL_CATALOG,
+      ...WHISPER_MODEL_CATALOG.map((m) => ({ ...m, provider: "whisper" as const })),
+    ];
   }
 
-  async installSTTModel(name: string): Promise<{ success: boolean; error?: string }> {
-    // Validate model name
+  async installSTTModel(
+    name: string,
+    provider?: "granite" | "whisper"
+  ): Promise<{ success: boolean; error?: string }> {
+    // Auto-detect provider from model name
+    const isGranite = provider === "granite" || name.includes("granite");
+
+    if (isGranite) {
+      return this.installGraniteModel(name);
+    }
+    return this.installWhisperModel(name);
+  }
+
+  private async installGraniteModel(name: string): Promise<{ success: boolean; error?: string }> {
+    const modelId = name.includes("/") ? name : "ibm-granite/granite-4.0-1b-speech";
+
+    try {
+      console.log(`[model-manager] Installing Granite STT model: ${modelId}`);
+
+      // Download model via HuggingFace transformers (caches automatically)
+      const cmd = `python3 -c "
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+print('Downloading processor...')
+AutoProcessor.from_pretrained('${modelId}', trust_remote_code=True)
+print('Downloading model...')
+AutoModelForSpeechSeq2Seq.from_pretrained('${modelId}', trust_remote_code=True)
+print('ok')
+"`;
+      await runCommand(cmd);
+
+      console.log(`[model-manager] Granite STT model ${modelId} installed successfully`);
+
+      const existing = this.config.installedModels.stt.find((m) => m.name === modelId);
+      if (!existing) {
+        this.config.installedModels.stt.push({
+          name: modelId,
+          size: "~2GB",
+          provider: "granite",
+          installedAt: new Date().toISOString(),
+        });
+      }
+      await this.saveConfig();
+      return { success: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[model-manager] Granite STT install failed for ${modelId}:`, msg);
+      return { success: false, error: msg };
+    }
+  }
+
+  private async installWhisperModel(name: string): Promise<{ success: boolean; error?: string }> {
     const validModel = WHISPER_MODEL_CATALOG.find((m) => m.name === name);
     if (!validModel) {
       return {
@@ -479,17 +600,15 @@ export class ModelManager {
     }
 
     try {
-      console.log(`[model-manager] Installing STT model: ${name}`);
+      console.log(`[model-manager] Installing Whisper STT model: ${name}`);
 
-      // Ensure whisper models dir exists
       await fs.promises.mkdir(WHISPER_MODELS_DIR, { recursive: true });
 
       const cmd = `python3 -c "from faster_whisper import WhisperModel; WhisperModel('${name}', download_root='${WHISPER_MODELS_DIR}')"`;
       await runCommand(cmd);
 
-      console.log(`[model-manager] STT model ${name} installed successfully`);
+      console.log(`[model-manager] Whisper STT model ${name} installed successfully`);
 
-      // Update config
       const existing = this.config.installedModels.stt.find((m) => m.name === name);
       if (!existing) {
         this.config.installedModels.stt.push({
@@ -500,32 +619,68 @@ export class ModelManager {
         });
       }
       await this.saveConfig();
-
       return { success: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[model-manager] STT install failed for ${name}:`, msg);
+      console.error(`[model-manager] Whisper STT install failed for ${name}:`, msg);
       return { success: false, error: msg };
     }
   }
 
   async deleteSTTModel(name: string): Promise<{ success: boolean; error?: string }> {
+    const isGranite = name.includes("granite");
+
     try {
-      // Find the model directory
-      const entries = await fs.promises.readdir(WHISPER_MODELS_DIR, { withFileTypes: true });
       let deleted = false;
 
-      for (const entry of entries) {
-        if (entry.isDirectory() && (entry.name === name || entry.name.includes(name))) {
-          const modelPath = path.join(WHISPER_MODELS_DIR, entry.name);
-          await fs.promises.rm(modelPath, { recursive: true, force: true });
-          console.log(`[model-manager] Deleted STT model directory: ${modelPath}`);
+      if (isGranite) {
+        // For Granite, clear the HuggingFace transformers cache for this model
+        try {
+          const cmd = `python3 -c "
+from huggingface_hub import scan_cache_dir
+cache = scan_cache_dir()
+for repo in cache.repos:
+    if '${name.split('/').pop()}' in repo.repo_id:
+        for revision in repo.revisions:
+            print(f'Deleting {repo.repo_id}')
+            revision.delete()
+print('ok')
+"`;
+          await runCommand(cmd);
           deleted = true;
+          console.log(`[model-manager] Deleted Granite STT model cache: ${name}`);
+        } catch {
+          // Also try deleting from GRANITE_MODELS_DIR if it exists
+        }
+
+        // Also check GRANITE_MODELS_DIR
+        try {
+          const entries = await fs.promises.readdir(GRANITE_MODELS_DIR, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.isDirectory() && entry.name.includes(name.split("/").pop()!)) {
+              const modelPath = path.join(GRANITE_MODELS_DIR, entry.name);
+              await fs.promises.rm(modelPath, { recursive: true, force: true });
+              deleted = true;
+            }
+          }
+        } catch {
+          // Directory may not exist
+        }
+      } else {
+        // Whisper model deletion
+        const entries = await fs.promises.readdir(WHISPER_MODELS_DIR, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && (entry.name === name || entry.name.includes(name))) {
+            const modelPath = path.join(WHISPER_MODELS_DIR, entry.name);
+            await fs.promises.rm(modelPath, { recursive: true, force: true });
+            console.log(`[model-manager] Deleted Whisper STT model directory: ${modelPath}`);
+            deleted = true;
+          }
         }
       }
 
       if (!deleted) {
-        return { success: false, error: `STT model "${name}" not found in ${WHISPER_MODELS_DIR}` };
+        return { success: false, error: `STT model "${name}" not found` };
       }
 
       // Clear active if it was the deleted model
@@ -546,8 +701,33 @@ export class ModelManager {
     }
   }
 
-  async activateSTT(name: string): Promise<{ success: boolean; error?: string }> {
-    // Check if model is installed (check filesystem)
+  async activateSTT(
+    name: string,
+    provider?: "granite" | "whisper"
+  ): Promise<{ success: boolean; error?: string }> {
+    const isGranite = provider === "granite" || name.includes("granite");
+
+    if (isGranite) {
+      // Check if Granite model is available (in catalog or installed)
+      const inCatalog = GRANITE_MODEL_CATALOG.some((m) => m.name === name);
+      const inInstalled = this.config.installedModels.stt.some(
+        (m) => m.name === name && m.provider === "granite"
+      );
+
+      if (!inCatalog && !inInstalled) {
+        return {
+          success: false,
+          error: `Granite STT model "${name}" is not recognized. Available: ${GRANITE_MODEL_CATALOG.map((m) => m.name).join(", ")}`,
+        };
+      }
+
+      this.config.activeSTT = { provider: "granite", model: name };
+      await this.saveConfig();
+      console.log(`[model-manager] Active STT set to Granite: ${name}`);
+      return { success: true };
+    }
+
+    // Whisper activation
     let found = false;
     try {
       const entries = await fs.promises.readdir(WHISPER_MODELS_DIR, { withFileTypes: true });
@@ -558,7 +738,6 @@ export class ModelManager {
       // Directory doesn't exist
     }
 
-    // Also accept if it's a valid catalog model (it may download on first use)
     const inCatalog = WHISPER_MODEL_CATALOG.some((m) => m.name === name);
 
     if (!found && !inCatalog) {
@@ -570,7 +749,7 @@ export class ModelManager {
 
     this.config.activeSTT = { provider: "whisper", model: name };
     await this.saveConfig();
-    console.log(`[model-manager] Active STT set to: ${name}`);
+    console.log(`[model-manager] Active STT set to Whisper: ${name}`);
     return { success: true };
   }
 
@@ -776,14 +955,22 @@ export class ModelManager {
     type: "llm" | "stt" | "tts"
   ): Promise<HuggingFaceSearchResult[]> {
     if (type === "stt") {
-      // Return hardcoded Whisper model list
-      return WHISPER_MODEL_CATALOG.map((m) => ({
+      // Return Granite + Whisper model lists
+      const graniteResults = GRANITE_MODEL_CATALOG.map((m) => ({
+        id: m.name,
+        name: m.name.split("/").pop() || m.name,
+        downloads: 0,
+        likes: 0,
+        description: `[GRANITE] ${m.description} (${m.size})`,
+      }));
+      const whisperResults = WHISPER_MODEL_CATALOG.map((m) => ({
         id: `openai/whisper-${m.name}`,
         name: m.name,
         downloads: 0,
         likes: 0,
-        description: `${m.description} (${m.size})`,
+        description: `[WHISPER] ${m.description} (${m.size})`,
       }));
+      return [...graniteResults, ...whisperResults];
     }
 
     try {

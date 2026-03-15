@@ -14,10 +14,13 @@ services:
       - VAPICLONE_API_KEY=${VAPICLONE_API_KEY}
       - IPC_SECRET=${IPC_SECRET}
       - PIPER_MODELS_DIR=/models/piper
+      - GRANITE_MODELS_DIR=/models/granite
       - WHISPER_MODEL=base.en
     volumes:
       - piper-models:/models/piper
       - whisper-models:/models/whisper
+      - granite-models:/models/granite
+      - hf-cache:/root/.cache/huggingface
     depends_on:
       - ollama
     restart: unless-stopped
@@ -41,3 +44,5 @@ volumes:
   ollama-data:
   piper-models:
   whisper-models:
+  granite-models:
+  hf-cache:

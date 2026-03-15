@@ -23,7 +23,17 @@ RUN pip3 install --no-cache-dir faster-whisper
 # Install piper-tts
 RUN pip3 install --no-cache-dir piper-tts
 
-# Pre-download the default Whisper model
+# Install Granite STT dependencies (transformers + torch + soundfile)
+RUN pip3 install --no-cache-dir transformers torch soundfile huggingface_hub
+
+# Pre-download the default Granite STT model (ibm-granite/granite-4.0-1b-speech)
+RUN python3 -c "\
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor; \
+AutoProcessor.from_pretrained('ibm-granite/granite-4.0-1b-speech', trust_remote_code=True); \
+AutoModelForSpeechSeq2Seq.from_pretrained('ibm-granite/granite-4.0-1b-speech', trust_remote_code=True); \
+print('Granite STT model downloaded')"
+
+# Pre-download the default Whisper model (kept as fallback)
 RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('base.en')"
 
 # Download default Piper voice
@@ -57,6 +67,7 @@ ENV WS_PORT=8765
 ENV IPC_PORT=8766
 ENV PIPER_MODELS_DIR=/models/piper
 ENV WHISPER_MODEL=base.en
+ENV GRANITE_MODELS_DIR=/models/granite
 ENV NODE_ENV=production
 
 CMD ["node", "dist/index.js"]
