@@ -5,6 +5,7 @@ import { WhisperSTT } from "./stt/whisper";
 import { GraniteSTT } from "./stt/granite";
 import { OpenAICompatLLM } from "./llm/openai-compat";
 import { PiperTTS } from "./tts/piper";
+import { KokoroTTS } from "./tts/kokoro";
 import { modelManager } from "../model-manager";
 
 /**
@@ -13,7 +14,7 @@ import { modelManager } from "../model-manager";
  * Free-first defaults:
  *   STT: IBM Granite 4.0 1B Speech (faster-whisper as fallback option)
  *   LLM: Ollama
- *   TTS: Piper
+ *   TTS: Kokoro-82M (Piper as fallback)
  * Optional paid providers are supported if API keys are present.
  */
 
@@ -57,12 +58,13 @@ export function createSTTProvider(config: STTConfig): STTProvider {
 }
 
 export function createTTSProvider(config: TTSConfig): TTSProvider {
-  // Use active TTS voice from model-manager as default if not specified in config
-  if (!config.voiceId) {
+  // Use active TTS from model-manager as default if not specified in config
+  if (!config.voiceId && !config.provider) {
     const activeTTS = modelManager.getActiveTTS();
+    const activeTTSProvider = modelManager.getActiveTTSProvider();
     if (activeTTS) {
-      config = { ...config, voiceId: activeTTS };
-      console.log(`[providers] Using model-manager active TTS voice: ${activeTTS}`);
+      config = { ...config, voiceId: activeTTS, provider: activeTTSProvider || "kokoro" };
+      console.log(`[providers] Using model-manager active TTS: ${activeTTSProvider}/${activeTTS}`);
     }
   }
 
@@ -71,22 +73,25 @@ export function createTTSProvider(config: TTSConfig): TTSProvider {
     case "11labs": {
       const apiKey = process.env.ELEVENLABS_API_KEY;
       if (!apiKey) {
-        console.warn("[providers] ElevenLabs requested but ELEVENLABS_API_KEY not set, falling back to Piper");
-        return new PiperTTS(config);
+        console.warn("[providers] ElevenLabs requested but ELEVENLABS_API_KEY not set, falling back to Kokoro");
+        return new KokoroTTS(config);
       }
       try {
         const { ElevenLabsTTS } = require("./tts/elevenlabs");
         return new ElevenLabsTTS(config, apiKey);
       } catch {
-        console.warn("[providers] ElevenLabs module not available, falling back to Piper");
-        return new PiperTTS(config);
+        console.warn("[providers] ElevenLabs module not available, falling back to Kokoro");
+        return new KokoroTTS(config);
       }
     }
+    case "kokoro":
+    case "kokoro-82m":
+      return new KokoroTTS(config);
     case "piper":
       return new PiperTTS(config);
     default:
-      // Default to Piper (free)
-      return new PiperTTS(config);
+      // Default to Kokoro (free, #1 TTS Arena, near-human quality)
+      return new KokoroTTS(config);
   }
 }
 

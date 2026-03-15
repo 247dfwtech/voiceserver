@@ -4,6 +4,9 @@
  * Default STT: IBM Granite 4.0 1B Speech (#1 OpenASR, keyword biasing, Apache 2.0)
  * Fallback STT: faster-whisper (can be enabled if Granite is not preferred)
  *
+ * Default TTS: Kokoro-82M (#1 TTS Arena, near-human quality, Apache 2.0)
+ * Fallback TTS: Piper (ultra-lightweight CPU option)
+ *
  * Tracks installed models, active selections, and provides install/remove/activate operations.
  * Persists state to DATA_DIR/model-config.json.
  */
@@ -18,6 +21,7 @@ const DATA_DIR = process.env.DATA_DIR || "/data";
 const WHISPER_MODELS_DIR = process.env.WHISPER_MODELS_DIR || "/models/whisper";
 const GRANITE_MODELS_DIR = process.env.GRANITE_MODELS_DIR || "/models/granite";
 const PIPER_MODELS_DIR = process.env.PIPER_MODELS_DIR || "/models/piper";
+const KOKORO_MODELS_DIR = process.env.KOKORO_MODELS_DIR || "/models/kokoro";
 const OLLAMA_URL = (process.env.OLLAMA_URL || "http://localhost:11434/v1").replace(/\/v1\/?$/, "");
 const CONFIG_PATH = path.join(DATA_DIR, "model-config.json");
 
@@ -33,11 +37,11 @@ export interface InstalledModel {
 export interface ModelConfig {
   activeLLM: { provider: "ollama"; model: string } | null;
   activeSTT: { provider: "granite" | "whisper"; model: string } | null;
-  activeTTS: { provider: "piper"; voice: string } | null;
+  activeTTS: { provider: "kokoro" | "piper"; voice: string } | null;
   installedModels: {
     llm: Array<{ name: string; size: string; provider: "ollama"; installedAt: string }>;
     stt: Array<{ name: string; size: string; provider: "granite" | "whisper"; installedAt: string }>;
-    tts: Array<{ name: string; size: string; provider: "piper"; installedAt: string }>;
+    tts: Array<{ name: string; size: string; provider: "kokoro" | "piper"; installedAt: string }>;
   };
 }
 
@@ -88,15 +92,54 @@ const GRANITE_MODEL_CATALOG: STTModelInfo[] = [
   },
 ];
 
-// ---- Common Piper voices catalog ----
+// ---- Kokoro-82M voice catalog (default TTS) ----
 
-const PIPER_VOICE_CATALOG = [
-  { name: "en_US-lessac-medium", description: "Female, natural", quality: "medium" },
-  { name: "en_US-lessac-high", description: "Female, high quality", quality: "high" },
-  { name: "en_US-amy-medium", description: "Female", quality: "medium" },
-  { name: "en_US-ryan-medium", description: "Male", quality: "medium" },
-  { name: "en_US-arctic-medium", description: "Multiple speakers", quality: "medium" },
-  { name: "en_US-libritts_r-medium", description: "Multiple speakers", quality: "medium" },
+export interface TTSVoiceInfo {
+  name: string;
+  description: string;
+  provider: "kokoro" | "piper";
+  gender?: string;
+  accent?: string;
+}
+
+const KOKORO_VOICE_CATALOG: TTSVoiceInfo[] = [
+  // American Female
+  { name: "af_heart", description: "Heart — Warm, natural (DEFAULT)", provider: "kokoro", gender: "female", accent: "american" },
+  { name: "af_alloy", description: "Alloy — Clear, professional", provider: "kokoro", gender: "female", accent: "american" },
+  { name: "af_aoede", description: "Aoede — Melodic, engaging", provider: "kokoro", gender: "female", accent: "american" },
+  { name: "af_bella", description: "Bella — Friendly, approachable", provider: "kokoro", gender: "female", accent: "american" },
+  { name: "af_jessica", description: "Jessica — Confident, articulate", provider: "kokoro", gender: "female", accent: "american" },
+  { name: "af_kore", description: "Kore — Youthful, energetic", provider: "kokoro", gender: "female", accent: "american" },
+  { name: "af_nicole", description: "Nicole — Smooth, calm", provider: "kokoro", gender: "female", accent: "american" },
+  { name: "af_nova", description: "Nova — Bright, modern", provider: "kokoro", gender: "female", accent: "american" },
+  { name: "af_river", description: "River — Flowing, pleasant", provider: "kokoro", gender: "female", accent: "american" },
+  { name: "af_sarah", description: "Sarah — Conversational", provider: "kokoro", gender: "female", accent: "american" },
+  { name: "af_sky", description: "Sky — Light, airy", provider: "kokoro", gender: "female", accent: "american" },
+  // American Male
+  { name: "am_adam", description: "Adam — Deep, authoritative", provider: "kokoro", gender: "male", accent: "american" },
+  { name: "am_echo", description: "Echo — Rich, resonant", provider: "kokoro", gender: "male", accent: "american" },
+  { name: "am_eric", description: "Eric — Professional, clear", provider: "kokoro", gender: "male", accent: "american" },
+  { name: "am_fenrir", description: "Fenrir — Strong, commanding", provider: "kokoro", gender: "male", accent: "american" },
+  { name: "am_liam", description: "Liam — Warm, trustworthy", provider: "kokoro", gender: "male", accent: "american" },
+  { name: "am_michael", description: "Michael — Versatile, natural", provider: "kokoro", gender: "male", accent: "american" },
+  { name: "am_onyx", description: "Onyx — Smooth, deep", provider: "kokoro", gender: "male", accent: "american" },
+  // British Female
+  { name: "bf_emma", description: "Emma — British, refined", provider: "kokoro", gender: "female", accent: "british" },
+  { name: "bf_isabella", description: "Isabella — British, elegant", provider: "kokoro", gender: "female", accent: "british" },
+  // British Male
+  { name: "bm_george", description: "George — British, distinguished", provider: "kokoro", gender: "male", accent: "british" },
+  { name: "bm_lewis", description: "Lewis — British, casual", provider: "kokoro", gender: "male", accent: "british" },
+];
+
+// ---- Common Piper voices catalog (fallback TTS) ----
+
+const PIPER_VOICE_CATALOG: TTSVoiceInfo[] = [
+  { name: "en_US-lessac-medium", description: "Female, natural (medium)", provider: "piper" },
+  { name: "en_US-lessac-high", description: "Female, high quality", provider: "piper" },
+  { name: "en_US-amy-medium", description: "Female (medium)", provider: "piper" },
+  { name: "en_US-ryan-medium", description: "Male (medium)", provider: "piper" },
+  { name: "en_US-arctic-medium", description: "Multiple speakers (medium)", provider: "piper" },
+  { name: "en_US-libritts_r-medium", description: "Multiple speakers (medium)", provider: "piper" },
 ];
 
 // ---- Helper: format bytes to human-readable ----
@@ -136,7 +179,7 @@ export class ModelManager {
     return {
       activeLLM: null,
       activeSTT: { provider: "granite", model: "ibm-granite/granite-4.0-1b-speech" },
-      activeTTS: null,
+      activeTTS: { provider: "kokoro", voice: "af_heart" },
       installedModels: {
         llm: [],
         stt: [],
@@ -212,6 +255,10 @@ export class ModelManager {
     return this.config.activeTTS?.voice ?? null;
   }
 
+  getActiveTTSProvider(): string | null {
+    return this.config.activeTTS?.provider ?? null;
+  }
+
   async getFullStatus(): Promise<{
     activeLLM: ModelConfig["activeLLM"];
     activeSTT: ModelConfig["activeSTT"];
@@ -223,7 +270,7 @@ export class ModelManager {
     };
     available: {
       stt: STTModelInfo[];
-      tts: typeof PIPER_VOICE_CATALOG;
+      tts: TTSVoiceInfo[];
     };
   }> {
     // Sync with Ollama to get the real list
@@ -256,7 +303,10 @@ export class ModelManager {
           ...GRANITE_MODEL_CATALOG,
           ...WHISPER_MODEL_CATALOG.map((m) => ({ ...m, provider: "whisper" as const })),
         ],
-        tts: PIPER_VOICE_CATALOG,
+        tts: [
+          ...KOKORO_VOICE_CATALOG,
+          ...PIPER_VOICE_CATALOG,
+        ],
       },
     };
   }
@@ -753,12 +803,34 @@ print('ok')
     return { success: true };
   }
 
-  // ---- TTS Management (Piper) ----
+  // ---- TTS Management (Kokoro + Piper) ----
 
   async listTTSVoices(): Promise<Array<InstalledModel & { active: boolean }>> {
-    const activeTTSName = this.config.activeTTS?.voice ?? null;
+    const activeTTS = this.config.activeTTS;
     const installed: Array<InstalledModel & { active: boolean }> = [];
 
+    // Check for installed Kokoro (kokoro Python package)
+    try {
+      const { stdout } = await runCommand(
+        `python3 -c "import kokoro; print('ok')" 2>/dev/null`
+      );
+      if (stdout.includes("ok")) {
+        // Kokoro is installed -- all voices are available
+        for (const voice of KOKORO_VOICE_CATALOG) {
+          installed.push({
+            name: voice.name,
+            size: "~200MB (shared)",
+            provider: "kokoro",
+            installedAt: "",
+            active: activeTTS?.provider === "kokoro" && activeTTS?.voice === voice.name,
+          });
+        }
+      }
+    } catch {
+      // Kokoro package not installed
+    }
+
+    // Check for installed Piper voices
     try {
       const entries = await fs.promises.readdir(PIPER_MODELS_DIR);
       const onnxFiles = entries.filter((e) => e.endsWith(".onnx"));
@@ -778,7 +850,7 @@ print('ok')
           size,
           provider: "piper",
           installedAt: "",
-          active: voiceName === activeTTSName,
+          active: activeTTS?.provider === "piper" && activeTTS?.voice === voiceName,
         });
       }
     } catch {
@@ -789,7 +861,7 @@ print('ok')
     this.config.installedModels.tts = installed.map((m) => ({
       name: m.name,
       size: m.size,
-      provider: "piper" as const,
+      provider: m.provider as "kokoro" | "piper",
       installedAt: m.installedAt,
     }));
     await this.saveConfig();
@@ -797,13 +869,56 @@ print('ok')
     return installed;
   }
 
-  getTTSCatalog(): typeof PIPER_VOICE_CATALOG {
-    return PIPER_VOICE_CATALOG;
+  getTTSCatalog(): TTSVoiceInfo[] {
+    return [...KOKORO_VOICE_CATALOG, ...PIPER_VOICE_CATALOG];
   }
 
-  async installTTSVoice(name: string): Promise<{ success: boolean; error?: string }> {
+  async installTTSVoice(
+    name: string,
+    provider?: "kokoro" | "piper"
+  ): Promise<{ success: boolean; error?: string }> {
+    // Auto-detect provider
+    const isKokoro = provider === "kokoro" || KOKORO_VOICE_CATALOG.some((v) => v.name === name);
+
+    if (isKokoro) {
+      return this.installKokoroTTS();
+    }
+
+    return this.installPiperVoice(name);
+  }
+
+  private async installKokoroTTS(): Promise<{ success: boolean; error?: string }> {
     try {
-      console.log(`[model-manager] Installing TTS voice: ${name}`);
+      console.log(`[model-manager] Installing Kokoro-82M TTS...`);
+
+      // Install the kokoro Python package (includes model weights)
+      const cmd = `pip3 install --no-cache-dir kokoro>=0.9 soundfile`;
+      await runCommand(cmd);
+
+      console.log(`[model-manager] Kokoro-82M TTS installed successfully`);
+
+      // All Kokoro voices come with the package, add first one as representative
+      const existing = this.config.installedModels.tts.find((m) => m.provider === "kokoro");
+      if (!existing) {
+        this.config.installedModels.tts.push({
+          name: "kokoro-82m",
+          size: "~200MB",
+          provider: "kokoro",
+          installedAt: new Date().toISOString(),
+        });
+      }
+      await this.saveConfig();
+      return { success: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[model-manager] Kokoro TTS install failed:`, msg);
+      return { success: false, error: msg };
+    }
+  }
+
+  private async installPiperVoice(name: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      console.log(`[model-manager] Installing Piper TTS voice: ${name}`);
 
       // Ensure piper models dir exists
       await fs.promises.mkdir(PIPER_MODELS_DIR, { recursive: true });
@@ -882,6 +997,33 @@ print('ok')
   }
 
   async deleteTTSVoice(name: string): Promise<{ success: boolean; error?: string }> {
+    const isKokoro = KOKORO_VOICE_CATALOG.some((v) => v.name === name) || name === "kokoro-82m";
+
+    if (isKokoro) {
+      try {
+        // Uninstall kokoro Python package
+        await runCommand(`pip3 uninstall -y kokoro`);
+
+        // Clear active if Kokoro was active
+        if (this.config.activeTTS?.provider === "kokoro") {
+          this.config.activeTTS = null;
+        }
+
+        // Remove all Kokoro entries from installed list
+        this.config.installedModels.tts = this.config.installedModels.tts.filter(
+          (m) => m.provider !== "kokoro"
+        );
+        await this.saveConfig();
+
+        console.log(`[model-manager] Deleted Kokoro TTS`);
+        return { success: true };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { success: false, error: msg };
+      }
+    }
+
+    // Piper voice deletion
     try {
       const onnxPath = path.join(PIPER_MODELS_DIR, `${name}.onnx`);
       const jsonPath = path.join(PIPER_MODELS_DIR, `${name}.onnx.json`);
@@ -903,7 +1045,7 @@ print('ok')
       }
 
       if (!deleted) {
-        return { success: false, error: `TTS voice "${name}" not found in ${PIPER_MODELS_DIR}` };
+        return { success: false, error: `Piper TTS voice "${name}" not found in ${PIPER_MODELS_DIR}` };
       }
 
       // Clear active if it was the deleted voice
@@ -917,7 +1059,7 @@ print('ok')
       );
       await this.saveConfig();
 
-      console.log(`[model-manager] Deleted TTS voice: ${name}`);
+      console.log(`[model-manager] Deleted Piper TTS voice: ${name}`);
       return { success: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -925,8 +1067,29 @@ print('ok')
     }
   }
 
-  async activateTTS(name: string): Promise<{ success: boolean; error?: string }> {
-    // Check if voice is installed
+  async activateTTS(
+    name: string,
+    provider?: "kokoro" | "piper"
+  ): Promise<{ success: boolean; error?: string }> {
+    const isKokoro = provider === "kokoro" || KOKORO_VOICE_CATALOG.some((v) => v.name === name);
+
+    if (isKokoro) {
+      // Validate voice ID
+      const validVoice = KOKORO_VOICE_CATALOG.some((v) => v.name === name);
+      if (!validVoice) {
+        return {
+          success: false,
+          error: `Unknown Kokoro voice "${name}". Use one of: ${KOKORO_VOICE_CATALOG.map((v) => v.name).join(", ")}`,
+        };
+      }
+
+      this.config.activeTTS = { provider: "kokoro", voice: name };
+      await this.saveConfig();
+      console.log(`[model-manager] Active TTS set to Kokoro: ${name}`);
+      return { success: true };
+    }
+
+    // Piper voice activation
     let found = false;
     try {
       await fs.promises.access(path.join(PIPER_MODELS_DIR, `${name}.onnx`));
@@ -938,13 +1101,13 @@ print('ok')
     if (!found) {
       return {
         success: false,
-        error: `TTS voice "${name}" is not installed. Install it first.`,
+        error: `Piper TTS voice "${name}" is not installed. Install it first.`,
       };
     }
 
     this.config.activeTTS = { provider: "piper", voice: name };
     await this.saveConfig();
-    console.log(`[model-manager] Active TTS set to: ${name}`);
+    console.log(`[model-manager] Active TTS set to Piper: ${name}`);
     return { success: true };
   }
 
@@ -979,7 +1142,21 @@ print('ok')
       if (type === "llm") {
         searchUrl = `https://huggingface.co/api/models?search=${encodeURIComponent(query)}&filter=gguf&sort=downloads&direction=-1&limit=20`;
       } else {
-        // TTS
+        // TTS -- return Kokoro + Piper catalog first, then search HuggingFace
+        const kokoroResults = KOKORO_VOICE_CATALOG
+          .filter((v) => v.name.includes(query.toLowerCase()) || v.description.toLowerCase().includes(query.toLowerCase()))
+          .map((v) => ({
+            id: `kokoro/${v.name}`,
+            name: v.name,
+            downloads: 0,
+            likes: 0,
+            description: `[KOKORO] ${v.description}`,
+          }));
+
+        if (kokoroResults.length > 0) {
+          return kokoroResults;
+        }
+
         searchUrl = `https://huggingface.co/api/models?search=${encodeURIComponent("piper " + query)}&author=rhasspy&sort=downloads&direction=-1&limit=20`;
       }
 

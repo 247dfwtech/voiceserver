@@ -20,11 +20,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # Install faster-whisper CLI
 RUN pip3 install --no-cache-dir faster-whisper
 
-# Install piper-tts
+# Install piper-tts (fallback TTS)
 RUN pip3 install --no-cache-dir piper-tts
 
+# Install Kokoro-82M TTS (default TTS -- #1 TTS Arena, near-human quality)
+RUN pip3 install --no-cache-dir kokoro>=0.9 soundfile
+
 # Install Granite STT dependencies (transformers + torch + soundfile)
-RUN pip3 install --no-cache-dir transformers torch soundfile huggingface_hub
+RUN pip3 install --no-cache-dir transformers torch huggingface_hub
 
 # Pre-download the default Granite STT model (ibm-granite/granite-4.0-1b-speech)
 RUN python3 -c "\
@@ -33,10 +36,16 @@ AutoProcessor.from_pretrained('ibm-granite/granite-4.0-1b-speech', trust_remote_
 AutoModelForSpeechSeq2Seq.from_pretrained('ibm-granite/granite-4.0-1b-speech', trust_remote_code=True); \
 print('Granite STT model downloaded')"
 
+# Pre-download Kokoro-82M model weights (so first TTS call is instant)
+RUN python3 -c "\
+from kokoro import KPipeline; \
+pipeline = KPipeline(lang_code='a'); \
+print('Kokoro-82M TTS model downloaded')"
+
 # Pre-download the default Whisper model (kept as fallback)
 RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('base.en')"
 
-# Download default Piper voice
+# Download default Piper voice (kept as fallback)
 RUN mkdir -p /models/piper && \
     wget -q "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx" \
       -O /models/piper/en_US-lessac-medium.onnx && \
@@ -68,6 +77,8 @@ ENV IPC_PORT=8766
 ENV PIPER_MODELS_DIR=/models/piper
 ENV WHISPER_MODEL=base.en
 ENV GRANITE_MODELS_DIR=/models/granite
+ENV KOKORO_MODELS_DIR=/models/kokoro
+ENV KOKORO_VOICE=af_heart
 ENV NODE_ENV=production
 
 CMD ["node", "dist/index.js"]
