@@ -1,0 +1,43 @@
+version: '3.8'
+services:
+  voiceserver:
+    build: .
+    ports:
+      - "8765:8765"  # WebSocket
+      - "8766:8766"  # IPC HTTP
+    environment:
+      - OLLAMA_URL=http://ollama:11434/v1
+      - OLLAMA_MODEL=llama3.1:8b
+      - WS_PORT=8765
+      - IPC_PORT=8766
+      - VAPICLONE_API_URL=${VAPICLONE_API_URL}
+      - VAPICLONE_API_KEY=${VAPICLONE_API_KEY}
+      - IPC_SECRET=${IPC_SECRET}
+      - PIPER_MODELS_DIR=/models/piper
+      - WHISPER_MODEL=base.en
+    volumes:
+      - piper-models:/models/piper
+      - whisper-models:/models/whisper
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  ollama-data:
+  piper-models:
+  whisper-models:
