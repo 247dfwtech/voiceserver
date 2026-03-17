@@ -1,6 +1,6 @@
 # VoiceServer — Claude Handoff Document
 
-**Last updated:** 2026-03-17
+**Last updated:** 2026-03-17 (rev 2)
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
@@ -54,9 +54,11 @@ It's the backend engine for VapiClone. VapiClone handles orchestration (assistan
    - Installed PM2 globally via npm
    - Cloned voiceserver repo from GitHub, ran `npm install` + `npm run build`
    - Downloaded Kokoro TTS model files (kokoro-v1.0.onnx, voices-v1.0.bin) to /models/kokoro/
-   - Installed kokoro-onnx Python package
-   - Created .env with production config
-   - Created PM2 ecosystem config with voiceserver + 2 cloudflared tunnels
+   - Installed PyTorch CUDA wheel (`pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu124`)
+   - Installed kokoro Python package (`pip3 install kokoro soundfile`)
+   - Fixed HF_HOME stale file handle: changed `/etc/environment` `HF_HOME` from `/workspace/.hf_home` to `/root/.cache/huggingface`
+   - Created .env with production config (including `HF_HOME=/root/.cache/huggingface`)
+   - Created PM2 ecosystem config with voiceserver + 2 cloudflared tunnels, HF_HOME in env
    - Configured PM2 startup persistence (`pm2 save` + `pm2 startup`)
 3. **Cloudflared tunnels running via PM2:**
    - IPC tunnel: `https://plaintiff-databases-brave-isolation.trycloudflare.com` → localhost:8766
@@ -65,6 +67,9 @@ It's the backend engine for VapiClone. VapiClone handles orchestration (assistan
 4. **Ollama added to PM2** — Managed via `start-ollama.sh` with `OLLAMA_ORIGINS=*` and `OLLAMA_HOST=0.0.0.0` to allow cloudflared tunnel access. Without these env vars, Ollama returns 403 to non-localhost requests.
 5. **VapiClone Railway env vars updated** to point to new tunnel URLs (IPC, WS, and Ollama).
 6. **Voice server confirmed Connected** in VapiClone sidebar.
+7. **Fixed Kokoro TTS timeouts** — Increased model load timeout 60s→120s and synthesis timeout 30s→90s in `src/providers/tts/kokoro.ts`. GPU cold start takes 60-90s on first call.
+8. **Fixed /tts/test spinning forever** — Added a module-level KokoroTTS singleton in `src/index.ts`. Previously each Play button click spawned a new Python subprocess (60-90s cold start, always timed out). Now the singleton is reused across preview requests.
+9. **Updated setup-gpu-server.sh** — Added HF_HOME fix, CUDA-aware PyTorch install, ollama PM2 management, all 5 PM2 processes, automatic verification checks.
 
 ---
 
@@ -96,8 +101,10 @@ It's the backend engine for VapiClone. VapiClone handles orchestration (assistan
 
 ## Gotchas and Important Context
 
+- **HF_HOME stale file handle (Critical)** — When copying a Vast.ai instance, `/etc/environment` retains `HF_HOME="/workspace/.hf_home"` but `/workspace` is a stale NFS mount. This causes `OSError: [Errno 116] Stale file handle` in any Python code downloading HuggingFace models (Kokoro, Granite, Whisper). Fix: `sed -i 's|HF_HOME=.*|HF_HOME="/root/.cache/huggingface"|g' /etc/environment`, then `pm2 delete voiceserver && pm2 start ecosystem.config.cjs --only voiceserver` (restart alone doesn't pick up /etc/environment).
+- **PyTorch CUDA wheel (Critical)** — `pip install torch` installs CPU-only version. Must use `pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu124` for GPU support. Without this, Kokoro fails with `ModuleNotFoundError: No module named 'torch'`.
 - **PM2 needs PATH set** — Node.js is at `/opt/nvm/versions/node/v24.12.0/bin`. Always set PATH before running PM2 commands: `export PATH="/opt/nvm/versions/node/v24.12.0/bin:/opt/instance-tools/bin:$PATH"`.
-- **`pm2 restart voiceserver --update-env`** — The `--update-env` flag is required when .env changes, otherwise PM2 uses cached environment from the previous start.
+- **`pm2 restart voiceserver --update-env`** vs full delete/start** — `--update-env` picks up PM2 ecosystem env changes but NOT `/etc/environment` changes. For `/etc/environment` changes, must do `pm2 delete voiceserver && pm2 start ecosystem.config.cjs --only voiceserver`.
 - **Cloudflared is at `/opt/instance-tools/bin/cloudflared`** — Pre-installed on Vast.ai instances. No need to install separately.
 - **Vast.ai "200 ports" is misleading** — Only 6 explicitly Docker-mapped ports are externally accessible (22→45194, 1111→45143, 6006→45087, 8080→45164, 8384→45035, 72299→45086). Internal ports like 8765/8766 are NOT accessible from outside despite the "200 ports" label.
 - **Tunnel URLs change on restart** — If voice server shows "Offline" in VapiClone, check `pm2 logs tunnel-ipc --lines 5 --nostream` and `pm2 logs tunnel-ws --lines 5 --nostream` for new URLs. Update Railway env vars `VOICE_SERVER_IPC_URL` and `VOICE_SERVER_URL`.

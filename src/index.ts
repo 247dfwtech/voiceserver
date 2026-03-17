@@ -54,6 +54,17 @@ let isShuttingDown = false;
 const MAX_PENDING_CONFIGS = 200;
 const MAX_IPC_BODY_BYTES = 1_000_000; // 1MB
 
+// Singleton KokoroTTS instance — keeps the Python process alive between /tts/test calls
+// so the model doesn't need to reload on every preview request (cold start is 60-90s)
+let kokoroTTSSingleton: import("./providers/tts/kokoro").KokoroTTS | null = null;
+async function getOrCreateKokoroSingleton(voiceId: string): Promise<import("./providers/tts/kokoro").KokoroTTS> {
+  const { KokoroTTS } = await import("./providers/tts/kokoro");
+  if (!kokoroTTSSingleton) {
+    kokoroTTSSingleton = new KokoroTTS({ provider: "kokoro", voiceId, speed: 1.0 });
+  }
+  return kokoroTTSSingleton;
+}
+
 // ---- WebSocket Server ----
 
 const wss = new WebSocketServer({
@@ -1098,8 +1109,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           let sampleRate: number;
 
           if (sampleProvider === "kokoro" || !sampleProvider || sampleProvider === "piper") {
-            const { KokoroTTS } = await import("./providers/tts/kokoro");
-            const tts = new KokoroTTS({ provider: "kokoro", voiceId: sampleVoice, speed: 1.0 });
+            const tts = await getOrCreateKokoroSingleton(sampleVoice);
             audioBuffer = await tts.synthesize(sampleText);
             sampleRate = 24000; // Kokoro outputs 24kHz PCM
           } else {
