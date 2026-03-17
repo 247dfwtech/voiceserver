@@ -4,7 +4,7 @@
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
-**SSH:** `ssh -p 45194 root@174.92.170.239`
+**SSH:** `ssh -p 45194 root@70.29.210.33` (direct IP — Vast.ai proxy `ssh5.vast.ai:32104` may have routing issues)
 **Server path:** /opt/voiceserver/
 
 ---
@@ -145,7 +145,7 @@ It's the backend engine for VapiClone. VapiClone handles orchestration (assistan
 | `.github/workflows/deploy.yml` | GitHub Actions — SSH into Vast.ai, git pull, build, pm2 restart |
 | `scripts/setup-gpu-server.sh` | One-click bare metal setup script |
 
-### Vast.ai GPU Server (174.92.170.239, SSH port 45194)
+### Vast.ai GPU Server (70.29.210.33, SSH port 45194)
 
 | Path | What's In It |
 |---|---|
