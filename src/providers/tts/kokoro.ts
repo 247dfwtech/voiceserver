@@ -201,16 +201,16 @@ for line in sys.stdin:
         if (!resolved) reject(new Error(`Kokoro Python process exited with code ${code}: ${stderrBuf}`));
       });
 
-      // Timeout after 60 seconds (first load downloads/loads model into GPU)
+      // Timeout after 120 seconds (first load downloads/loads model into GPU)
       setTimeout(() => {
         if (!resolved) {
           resolved = true;
           this.pythonProcess?.kill("SIGTERM");
           this.ready = false;
           this.readyPromise = null;
-          reject(new Error(`Kokoro model load timed out after 60s. stderr: ${stderrBuf}`));
+          reject(new Error(`Kokoro model load timed out after 120s. stderr: ${stderrBuf}`));
         }
-      }, 60_000);
+      }, 120_000);
     });
 
     return this.readyPromise;
@@ -271,11 +271,11 @@ for line in sys.stdin:
       // Send command
       this.pythonProcess.stdin.write(cmd + "\n");
 
-      // Timeout after 30 seconds
+      // Timeout after 90 seconds (first call loads model into GPU, can take 60s+)
       setTimeout(() => {
         this.pythonProcess?.stdout?.removeListener("data", onData);
-        reject(new Error(`Kokoro TTS timed out after 30s for text: "${text.substring(0, 50)}..."`));
-      }, 30_000);
+        reject(new Error(`Kokoro TTS timed out after 90s for text: "${text.substring(0, 50)}..."`));
+      }, 90_000);
     });
   }
 
