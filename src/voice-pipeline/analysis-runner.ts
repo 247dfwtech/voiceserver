@@ -30,7 +30,7 @@ export async function runPostCallAnalysis(
 
   // Determine which LLM to use for analysis
   const ollamaUrl = process.env.OLLAMA_URL || "http://localhost:11434/v1";
-  const ollamaModel = process.env.OLLAMA_MODEL || "llama3.1:8b";
+  const ollamaModel = process.env.DEFAULT_LLM || process.env.OLLAMA_MODEL || "qwen3.5:9b";
   const openaiKey = apiKey || process.env.OPENAI_API_KEY;
 
   // Try Ollama first (free), fall back to OpenAI
