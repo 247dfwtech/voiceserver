@@ -1083,14 +1083,83 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
+  // POST /tts/test -- Synthesize a voice sample for preview in the UI
+  // Returns base64-encoded WAV audio
+  if (req.method === "POST" && url.pathname === "/tts/test") {
+    readBody(req, MAX_IPC_BODY_BYTES)
+      .then(async (body) => {
+        const { text, voiceId, provider } = JSON.parse(body);
+        const sampleText = text || "Hello! I'm your AI assistant. How can I help you today?";
+        const sampleVoice = voiceId || "af_heart";
+        const sampleProvider = provider || "kokoro";
+
+        try {
+          let audioBuffer: Buffer;
+          let sampleRate: number;
+
+          if (sampleProvider === "kokoro" || !sampleProvider || sampleProvider === "piper") {
+            const { KokoroTTS } = await import("./providers/tts/kokoro");
+            const tts = new KokoroTTS({ provider: "kokoro", voiceId: sampleVoice, speed: 1.0 });
+            audioBuffer = await tts.synthesize(sampleText);
+            sampleRate = 24000; // Kokoro outputs 24kHz PCM
+          } else {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: `Provider '${sampleProvider}' not supported for preview` }));
+            return;
+          }
+
+          // Convert raw PCM s16le to WAV by prepending WAV header
+          const wavBuffer = pcmToWav(audioBuffer, sampleRate, 1, 16);
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            ok: true,
+            audio: wavBuffer.toString("base64"),
+            mimeType: "audio/wav",
+            sampleRate,
+            durationMs: Math.round((audioBuffer.length / 2) / sampleRate * 1000),
+          }));
+        } catch (err) {
+          console.error("[voice-server] TTS test error:", err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
+      });
+    return;
+  }
+
   res.writeHead(404);
   res.end("Not found");
+}
+
+/** Convert raw PCM (s16le) buffer to WAV format */
+function pcmToWav(pcm: Buffer, sampleRate: number, numChannels: number, bitDepth: number): Buffer {
+  const dataSize = pcm.length;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE((sampleRate * numChannels * bitDepth) / 8, 28);
+  header.writeUInt16LE((numChannels * bitDepth) / 8, 32);
+  header.writeUInt16LE(bitDepth, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, pcm]);
 }
 
 const ipcServer = createServer(handleIPC);
 // Bind to 0.0.0.0 so it's accessible from Railway and other external services
 ipcServer.listen(IPC_PORT, "0.0.0.0", () => {
-  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /sessions, /metrics, /register-call, /end-call/:id, /voice-clone/*`);
+  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /tts/test, /sessions, /metrics, /register-call, /end-call/:id, /voice-clone/*`);
 });
 
 // ---- Call Config Registration ----
