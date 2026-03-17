@@ -315,6 +315,7 @@ async function notifyCallEnded(
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${VAPICLONE_API_KEY}`,
+        ...(IPC_SECRET ? { "x-ipc-secret": IPC_SECRET } : {}),
       },
       body: JSON.stringify({
         type: "end-of-call-report",
@@ -1094,6 +1095,37 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
+  // GET /logs -- Return recent log lines for real-time debugging from vapiclone UI
+  if (req.method === "GET" && url.pathname === "/logs") {
+    import("fs").then(async (fs) => {
+      const lines = parseInt(url.searchParams.get("lines") || "100", 10);
+      const type = url.searchParams.get("type") || "all"; // "out", "error", or "all"
+      try {
+        const readLastLines = (filePath: string, n: number): string[] => {
+          try {
+            const content = fs.readFileSync(filePath, "utf8");
+            const all = content.split("\n").filter(Boolean);
+            return all.slice(-n);
+          } catch { return []; }
+        };
+        const outLines = (type === "all" || type === "out")
+          ? readLastLines("/var/log/voiceserver/out.log", lines)
+          : [];
+        const errLines = (type === "all" || type === "error")
+          ? readLastLines("/var/log/voiceserver/error.log", lines)
+          : [];
+        // Merge and sort by timestamp prefix
+        const merged = [...outLines, ...errLines].sort();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, lines: merged.slice(-lines), total: merged.length }));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: String(err) }));
+      }
+    });
+    return;
+  }
+
   // POST /tts/test -- Synthesize a voice sample for preview in the UI
   // Returns base64-encoded WAV audio
   if (req.method === "POST" && url.pathname === "/tts/test") {
@@ -1112,6 +1144,15 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
             const tts = await getOrCreateKokoroSingleton(sampleVoice);
             audioBuffer = await tts.synthesize(sampleText, undefined, sampleVoice);
             sampleRate = 16000; // synthesize returns 16kHz after resampling
+
+            // If synthesis returned empty audio (e.g. voice pack 404 from HuggingFace),
+            // reset the singleton so the next request starts a fresh Python process.
+            if (audioBuffer.length === 0) {
+              kokoroTTSSingleton = null;
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "TTS synthesis returned empty audio. Voice pack may still be downloading — try again in 10s." }));
+              return;
+            }
           } else {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: `Provider '${sampleProvider}' not supported for preview` }));
@@ -1130,6 +1171,8 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
             durationMs: Math.round((audioBuffer.length / 2) / sampleRate * 1000),
           }));
         } catch (err) {
+          // Reset singleton on error so next request gets a fresh Python process
+          kokoroTTSSingleton = null;
           console.error("[voice-server] TTS test error:", err);
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));

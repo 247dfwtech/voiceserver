@@ -34,7 +34,10 @@ export class GraniteSTT extends EventEmitter implements STTProvider {
   constructor(config: STTConfig) {
     super();
     this.config = config;
-    this.modelId = config.model || "ibm-granite/granite-4.0-1b-speech";
+    // Only use config.model if it looks like a valid HuggingFace ID (contains '/').
+    // Reject Deepgram/Vapi model names like "flux-general-en", "nova-2-general".
+    const configModel = config.model && config.model.includes("/") ? config.model : null;
+    this.modelId = configModel || "ibm-granite/granite-4.0-1b-speech";
 
     // Build keyword bias argument for the Python script
     const keywords = config.keywords?.length
