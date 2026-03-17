@@ -25,11 +25,17 @@ export class OpenAICompatLLM implements LLMProvider {
 
     const run = async () => {
       try {
+        // Ollama/qwen3 thinking models use ~1000 tokens for chain-of-thought
+        // before emitting content, so 300 tokens leaves nothing for the reply.
+        const rawMax = this.config.maxTokens ?? 300;
+        const isOllama = this.config.provider === "ollama";
+        const effectiveMaxTokens = (isOllama && rawMax < 2000) ? 2000 : rawMax;
+
         const streamParams: OpenAI.ChatCompletionCreateParamsStreaming = {
           model: this.config.model,
           messages: params.messages as OpenAI.ChatCompletionMessageParam[],
           temperature: this.config.temperature ?? 0.3,
-          max_tokens: this.config.maxTokens ?? 300,
+          max_tokens: effectiveMaxTokens,
           stream: true,
         };
 
