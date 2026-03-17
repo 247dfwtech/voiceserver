@@ -1,6 +1,6 @@
 # VoiceServer — Claude Handoff Document
 
-**Last updated:** 2026-03-17 (rev 2)
+**Last updated:** 2026-03-17 (rev 3)
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
@@ -37,17 +37,23 @@ It's the backend engine for VapiClone. VapiClone handles orchestration (assistan
 ## What's Not Working / Known Issues
 
 - **Cloudflared tunnel URLs are ephemeral** — Quick tunnels generate random `trycloudflare.com` URLs. If tunnel processes restart (PM2 auto-restart, server reboot), URLs change and Railway env vars need manual updating. A proper Cloudflare named tunnel would fix this.
-- **Ollama is now PM2-managed** — Runs via `start-ollama.sh` with `OLLAMA_ORIGINS=*` and `OLLAMA_HOST=0.0.0.0` to allow cloudflared tunnel access.
-- **GitHub Actions auto-deploy needs SSH secret update** — The deploy workflow (`.github/workflows/deploy.yml`) has secrets for the old Vast.ai instance. SSH host (174.92.170.239), port (45194), and SSH key need updating in GitHub repo settings.
-- **Granite STT not verified on new instance** — The Granite STT Python dependencies (transformers, torch, torchaudio) were not explicitly installed on the new instance. Kokoro TTS Python package was installed but Granite STT may need: `pip3 install transformers torch torchaudio soundfile`.
+- **Granite STT not verified on new instance** — The Granite STT Python dependencies (transformers, torch, torchaudio) were not explicitly installed on the new instance. Kokoro TTS Python package was installed but Granite STT may need: `pip3 install transformers torch torchaudio soundfile`. Without it, actual calls won't transcribe audio.
 - **faster-whisper not installed on new instance** — If using Whisper as STT fallback, need: `pip3 install faster-whisper`.
 - **Piper TTS not installed on new instance** — Piper binary and models not set up. Only Kokoro is available.
-- **qwen3:4b instead of qwen3.5:9b** — The new instance has qwen3:4b pulled (smaller model). The .env references `qwen3.5:9b` as DEFAULT_LLM but the model manager log says it found 1 model already installed and skipped auto-pull. May need to pull qwen3.5:9b manually if better quality is needed: `ollama pull qwen3.5:9b`.
+- **qwen3:4b instead of qwen3.5:9b** — The new instance has qwen3:4b pulled (smaller model). May need to pull qwen3.5:9b manually for better quality: `ollama pull qwen3.5:9b`.
 
 ---
 
 ## What Was Just Completed (March 2026)
 
+**Session 3 fixes (same day):**
+- **Fixed Kokoro TTS stdout corruption (Critical)** — `torch` and `kokoro` imports print warnings to stdout, corrupting the binary PCM protocol (Node.js read "WARN" as a 1.3GB uint32 length → 90s timeout on every synthesis). Fixed by redirecting `sys.stdout = sys.stderr` before all imports and writing binary data to saved `_binary_stdout` reference. Committed in `df121d0`.
+- **Fixed Ollama max_tokens for thinking models** — `qwen3:4b` uses ~1000 tokens for chain-of-thought before emitting content. `maxTokens=300` left no room for the actual reply (empty content). Fixed by enforcing 2000-token minimum for Ollama provider in `openai-compat.ts`. Committed in `b5abdc6`.
+- **GitHub Actions SSH secrets updated** — All 4 secrets (SSH_HOST=70.29.210.33, SSH_PORT=45194, SSH_USER=root, SSH_PRIVATE_KEY) updated in GitHub repo settings for the current Vast.ai instance. Auto-deploy on push should now work.
+- **Added /logs IPC endpoint** — `GET /logs?lines=N&type=all` reads PM2 log files from `/var/log/voiceserver/` and returns recent lines. Requires `x-ipc-secret` header. Useful for remote debugging without SSH.
+- **IPC_SECRET auth fixed** — Added `VAPICLONE_API_KEY` and `IPC_SECRET` to voiceserver `.env`. The `notifyCallEnded` function now sends both `Authorization: Bearer <key>` and `x-ipc-secret: <secret>` headers to vapiclone's `/api/webhooks/call-events` endpoint.
+
+**Session 2 fixes:**
 1. **Migrated to new reserved Vast.ai instance** — Old on-demand instance (32982226, Oregon) lost GPU availability overnight. New reserved instance (33032104, Quebec CA) set up from scratch.
 2. **Fresh install on new instance:**
    - Installed Ollama + pulled qwen3:4b model
@@ -90,17 +96,18 @@ It's the backend engine for VapiClone. VapiClone handles orchestration (assistan
 
 ## Next Steps (In Order)
 
-1. **Install Granite STT dependencies** — `pip3 install transformers torch torchaudio soundfile` on the Vast.ai instance. Without this, STT falls back to Whisper (which also isn't installed). Critical for actual phone calls.
-2. **Install faster-whisper** — `pip3 install faster-whisper` as STT fallback.
-3. **Pull qwen3.5:9b model** — `ollama pull qwen3.5:9b` for better LLM quality (4b is smaller/faster but less capable).
-4. **Update GitHub Actions SSH secrets** — In GitHub repo settings (247dfwtech/voiceserver), update `SSH_HOST`, `SSH_PORT`, `SSH_PRIVATE_KEY` for the new Vast.ai instance (174.92.170.239, port 45194).
-5. **Set up Cloudflare named tunnel** — Replace quick tunnels with permanent named tunnel to get stable URLs that don't change on restart. Currently 3 tunnels (IPC, WS, Ollama) all use ephemeral URLs.
-6. **Test end-to-end call** — Make a test call through VapiClone to verify the full audio pipeline works on the new instance.
+1. **Install Granite STT dependencies** — `pip3 install transformers torch torchaudio soundfile` on the Vast.ai instance. Without this, STT won't work during actual calls. Verify with: `python3 -c "from transformers import AutoProcessor; print('ok')"`.
+2. **Make a test outbound call** — Full pipeline is verified except actual phone call audio. LLM ✅, TTS ✅, IPC auth ✅. Make a real call via vapiclone dashboard and check logs for STT transcripts.
+3. **Install faster-whisper** — `pip3 install faster-whisper` as STT fallback if Granite has issues.
+4. **Set up Cloudflare named tunnel** — Replace quick tunnels with permanent named tunnel to get stable URLs that don't change on restart.
+5. **Pull qwen3.5:9b model** — `ollama pull qwen3.5:9b` for better conversation quality.
 
 ---
 
 ## Gotchas and Important Context
 
+- **Kokoro stdout redirect (Critical)** — The Python Kokoro subprocess redirects `sys.stdout = sys.stderr` before importing torch/kokoro. This prevents library warnings from corrupting the binary PCM protocol. If you ever rewrite the Python script, keep this redirect. Removing it causes silent synthesis failures (90s timeout every time).
+- **Ollama max_tokens minimum** — `openai-compat.ts` enforces a 2000-token minimum for Ollama provider because qwen3 thinking models use ~1000 tokens for CoT before emitting content. If you switch to a non-thinking model (llama3, etc.), this is harmless.
 - **HF_HOME stale file handle (Critical)** — When copying a Vast.ai instance, `/etc/environment` retains `HF_HOME="/workspace/.hf_home"` but `/workspace` is a stale NFS mount. This causes `OSError: [Errno 116] Stale file handle` in any Python code downloading HuggingFace models (Kokoro, Granite, Whisper). Fix: `sed -i 's|HF_HOME=.*|HF_HOME="/root/.cache/huggingface"|g' /etc/environment`, then `pm2 delete voiceserver && pm2 start ecosystem.config.cjs --only voiceserver` (restart alone doesn't pick up /etc/environment).
 - **PyTorch CUDA wheel (Critical)** — `pip install torch` installs CPU-only version. Must use `pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu124` for GPU support. Without this, Kokoro fails with `ModuleNotFoundError: No module named 'torch'`.
 - **PM2 needs PATH set** — Node.js is at `/opt/nvm/versions/node/v24.12.0/bin`. Always set PATH before running PM2 commands: `export PATH="/opt/nvm/versions/node/v24.12.0/bin:/opt/instance-tools/bin:$PATH"`.
