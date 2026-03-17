@@ -40,28 +40,29 @@ function getModelId(config: STTConfig): string {
 
 function buildPythonScript(modelId: string): string {
   return `
-import sys, os
+import sys
 
 # Redirect all stdout noise to stderr before importing heavy libs
 _orig_stdout = sys.stdout.buffer
 sys.stdout = sys.stderr
 
 import torch
-import soundfile as sf
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+from transformers import pipeline as hf_pipeline
 
 model_id = "${modelId}"
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = 0 if torch.cuda.is_available() else -1
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
 print(f"GRANITE_LOADING model={model_id} device={device}", flush=True)
 
-processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-model = AutoModelForSpeechSeq2Seq.from_pretrained(
-    model_id,
+# Use pipeline abstraction — handles AutoProcessor calling convention automatically
+pipe = hf_pipeline(
+    "automatic-speech-recognition",
+    model=model_id,
+    device=device,
     torch_dtype=torch_dtype,
     trust_remote_code=True,
-).to(device)
+)
 
 print("GRANITE_READY", flush=True)
 
@@ -72,17 +73,8 @@ for line in sys.stdin:
         continue
 
     try:
-        audio_data, sample_rate = sf.read(line)
-        inputs = processor(
-            audio_data,
-            sampling_rate=sample_rate,
-            return_tensors="pt",
-        ).to(device)
-
-        with torch.no_grad():
-            predicted_ids = model.generate(**inputs, max_new_tokens=440)
-
-        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+        result = pipe(line)
+        transcription = (result.get("text", "") if isinstance(result, dict) else "").strip()
         _orig_stdout.write((transcription + "\\n").encode())
         _orig_stdout.flush()
         print(f"GRANITE_OK chars={len(transcription)}", flush=True)
