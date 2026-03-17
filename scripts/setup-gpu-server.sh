@@ -197,9 +197,9 @@ info "Installing Kokoro TTS..."
 pip3 install --no-cache-dir "kokoro>=0.9" soundfile 2>&1 | tail -1
 log "Kokoro TTS installed"
 
-# Granite STT dependencies (transformers + torch + huggingface_hub)
-info "Installing Granite STT dependencies (transformers, torch)... this may take a few minutes"
-pip3 install --no-cache-dir transformers torch huggingface_hub soundfile 2>&1 | tail -1
+# Granite STT dependencies (transformers + torch + torchaudio + huggingface_hub)
+info "Installing Granite STT dependencies (transformers, torch, torchaudio)... this may take a few minutes"
+pip3 install --no-cache-dir transformers torch torchaudio huggingface_hub soundfile 2>&1 | tail -1
 log "Granite STT dependencies installed"
 
 ###############################################################################
