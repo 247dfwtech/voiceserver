@@ -84,6 +84,13 @@ export class KokoroTTS implements TTSProvider {
 
       const pythonScript = `
 import sys, json, struct, io
+
+# CRITICAL: redirect all text output (including library warnings) to stderr
+# BEFORE importing any libraries. Some libraries (torch, kokoro) print to
+# stdout during import, which corrupts our binary length-prefixed protocol.
+_binary_stdout = sys.stdout.buffer
+sys.stdout = sys.stderr
+
 import torch
 import numpy as np
 
@@ -126,8 +133,8 @@ for line in sys.stdin:
 
         if not text:
             # Send empty response
-            sys.stdout.buffer.write(struct.pack("<I", 0))
-            sys.stdout.buffer.flush()
+            _binary_stdout.write(struct.pack("<I", 0))
+            _binary_stdout.flush()
             continue
 
         if USE_KOKORO_PKG:
@@ -141,17 +148,17 @@ for line in sys.stdin:
         pcm_bytes = audio_int16.tobytes()
 
         # Write length prefix (4 bytes LE uint32) then PCM data
-        sys.stdout.buffer.write(struct.pack("<I", len(pcm_bytes)))
-        sys.stdout.buffer.write(pcm_bytes)
-        sys.stdout.buffer.flush()
+        _binary_stdout.write(struct.pack("<I", len(pcm_bytes)))
+        _binary_stdout.write(pcm_bytes)
+        _binary_stdout.flush()
 
         print(f"KOKORO_SYNTH voice={voice} chars={len(text)} samples={len(audio_int16)} duration={len(audio_int16)/24000:.2f}s", file=sys.stderr, flush=True)
 
     except Exception as e:
         print(f"KOKORO_ERROR {e}", file=sys.stderr, flush=True)
         # Send zero-length response so caller doesn't hang
-        sys.stdout.buffer.write(struct.pack("<I", 0))
-        sys.stdout.buffer.flush()
+        _binary_stdout.write(struct.pack("<I", 0))
+        _binary_stdout.flush()
 `;
 
       this.pythonProcess = spawn("python3", ["-u", "-c", pythonScript], {
