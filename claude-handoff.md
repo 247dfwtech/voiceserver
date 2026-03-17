@@ -1,10 +1,10 @@
 # VoiceServer — Claude Handoff Document
 
-**Last updated:** 2026-03-17 (rev 3)
+**Last updated:** 2026-03-17 (rev 4)
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
-**SSH:** `ssh -p 45194 root@70.29.210.33` (direct IP — Vast.ai proxy `ssh5.vast.ai:32104` may have routing issues)
+**SSH:** `ssh -p 45194 root@70.29.210.33`
 **Server path:** /opt/voiceserver/
 
 ---
@@ -13,69 +13,56 @@
 
 VoiceServer is the GPU-powered voice processing engine that handles real-time phone calls. It receives audio from Twilio via WebSocket, transcribes speech (STT), generates AI responses (LLM), synthesizes speech (TTS), and streams audio back to Twilio. All AI models run locally on a dedicated RTX 4090 GPU — no paid API calls for core voice processing.
 
-It's the backend engine for VapiClone. VapiClone handles orchestration (assistants, phone numbers, call logs). VoiceServer handles the actual voice processing.
-
 ---
 
 ## Current State (What's Working)
 
-- **WebSocket server** (port 8765) — Accepts Twilio Media Stream connections, processes audio in real-time
-- **IPC HTTP server** (port 8766) — Health checks, model management, call registration, TTS testing, voice cloning
-- **IBM Granite 4.0 1B Speech** — Default STT, #1 on OpenASR leaderboard, supports keyword biasing
-- **Kokoro-82M TTS** — Default TTS, #1 in TTS Spaces Arena, 54 voices, sub-0.3s latency on RTX 4090
-- **Ollama with qwen3:4b** — Default LLM for conversation and post-call analysis
+- **WebSocket server** (port 8765) — Accepts Twilio Media Stream connections
+- **IPC HTTP server** (port 8766) — Health checks, model management, call registration, TTS testing
+- **IBM Granite 4.0 1B Speech STT** ✅ — Persistent Python subprocess (model loads once, stays in memory). Model pre-downloaded at `/root/.cache/huggingface/`. No more timeout failures.
+- **Kokoro-82M TTS** ✅ — Persistent Python subprocess, 54 voices, sub-0.3s latency on RTX 4090. All voice packs (af_heart, af_nicole, am_adam, af_sarah) pre-downloaded.
+- **Ollama with qwen3:4b** ✅ — LLM for conversation, post-call analysis. `<think>` blocks handled with 2000-token minimum.
 - **KokoClone voice cloning** — Clone voices from 3-10s reference audio samples
 - **Model manager** — Install/activate/remove LLM/STT/TTS models via IPC API
 - **Post-call analysis** — Summary generation and success evaluation after each call
 - **Tool execution** — Function webhooks, call transfer, DTMF, end call (with SSRF protection)
 - **Voicemail detection** — Detects sustained speech patterns in first 5 seconds
-- **Cost tracking** — Per-call breakdown (STT, LLM, TTS, transport). Local models are $0.
-- **PM2 managed** — voiceserver + 2 cloudflared tunnels, auto-restart, boot persistence
-- **Cloudflared tunnels** — Public HTTPS/WSS URLs for IPC and WebSocket access from Railway
-- **Health endpoint** — Reports sessions, memory, uptime, Ollama status, installed models
+- **Cost tracking** — Per-call breakdown (STT, LLM, TTS, transport). Local models = $0.
+- **PM2 managed** — voiceserver + ollama + 3 cloudflared tunnels, auto-restart, boot persistence
+- **Health endpoint** — Reports sessions, memory, uptime, Ollama status
+- **`/logs` endpoint** — `GET /logs?lines=N` returns recent PM2 log lines; requires `x-ipc-secret` header
+- **IPC auth** — All IPC calls require either `Authorization: Bearer <VAPICLONE_API_KEY>` or `x-ipc-secret: <IPC_SECRET>` header
 
 ## What's Not Working / Known Issues
 
 - **Cloudflared tunnel URLs are ephemeral** — Quick tunnels generate random `trycloudflare.com` URLs. If tunnel processes restart (PM2 auto-restart, server reboot), URLs change and Railway env vars need manual updating. A proper Cloudflare named tunnel would fix this.
-- **Granite STT not verified on new instance** — The Granite STT Python dependencies (transformers, torch, torchaudio) were not explicitly installed on the new instance. Kokoro TTS Python package was installed but Granite STT may need: `pip3 install transformers torch torchaudio soundfile`. Without it, actual calls won't transcribe audio.
-- **faster-whisper not installed on new instance** — If using Whisper as STT fallback, need: `pip3 install faster-whisper`.
-- **Piper TTS not installed on new instance** — Piper binary and models not set up. Only Kokoro is available.
-- **qwen3:4b instead of qwen3.5:9b** — The new instance has qwen3:4b pulled (smaller model). May need to pull qwen3.5:9b manually for better quality: `ollama pull qwen3.5:9b`.
+- **faster-whisper not verified on current instance** — If Granite has issues, `pip3 install faster-whisper` and switch STT provider to "whisper" in assistant config.
+- **Piper TTS not installed on current instance** — Only Kokoro is available. Install with `pip3 install piper-tts` if needed.
+- **qwen3:4b instead of qwen3.5:9b** — Smaller model. Run `ollama pull qwen3.5:9b` for better quality if VRAM allows.
 
 ---
 
 ## What Was Just Completed (March 2026)
 
-**Session 3 fixes (same day):**
-- **Fixed Kokoro TTS stdout corruption (Critical)** — `torch` and `kokoro` imports print warnings to stdout, corrupting the binary PCM protocol (Node.js read "WARN" as a 1.3GB uint32 length → 90s timeout on every synthesis). Fixed by redirecting `sys.stdout = sys.stderr` before all imports and writing binary data to saved `_binary_stdout` reference. Committed in `df121d0`.
-- **Fixed Ollama max_tokens for thinking models** — `qwen3:4b` uses ~1000 tokens for chain-of-thought before emitting content. `maxTokens=300` left no room for the actual reply (empty content). Fixed by enforcing 2000-token minimum for Ollama provider in `openai-compat.ts`. Committed in `b5abdc6`.
-- **GitHub Actions SSH secrets updated** — All 4 secrets (SSH_HOST=70.29.210.33, SSH_PORT=45194, SSH_USER=root, SSH_PRIVATE_KEY) updated in GitHub repo settings for the current Vast.ai instance. Auto-deploy on push should now work.
-- **Added /logs IPC endpoint** — `GET /logs?lines=N&type=all` reads PM2 log files from `/var/log/voiceserver/` and returns recent lines. Requires `x-ipc-secret` header. Useful for remote debugging without SSH.
-- **IPC_SECRET auth fixed** — Added `VAPICLONE_API_KEY` and `IPC_SECRET` to voiceserver `.env`. The `notifyCallEnded` function now sends both `Authorization: Bearer <key>` and `x-ipc-secret: <secret>` headers to vapiclone's `/api/webhooks/call-events` endpoint.
+**Session 4 (latest):**
+- **Fixed Granite STT persistent subprocess (Critical)** — Granite STT was spawning a NEW Python process per utterance, loading a 2GB model from disk every time (15-30s per load, 15s timeout → timeout every call). Completely rewrote `src/providers/stt/granite.ts` to use a module-level singleton persistent Python process (same pattern as KokoroTTS). Model loads ONCE on first call, stays in GPU memory. Per-utterance latency now 0.5-2s. Committed and deployed.
+- **Pre-downloaded all Kokoro voice packs** — `af_heart.pt`, `af_nicole.pt`, `am_adam.pt`, `af_sarah.pt` downloaded to `/root/.cache/huggingface/`. No more 404 on voice pack lazy download.
+- **Pre-downloaded Granite model** — `ibm-granite/granite-4.0-1b-speech` cached to `/root/.cache/huggingface/`. No cold-start download needed.
+- **Deployed latest code to GPU** — `git pull && npm run build && pm2 restart voiceserver --update-env` confirmed deployed.
+
+**Session 3 fixes:**
+- **Fixed Kokoro TTS stdout corruption (Critical)** — `torch` and `kokoro` imports print warnings to stdout, corrupting the binary PCM protocol. Fixed by redirecting `sys.stdout = sys.stderr` before all imports.
+- **Fixed Ollama max_tokens for thinking models** — `qwen3:4b` uses ~1000 tokens for chain-of-thought. Fixed by enforcing 2000-token minimum for Ollama provider in `openai-compat.ts`.
+- **GitHub Actions SSH secrets updated** — All 4 secrets updated for current Vast.ai instance. Auto-deploy on push works.
+- **Added `/logs` IPC endpoint** — Remote debugging without SSH.
+- **IPC_SECRET auth fixed** — Added `VAPICLONE_API_KEY` and `IPC_SECRET` to voiceserver `.env`. `notifyCallEnded` now sends both `Authorization: Bearer` and `x-ipc-secret` headers.
+- **Added `flux-general-en` model name validation** — Vapi-imported assistants have Deepgram model names. Added `config.model.includes('/')` check to reject non-HuggingFace IDs.
 
 **Session 2 fixes:**
-1. **Migrated to new reserved Vast.ai instance** — Old on-demand instance (32982226, Oregon) lost GPU availability overnight. New reserved instance (33032104, Quebec CA) set up from scratch.
-2. **Fresh install on new instance:**
-   - Installed Ollama + pulled qwen3:4b model
-   - Installed PM2 globally via npm
-   - Cloned voiceserver repo from GitHub, ran `npm install` + `npm run build`
-   - Downloaded Kokoro TTS model files (kokoro-v1.0.onnx, voices-v1.0.bin) to /models/kokoro/
-   - Installed PyTorch CUDA wheel (`pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu124`)
-   - Installed kokoro Python package (`pip3 install kokoro soundfile`)
-   - Fixed HF_HOME stale file handle: changed `/etc/environment` `HF_HOME` from `/workspace/.hf_home` to `/root/.cache/huggingface`
-   - Created .env with production config (including `HF_HOME=/root/.cache/huggingface`)
-   - Created PM2 ecosystem config with voiceserver + 2 cloudflared tunnels, HF_HOME in env
-   - Configured PM2 startup persistence (`pm2 save` + `pm2 startup`)
-3. **Cloudflared tunnels running via PM2:**
-   - IPC tunnel: `https://plaintiff-databases-brave-isolation.trycloudflare.com` → localhost:8766
-   - WS tunnel: `wss://cup-delegation-shake-stickers.trycloudflare.com` → localhost:8765
-   - Ollama tunnel: `https://occupational-briefly-flag-cas.trycloudflare.com` → localhost:11434
-4. **Ollama added to PM2** — Managed via `start-ollama.sh` with `OLLAMA_ORIGINS=*` and `OLLAMA_HOST=0.0.0.0` to allow cloudflared tunnel access. Without these env vars, Ollama returns 403 to non-localhost requests.
-5. **VapiClone Railway env vars updated** to point to new tunnel URLs (IPC, WS, and Ollama).
-6. **Voice server confirmed Connected** in VapiClone sidebar.
-7. **Fixed Kokoro TTS timeouts** — Increased model load timeout 60s→120s and synthesis timeout 30s→90s in `src/providers/tts/kokoro.ts`. GPU cold start takes 60-90s on first call.
-8. **Fixed /tts/test spinning forever** — Added a module-level KokoroTTS singleton in `src/index.ts`. Previously each Play button click spawned a new Python subprocess (60-90s cold start, always timed out). Now the singleton is reused across preview requests.
-9. **Updated setup-gpu-server.sh** — Added HF_HOME fix, CUDA-aware PyTorch install, ollama PM2 management, all 5 PM2 processes, automatic verification checks.
+- Migrated to new reserved Vast.ai instance (33032104, Quebec CA, RTX 4090)
+- Full fresh install: Ollama, PM2, kokoro, torch CUDA, cloudflared tunnels
+- Fixed HF_HOME stale file handle from Vast.ai instance copy
+- Configured PM2 with all 5 processes + boot persistence
 
 ---
 
@@ -83,45 +70,40 @@ It's the backend engine for VapiClone. VapiClone handles orchestration (assistan
 
 | Decision | Why |
 |---|---|
-| RTX 4090 on Vast.ai | Best price/performance for GPU inference. ~$0.30/hr reserved. Runs all 3 AI models (STT + LLM + TTS) with room to spare (~8.5GB of 24GB VRAM used). |
-| Reserved instance instead of on-demand | On-demand lost the GPU overnight when stopped. Reserved guarantees availability. At ~$17-22/month for 24/7, it's very affordable. |
-| Leave running 24/7, don't stop | Stopping risks losing the GPU (even reserved can have issues), and the cost is negligible. Avoids tunnel URL changes and PM2 restart hassles. |
-| IBM Granite STT over Whisper | Better accuracy (#1 OpenASR), supports keyword biasing (important for sales — names, product terms), smaller model (2GB vs Whisper large-v3). |
-| Kokoro TTS over ElevenLabs/Piper | #1 in TTS quality rankings, near-human naturalness, only 82M params, sub-0.3s latency, free (Apache 2.0). Piper is fallback for CPU-only environments. |
-| Ollama for LLM | Runs locally on GPU, no API costs. OpenAI-compatible API makes it a drop-in replacement. Qwen3 models are strong for conversation. |
-| Cloudflared quick tunnels | Vast.ai's Docker networking blocks direct port access from outside. Only 6 explicitly mapped ports work, and 8765/8766 aren't among them. Cloudflared creates public HTTPS/WSS URLs that work through Docker. |
-| Separate voiceserver repo | Decouples voice processing from the web app. Can be deployed independently, version-controlled separately, and run on different hardware. |
+| RTX 4090 on Vast.ai | Best price/performance. ~$0.30/hr reserved. Runs all 3 AI models with ~15GB headroom. |
+| Reserved instance | On-demand lost the GPU overnight when stopped. Reserved guarantees availability. |
+| Leave running 24/7 | Stopping risks losing the GPU. ~$17-22/month is negligible. Avoids tunnel URL churn. |
+| IBM Granite STT over Whisper | Better accuracy (#1 OpenASR), keyword biasing for names/sales terms, ~2GB vs Whisper large-v3. |
+| Persistent Python subprocess for STT/TTS | Models load once into GPU VRAM. Per-request subprocess was loading 2GB model every utterance (15-30s). Persistent process makes it 0.5-2s. |
+| Kokoro TTS over ElevenLabs/Piper | #1 quality, near-human naturalness, 82M params, sub-0.3s on GPU, Apache 2.0. |
+| Ollama for LLM | Free, local, no API costs. OpenAI-compatible. |
 
 ---
 
 ## Next Steps (In Order)
 
-1. **Install Granite STT dependencies** — `pip3 install transformers torch torchaudio soundfile` on the Vast.ai instance. Without this, STT won't work during actual calls. Verify with: `python3 -c "from transformers import AutoProcessor; print('ok')"`.
-2. **Make a test outbound call** — Full pipeline is verified except actual phone call audio. LLM ✅, TTS ✅, IPC auth ✅. Make a real call via vapiclone dashboard and check logs for STT transcripts.
-3. **Install faster-whisper** — `pip3 install faster-whisper` as STT fallback if Granite has issues.
-4. **Set up Cloudflare named tunnel** — Replace quick tunnels with permanent named tunnel to get stable URLs that don't change on restart.
-5. **Pull qwen3.5:9b model** — `ollama pull qwen3.5:9b` for better conversation quality.
+1. **Test a live call end-to-end** — All known issues fixed. Make a call and verify caller hears firstMessage (Kokoro TTS) and conversation flows (Granite STT → Ollama LLM → Kokoro TTS).
+2. **Set up Cloudflare named tunnel** — Replace quick tunnels with permanent named tunnel for stable URLs.
+3. **Pull qwen3.5:9b model** — `ollama pull qwen3.5:9b` for better conversation quality.
+4. **Implement Deepgram STT option** — For production scale, Deepgram is faster and more reliable than self-hosted. Add `DEEPGRAM_API_KEY` to `.env` and set transcriber provider in assistant config.
 
 ---
 
 ## Gotchas and Important Context
 
-- **Kokoro stdout redirect (Critical)** — The Python Kokoro subprocess redirects `sys.stdout = sys.stderr` before importing torch/kokoro. This prevents library warnings from corrupting the binary PCM protocol. If you ever rewrite the Python script, keep this redirect. Removing it causes silent synthesis failures (90s timeout every time).
-- **Ollama max_tokens minimum** — `openai-compat.ts` enforces a 2000-token minimum for Ollama provider because qwen3 thinking models use ~1000 tokens for CoT before emitting content. If you switch to a non-thinking model (llama3, etc.), this is harmless.
-- **HF_HOME stale file handle (Critical)** — When copying a Vast.ai instance, `/etc/environment` retains `HF_HOME="/workspace/.hf_home"` but `/workspace` is a stale NFS mount. This causes `OSError: [Errno 116] Stale file handle` in any Python code downloading HuggingFace models (Kokoro, Granite, Whisper). Fix: `sed -i 's|HF_HOME=.*|HF_HOME="/root/.cache/huggingface"|g' /etc/environment`, then `pm2 delete voiceserver && pm2 start ecosystem.config.cjs --only voiceserver` (restart alone doesn't pick up /etc/environment).
-- **PyTorch CUDA wheel (Critical)** — `pip install torch` installs CPU-only version. Must use `pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu124` for GPU support. Without this, Kokoro fails with `ModuleNotFoundError: No module named 'torch'`.
-- **PM2 needs PATH set** — Node.js is at `/opt/nvm/versions/node/v24.12.0/bin`. Always set PATH before running PM2 commands: `export PATH="/opt/nvm/versions/node/v24.12.0/bin:/opt/instance-tools/bin:$PATH"`.
-- **`pm2 restart voiceserver --update-env`** vs full delete/start** — `--update-env` picks up PM2 ecosystem env changes but NOT `/etc/environment` changes. For `/etc/environment` changes, must do `pm2 delete voiceserver && pm2 start ecosystem.config.cjs --only voiceserver`.
-- **Cloudflared is at `/opt/instance-tools/bin/cloudflared`** — Pre-installed on Vast.ai instances. No need to install separately.
-- **Vast.ai "200 ports" is misleading** — Only 6 explicitly Docker-mapped ports are externally accessible (22→45194, 1111→45143, 6006→45087, 8080→45164, 8384→45035, 72299→45086). Internal ports like 8765/8766 are NOT accessible from outside despite the "200 ports" label.
-- **Tunnel URLs change on restart** — If voice server shows "Offline" in VapiClone, check `pm2 logs tunnel-ipc --lines 5 --nostream` and `pm2 logs tunnel-ws --lines 5 --nostream` for new URLs. Update Railway env vars `VOICE_SERVER_IPC_URL` and `VOICE_SERVER_URL`.
-- **Python packages are system-level** — No virtualenv on Vast.ai. `pip3 install` goes to system Python. The `kokoro-onnx` package is installed but Granite STT dependencies may be missing.
-- **Model files location** — Kokoro models at `/models/kokoro/`, cloned voices at `/data/cloned-voices/`, Ollama models managed by Ollama internally (`~/.ollama/models/`).
-- **Max 20 concurrent sessions** — Hardcoded in the server config. Adjustable via `MAX_CONCURRENT_CALLS` env var.
-- **Cost tracking: local models = $0** — Ollama, Granite, Kokoro, Whisper, Piper are all free. Only Deepgram, OpenAI, ElevenLabs incur API costs if configured.
-- **SSRF protection in tool executor** — Function tool webhooks block requests to localhost, private IP ranges (10.x, 172.16-31.x, 192.168.x), and cloud metadata endpoints (169.254.169.254).
-- **Audio format conversion** — Twilio sends/receives mu-law 8kHz mono. Voice server converts to PCM 16-bit 16kHz for STT and back to mu-law for Twilio output.
-- **Ollama needs OLLAMA_ORIGINS=*** — Without this env var, Ollama returns 403 to cloudflared tunnel requests. The `start-ollama.sh` script sets this. If Ollama is restarted manually, make sure to include this env var.
+- **Granite STT persistent process (Critical)** — `granite.ts` uses a module-level singleton Python process. The process loads `ibm-granite/granite-4.0-1b-speech` ONCE and handles all transcriptions via stdin/stdout. If the process crashes, it self-resets on the next call. Never revert to per-request subprocess spawning — it always times out.
+- **Kokoro stdout redirect (Critical)** — The Python Kokoro subprocess redirects `sys.stdout = sys.stderr` before importing torch/kokoro. This prevents library warnings from corrupting the binary PCM protocol. If you ever rewrite the Python script, keep this redirect.
+- **Ollama max_tokens minimum** — `openai-compat.ts` enforces a 2000-token minimum for Ollama because qwen3 thinking models use ~1000 tokens for CoT first.
+- **HF_HOME stale file handle (Critical)** — When copying a Vast.ai instance, `/etc/environment` retains `HF_HOME="/workspace/.hf_home"` but that path is stale. Causes `OSError: [Errno 116] Stale file handle`. Fix: `sed -i 's|HF_HOME=.*|HF_HOME="/root/.cache/huggingface"|g' /etc/environment`, then delete and restart voiceserver PM2 process.
+- **PyTorch CUDA wheel (Critical)** — `pip install torch` installs CPU-only. Must use `pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu124`.
+- **PM2 needs PATH set** — Node.js at `/opt/nvm/versions/node/v24.12.0/bin`. Always `export PATH="/opt/nvm/versions/node/v24.12.0/bin:/opt/instance-tools/bin:$PATH"`.
+- **`pm2 restart --update-env`** vs full delete/start** — `--update-env` picks up ecosystem env changes but NOT `/etc/environment` changes. For `/etc/environment` changes, must `pm2 delete voiceserver && pm2 start ecosystem.config.cjs --only voiceserver`.
+- **Cloudflared at `/opt/instance-tools/bin/cloudflared`** — Pre-installed on Vast.ai.
+- **Vast.ai "200 ports" is misleading** — Only 6 Docker-mapped ports accessible externally. 8765/8766 are NOT accessible. Always use cloudflared tunnels.
+- **Tunnel URLs change on restart** — If voice server shows "Offline" in VapiClone, check `pm2 logs tunnel-ipc --lines 5 --nostream` for new URL. Update Railway `VOICE_SERVER_IPC_URL` and `VOICE_SERVER_URL`.
+- **IPC auth headers** — IPC endpoints require either `Authorization: Bearer <VAPICLONE_API_KEY>` or `x-ipc-secret: <IPC_SECRET>`. Both are set in `.env`. Current values: `VAPICLONE_API_KEY=vs-internal-secret-2026`, `IPC_SECRET=vs-ipc-2026`.
+- **Audio format** — Twilio sends/receives mu-law 8kHz mono. Voice server converts to PCM 16-bit 16kHz for STT and back to mu-law.
+- **Ollama needs OLLAMA_ORIGINS=*** — Without this, returns 403 to cloudflared tunnel requests.
 
 ---
 
@@ -131,49 +113,38 @@ It's the backend engine for VapiClone. VapiClone handles orchestration (assistan
 
 | Path | What's In It |
 |---|---|
-| `src/index.ts` | Main entry — WebSocket server (8765) + IPC HTTP server (8766), session management |
-| `src/model-manager.ts` | Model lifecycle — install/activate/remove LLM/STT/TTS, persist config |
-| `src/providers/stt/granite.ts` | IBM Granite 4.0 1B Speech STT (Python subprocess) |
+| `src/index.ts` | Main entry — WebSocket (8765) + IPC HTTP (8766), session management, `/logs` endpoint |
+| `src/model-manager.ts` | Model lifecycle — install/activate/remove |
+| `src/providers/stt/granite.ts` | Granite STT — **persistent Python subprocess**, module-level singleton, stdin/stdout protocol |
 | `src/providers/stt/whisper.ts` | faster-whisper STT fallback |
-| `src/providers/tts/kokoro.ts` | Kokoro-82M TTS (persistent Python subprocess, GPU) |
-| `src/providers/tts/kokoclone.ts` | KokoClone voice cloning (reference audio → cloned voice) |
+| `src/providers/tts/kokoro.ts` | Kokoro-82M TTS — persistent Python subprocess, length-prefixed binary PCM protocol |
+| `src/providers/tts/kokoclone.ts` | KokoClone voice cloning |
 | `src/providers/tts/piper.ts` | Piper TTS fallback (CPU-friendly) |
-| `src/providers/llm/openai-compat.ts` | OpenAI-compatible LLM client (works with Ollama, OpenAI, DeepSeek) |
-| `src/providers/index.ts` | Provider factory — auto-selects based on env/config with fallbacks |
-| `src/voice-pipeline/call-session.ts` | Core call handler — STT→LLM→TTS loop, tool execution, analysis |
+| `src/providers/llm/openai-compat.ts` | OpenAI-compatible LLM client — 2000-token min for Ollama |
+| `src/providers/index.ts` | Provider factory — auto-selects based on config with fallbacks |
+| `src/voice-pipeline/call-session.ts` | Core call handler — STT→LLM→TTS loop, tool execution |
 | `src/voice-pipeline/analysis-runner.ts` | Post-call summary + success evaluation |
 | `src/voice-pipeline/tool-executor.ts` | Tool execution with SSRF protection |
 | `src/voice-pipeline/audio-utils.ts` | Audio format conversion (mu-law ↔ PCM, resampling) |
-| `src/voice-pipeline/voicemail-detector.ts` | Voicemail detection from audio patterns |
-| `package.json` | Dependencies, scripts (build: tsc, start: node dist/index.js) |
-| `tsconfig.json` | TypeScript config (ES2022, Node module resolution) |
-| `Dockerfile` | Multi-stage GPU build (nvidia/cuda base, pre-installs all models) |
-| `docker-compose.yml` | Ollama + voiceserver services with GPU access |
+| `scripts/setup-gpu-server.sh` | **One-click bare metal setup** — installs all deps, pre-downloads models, configures PM2 |
 | `.github/workflows/deploy.yml` | GitHub Actions — SSH into Vast.ai, git pull, build, pm2 restart |
-| `scripts/setup-gpu-server.sh` | One-click bare metal setup script |
 
 ### Vast.ai GPU Server (70.29.210.33, SSH port 45194)
 
 | Path | What's In It |
 |---|---|
 | `/opt/voiceserver/` | Cloned repo with built dist/ |
-| `/opt/voiceserver/.env` | Production environment config |
-| `/opt/voiceserver/ecosystem.config.cjs` | PM2 config: voiceserver + tunnel-ipc + tunnel-ws |
+| `/opt/voiceserver/.env` | Production environment config (see below) |
+| `/opt/voiceserver/ecosystem.config.cjs` | PM2 config: voiceserver + ollama + 3 tunnels |
 | `/opt/voiceserver/dist/index.js` | Compiled entry point (PM2 runs this) |
-| `/opt/voiceserver/start-tunnel-ipc.sh` | Cloudflared tunnel script for IPC (port 8766) |
-| `/opt/voiceserver/start-tunnel-ws.sh` | Cloudflared tunnel script for WebSocket (port 8765) |
-| `/opt/voiceserver/start-tunnel-ollama.sh` | Cloudflared tunnel script for Ollama (port 11434) |
-| `/opt/voiceserver/start-ollama.sh` | Ollama startup script with OLLAMA_ORIGINS=* |
-| `/models/kokoro/kokoro-v1.0.onnx` | Kokoro TTS model (311MB) |
-| `/models/kokoro/voices-v1.0.bin` | Kokoro voice data (27MB) |
-| `/data/cloned-voices/` | KokoClone cloned voice storage |
-| `/data/model-config.json` | Model manager persistent config (active models) |
-| `/var/log/voiceserver/out.log` | Voice server stdout log |
-| `/var/log/voiceserver/error.log` | Voice server stderr log |
-| `/var/log/voiceserver/tunnel-ipc.log` | IPC tunnel log (contains tunnel URL) |
-| `/var/log/voiceserver/tunnel-ws.log` | WS tunnel log (contains tunnel URL) |
+| `/opt/voiceserver/start-tunnel-ipc.sh` | Cloudflared tunnel → localhost:8766 |
+| `/opt/voiceserver/start-tunnel-ws.sh` | Cloudflared tunnel → localhost:8765 |
+| `/opt/voiceserver/start-tunnel-ollama.sh` | Cloudflared tunnel → localhost:11434 |
+| `/opt/voiceserver/start-ollama.sh` | Ollama startup with OLLAMA_ORIGINS=* |
+| `/root/.cache/huggingface/` | HuggingFace model cache (Granite STT + Kokoro voice packs) |
+| `/var/log/voiceserver/` | PM2 log files (out.log, error.log, tunnel-*.log) |
 
-### Current .env on Vast.ai
+### Current .env on Vast.ai (`/opt/voiceserver/.env`)
 
 ```env
 WS_PORT=8765
@@ -184,26 +155,61 @@ CLONED_VOICES_DIR=/data/cloned-voices
 OLLAMA_URL=http://localhost:11434/v1
 DEFAULT_LLM=qwen3:4b
 NODE_ENV=production
+HF_HOME=/root/.cache/huggingface
 VAPICLONE_API_URL=https://vapiclone-production.up.railway.app
+VAPICLONE_API_KEY=vs-internal-secret-2026
+IPC_SECRET=vs-ipc-2026
 ```
 
 ### Current PM2 Processes
 
 | Name | Script | Purpose |
 |---|---|---|
-| ollama | start-ollama.sh | Ollama LLM server (with OLLAMA_ORIGINS=* for tunnel access) |
+| ollama | start-ollama.sh | Ollama LLM server (OLLAMA_ORIGINS=* for tunnel) |
 | voiceserver | dist/index.js | Main voice processing server |
 | tunnel-ipc | start-tunnel-ipc.sh | Cloudflared tunnel for IPC HTTP (port 8766) |
 | tunnel-ws | start-tunnel-ws.sh | Cloudflared tunnel for WebSocket (port 8765) |
-| tunnel-ollama | start-tunnel-ollama.sh | Cloudflared tunnel for Ollama API (port 11434) |
+| tunnel-ollama | start-tunnel-ollama.sh | Cloudflared tunnel for Ollama (port 11434) |
 
 ### Current Cloudflared Tunnel URLs
 
 | Service | URL |
 |---|---|
-| IPC (health, models, call registration) | `https://plaintiff-databases-brave-isolation.trycloudflare.com` |
-| WebSocket (Twilio audio stream) | `wss://cup-delegation-shake-stickers.trycloudflare.com` |
-| Ollama API (LLM inference from Railway) | `https://occupational-briefly-flag-cas.trycloudflare.com` |
+| IPC (VOICE_SERVER_IPC_URL) | `https://plaintiff-databases-brave-isolation.trycloudflare.com` |
+| WebSocket (VOICE_SERVER_URL) | `wss://cup-delegation-shake-stickers.trycloudflare.com` |
+| Ollama (OLLAMA_URL) | `https://occupational-briefly-flag-cas.trycloudflare.com/v1` |
+
+---
+
+## Debugging Commands
+
+```bash
+# Check voiceserver logs (from Mac terminal)
+curl -s -H "x-ipc-secret: vs-ipc-2026" \
+  "https://plaintiff-databases-brave-isolation.trycloudflare.com/logs?lines=50" \
+  | python3 -c "import sys,json; [print(l) for l in json.load(sys.stdin)['lines']]"
+
+# SSH into GPU
+ssh -p 45194 root@70.29.210.33
+
+# After SSH: deploy latest code
+export PATH="/opt/nvm/versions/node/v24.12.0/bin:/opt/instance-tools/bin:$PATH"
+cd /opt/voiceserver && git pull && npm run build && pm2 restart voiceserver --update-env
+
+# Get current tunnel URLs (after restart)
+pm2 logs tunnel-ipc --lines 5 --nostream
+pm2 logs tunnel-ws --lines 5 --nostream
+pm2 logs tunnel-ollama --lines 5 --nostream
+
+# Check GPU usage
+nvidia-smi
+
+# Check Ollama models
+ollama list
+
+# Watch live logs
+pm2 logs voiceserver
+```
 
 ---
 
@@ -217,21 +223,29 @@ Twilio (phone call audio)
 [Audio Conversion] → PCM 16-bit 16kHz
     |
     v
-[STT: IBM Granite / Whisper / Deepgram]
+[STT: IBM Granite persistent subprocess]
+  - Python process lives across all calls
+  - Sends audio WAV path via stdin
+  - Gets transcript via stdout
     |
     v  text transcript
     |
 [LLM: Ollama qwen3 / OpenAI / DeepSeek]
-    |  (includes system prompt, conversation history, tools)
+  - system prompt + conversation history + tools
+  - 2000-token minimum for Ollama (qwen3 thinking models)
+    |
     v  response text (+ optional tool calls)
     |
-[Tool Executor] → function webhooks, call transfer, DTMF, end call
+[Tool Executor] → function webhooks, transfer, DTMF, end call
     |
     v  final response text
     |
-[TTS: Kokoro / Piper / ElevenLabs]
+[TTS: Kokoro persistent subprocess]
+  - Python process lives across all calls
+  - Sends JSON command via stdin
+  - Gets length-prefixed PCM via stdout
     |
-    v  PCM 16-bit audio
+    v  PCM 16-bit 24kHz → resampled to 16kHz
     |
 [Audio Conversion] → mu-law 8kHz mono
     |
@@ -248,10 +262,9 @@ Twilio → Caller hears AI response
 |---|---|
 | Runtime | Node.js 22+ (TypeScript) |
 | WebSocket | ws 8.18 |
-| STT | IBM Granite 4.0 1B (default), faster-whisper (fallback), Deepgram (optional paid) |
-| TTS | Kokoro-82M (default), Piper (fallback), ElevenLabs (optional paid) |
-| LLM | Ollama + Qwen3 (default), OpenAI/DeepSeek (optional paid) |
-| Voice Cloning | KokoClone (Kokoro + Kanade) |
+| STT | IBM Granite 4.0 1B (persistent subprocess, default), faster-whisper (fallback), Deepgram (paid) |
+| TTS | Kokoro-82M (persistent subprocess, default), Piper (fallback), ElevenLabs (paid) |
+| LLM | Ollama + Qwen3 (default), OpenAI/DeepSeek (paid) |
 | GPU | NVIDIA RTX 4090 (24GB VRAM) on Vast.ai |
 | Process Manager | PM2 (auto-restart, boot persistence) |
 | Tunneling | Cloudflared quick tunnels |
