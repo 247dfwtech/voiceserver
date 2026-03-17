@@ -1,5 +1,5 @@
 import { EventEmitter } from "events";
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 import { writeFile, unlink } from "fs/promises";
@@ -8,16 +8,229 @@ import type { STTProvider, STTConfig } from "./interface";
 /**
  * IBM Granite 4.0 1B Speech STT provider.
  *
- * Uses the HuggingFace transformers pipeline for transcription.
- * Key advantages over Whisper:
- * - #1 on OpenASR leaderboard (better accuracy)
- * - Keyword biasing for names/acronyms (critical for sales calls)
- * - Smaller model (1B params, ~2GB VRAM vs Whisper large-v3's 3GB)
- * - Apache 2.0 license
+ * Uses a PERSISTENT Python subprocess that loads the model once into GPU memory
+ * and processes transcription requests via stdin/stdout without reloading.
  *
- * Strategy: Same batch approach as Whisper — buffer audio until
- * utterance boundary (silence detection), then transcribe.
+ * Key advantages over per-request subprocess:
+ * - Model loads once (~30s cold start, then cached)
+ * - Each transcription takes 0.5-2s instead of 15-30s
+ * - No more 15s timeout failures
+ *
+ * Protocol:
+ *   stdin:  <audio_file_path>\n
+ *   stdout: <transcription_text>\n  (or "ERROR: <message>\n")
  */
+
+// Module-level singleton so all call sessions share one loaded model process
+let graniteProcess: ChildProcess | null = null;
+let graniteReady = false;
+let graniteReadyPromise: Promise<void> | null = null;
+let pendingResolve: ((text: string) => void) | null = null;
+let pendingReject: ((err: Error) => void) | null = null;
+let stdoutBuffer = "";
+
+const DEFAULT_MODEL = "ibm-granite/granite-4.0-1b-speech";
+
+function getModelId(config: STTConfig): string {
+  // Only use config.model if it looks like a valid HuggingFace ID (contains '/').
+  // Reject Deepgram/Vapi model names like "flux-general-en", "nova-2-general".
+  const configModel = config.model && config.model.includes("/") ? config.model : null;
+  return configModel || DEFAULT_MODEL;
+}
+
+function buildPythonScript(modelId: string): string {
+  return `
+import sys, os
+
+# Redirect all stdout noise to stderr before importing heavy libs
+_orig_stdout = sys.stdout.buffer
+sys.stdout = sys.stderr
+
+import torch
+import soundfile as sf
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+model_id = "${modelId}"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+print(f"GRANITE_LOADING model={model_id} device={device}", flush=True)
+
+processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForSpeechSeq2Seq.from_pretrained(
+    model_id,
+    torch_dtype=torch_dtype,
+    trust_remote_code=True,
+).to(device)
+
+print("GRANITE_READY", flush=True)
+
+# Main loop: read audio file paths from stdin, write transcription to stdout
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+
+    try:
+        audio_data, sample_rate = sf.read(line)
+        inputs = processor(
+            audio_data,
+            sampling_rate=sample_rate,
+            return_tensors="pt",
+        ).to(device)
+
+        with torch.no_grad():
+            predicted_ids = model.generate(**inputs, max_new_tokens=440)
+
+        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+        _orig_stdout.write((transcription + "\\n").encode())
+        _orig_stdout.flush()
+        print(f"GRANITE_OK chars={len(transcription)}", flush=True)
+
+    except Exception as e:
+        _orig_stdout.write(f"ERROR: {e}\\n".encode())
+        _orig_stdout.flush()
+        print(f"GRANITE_ERR {e}", flush=True)
+`.trim();
+}
+
+function ensureGraniteProcess(modelId: string): Promise<void> {
+  if (graniteReady && graniteProcess && !graniteProcess.killed) return Promise.resolve();
+  if (graniteReadyPromise) return graniteReadyPromise;
+
+  graniteReadyPromise = new Promise<void>((resolve, reject) => {
+    console.log("[stt/granite] Starting Granite persistent Python process...");
+
+    const script = buildPythonScript(modelId);
+    graniteProcess = spawn("python3", ["-u", "-c", script], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    });
+
+    let stderrBuf = "";
+    let resolved = false;
+
+    // Parse stdout lines — each line is a transcription response or ERROR:
+    graniteProcess.stdout!.on("data", (data: Buffer) => {
+      stdoutBuffer += data.toString();
+      const newline = stdoutBuffer.indexOf("\n");
+      if (newline !== -1) {
+        const line = stdoutBuffer.slice(0, newline).trim();
+        stdoutBuffer = stdoutBuffer.slice(newline + 1);
+
+        if (pendingResolve) {
+          const cb = pendingResolve;
+          const cbErr = pendingReject;
+          pendingResolve = null;
+          pendingReject = null;
+
+          if (line.startsWith("ERROR:")) {
+            cbErr?.(new Error(line.slice(6).trim()));
+          } else {
+            cb(line);
+          }
+        }
+      }
+    });
+
+    graniteProcess.stderr!.on("data", (data: Buffer) => {
+      const text = data.toString();
+      stderrBuf += text;
+
+      for (const line of text.split("\n").filter((l) => l.trim())) {
+        if (line.includes("GRANITE_READY")) {
+          if (!resolved) {
+            resolved = true;
+            graniteReady = true;
+            console.log("[stt/granite] Granite model loaded and ready");
+            resolve();
+          }
+        } else if (line.includes("GRANITE_OK") || line.includes("GRANITE_LOADING")) {
+          console.log(`[stt/granite] ${line.trim()}`);
+        } else if (line.includes("GRANITE_ERR")) {
+          console.error(`[stt/granite] ${line.trim()}`);
+        }
+      }
+    });
+
+    graniteProcess.on("error", (err) => {
+      console.error("[stt/granite] Python process error:", err.message);
+      graniteReady = false;
+      graniteReadyPromise = null;
+      graniteProcess = null;
+      pendingReject?.(err);
+      pendingResolve = null;
+      pendingReject = null;
+      if (!resolved) reject(err);
+    });
+
+    graniteProcess.on("exit", (code) => {
+      console.warn(`[stt/granite] Python process exited with code ${code}`);
+      graniteReady = false;
+      graniteProcess = null;
+      graniteReadyPromise = null;
+      if (pendingReject) {
+        pendingReject(new Error(`Granite process exited (code ${code})`));
+        pendingResolve = null;
+        pendingReject = null;
+      }
+      if (!resolved) reject(new Error(`Granite process exited (code ${code}): ${stderrBuf.slice(-500)}`));
+    });
+
+    // Allow up to 180s for first cold-start model download + load
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        graniteProcess?.kill("SIGTERM");
+        graniteReady = false;
+        graniteReadyPromise = null;
+        reject(new Error(`Granite model load timed out after 180s. stderr: ${stderrBuf.slice(-300)}`));
+      }
+    }, 180_000);
+  });
+
+  return graniteReadyPromise;
+}
+
+async function transcribeFile(audioPath: string, modelId: string): Promise<string> {
+  await ensureGraniteProcess(modelId);
+
+  return new Promise<string>((resolve, reject) => {
+    if (!graniteProcess || !graniteProcess.stdin) {
+      reject(new Error("Granite process not available"));
+      return;
+    }
+
+    if (pendingResolve) {
+      reject(new Error("Granite is already processing a request"));
+      return;
+    }
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      pendingResolve = null;
+      pendingReject = null;
+      reject(new Error("Granite transcription timed out after 30s"));
+    }, 30_000);
+
+    pendingResolve = (text) => {
+      if (!timedOut) {
+        clearTimeout(timer);
+        resolve(text);
+      }
+    };
+    pendingReject = (err) => {
+      if (!timedOut) {
+        clearTimeout(timer);
+        reject(err);
+      }
+    };
+
+    graniteProcess.stdin.write(audioPath + "\n");
+  });
+}
+
 export class GraniteSTT extends EventEmitter implements STTProvider {
   private config: STTConfig;
   private audioBuffer: Buffer[] = [];
@@ -29,89 +242,18 @@ export class GraniteSTT extends EventEmitter implements STTProvider {
   private modelId: string;
   private speechThreshold = 500;
   private silenceThresholdFrames = 25; // 25 * 20ms = 500ms of silence
-  private pythonScript: string;
 
   constructor(config: STTConfig) {
     super();
     this.config = config;
-    // Only use config.model if it looks like a valid HuggingFace ID (contains '/').
-    // Reject Deepgram/Vapi model names like "flux-general-en", "nova-2-general".
-    const configModel = config.model && config.model.includes("/") ? config.model : null;
-    this.modelId = configModel || "ibm-granite/granite-4.0-1b-speech";
-
-    // Build keyword bias argument for the Python script
-    const keywords = config.keywords?.length
-      ? JSON.stringify(config.keywords)
-      : "[]";
-
-    // Python script that loads and runs the Granite model
-    // The model is cached after first load, subsequent calls are fast
-    this.pythonScript = `
-import sys, json, torch
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-
-model_id = "${this.modelId}"
-device = "cuda" if torch.cuda.is_available() else "cpu"
-torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
-# Load model and processor (cached by transformers after first download)
-processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-model = AutoModelForSpeechSeq2Seq.from_pretrained(
-    model_id,
-    torch_dtype=torch_dtype,
-    trust_remote_code=True,
-).to(device)
-
-# Read audio file path from stdin
-audio_path = sys.stdin.readline().strip()
-keywords = ${keywords}
-
-import soundfile as sf
-audio_data, sample_rate = sf.read(audio_path)
-
-# Prepare inputs
-inputs = processor(
-    audio_data,
-    sampling_rate=sample_rate,
-    return_tensors="pt",
-).to(device)
-
-# Build generation kwargs
-gen_kwargs = {"max_new_tokens": 440}
-
-# Add keyword biasing if keywords provided
-if keywords:
-    gen_kwargs["decoder_input_ids"] = None
-    # Granite supports keyword biasing through prompt
-    keyword_str = ", ".join(keywords)
-    gen_kwargs["prompt_ids"] = processor.get_prompt_ids(f"Keywords: {keyword_str}")
-
-# Generate transcription
-with torch.no_grad():
-    predicted_ids = model.generate(**inputs, **gen_kwargs)
-
-# Decode
-transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-print(transcription.strip())
-`.trim();
+    this.modelId = getModelId(config);
   }
 
   async start(): Promise<void> {
-    // Verify Python + transformers are available
-    try {
-      const proc = spawn("python3", ["-c", "import transformers; print('ok')"], { stdio: "pipe" });
-      const result = await new Promise<string>((resolve, reject) => {
-        let stdout = "";
-        proc.stdout?.on("data", (d) => (stdout += d.toString()));
-        proc.on("close", (code) => {
-          if (code === 0 && stdout.includes("ok")) resolve(stdout);
-          else reject(new Error("transformers not available"));
-        });
-        proc.on("error", reject);
-      });
-    } catch (err) {
-      console.warn(`[stt/granite] ${err instanceof Error ? err.message : err}. Install: pip install transformers torch soundfile`);
-    }
+    // Kick off model loading in the background so first utterance isn't slow
+    ensureGraniteProcess(this.modelId).catch((err) => {
+      console.warn(`[stt/granite] Background model load failed: ${err.message}`);
+    });
   }
 
   send(audio: Buffer): void {
@@ -119,7 +261,6 @@ print(transcription.strip())
 
     this.audioBuffer.push(audio);
 
-    // Simple VAD: detect speech/silence transitions
     const rms = this.calculateRMS(audio);
 
     if (rms > this.speechThreshold) {
@@ -164,7 +305,7 @@ print(transcription.strip())
         this.emit("transcript", {
           text: transcript.trim(),
           isFinal: true,
-          confidence: 0.95, // Granite is #1 on OpenASR
+          confidence: 0.95,
         });
         this.emit("utterance_end");
       }
@@ -177,50 +318,15 @@ print(transcription.strip())
 
   private async transcribeWithGranite(pcmData: Buffer): Promise<string> {
     const tmpPath = join(tmpdir(), `granite-${Date.now()}.wav`);
-
     try {
       const wavBuffer = this.pcmToWav(pcmData, 16000, 16, 1);
       await writeFile(tmpPath, wavBuffer);
-
-      const result = await new Promise<string>((resolve, reject) => {
-        const proc: ChildProcess = spawn("python3", ["-c", this.pythonScript], {
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-
-        let stdout = "";
-        let stderr = "";
-
-        proc.stdout?.on("data", (data) => (stdout += data.toString()));
-        proc.stderr?.on("data", (data) => (stderr += data.toString()));
-
-        // Send the audio file path to stdin
-        proc.stdin?.write(tmpPath + "\n");
-        proc.stdin?.end();
-
-        proc.on("close", (code) => {
-          if (code === 0) {
-            resolve(stdout.trim());
-          } else {
-            reject(new Error(`Granite STT failed (exit ${code}): ${stderr.slice(-500)}`));
-          }
-        });
-
-        proc.on("error", reject);
-
-        // Timeout after 15 seconds (first run downloads model)
-        setTimeout(() => {
-          proc.kill("SIGTERM");
-          reject(new Error("Granite transcription timed out"));
-        }, 15000);
-      });
-
-      return result;
+      return await transcribeFile(tmpPath, this.modelId);
     } finally {
       try { await unlink(tmpPath); } catch {}
     }
   }
 
-  /** Convert raw PCM to WAV format */
   private pcmToWav(pcm: Buffer, sampleRate: number, bitsPerSample: number, channels: number): Buffer {
     const byteRate = sampleRate * channels * (bitsPerSample / 8);
     const blockAlign = channels * (bitsPerSample / 8);
