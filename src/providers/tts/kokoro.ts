@@ -56,6 +56,7 @@ export class KokoroTTS implements TTSProvider {
   private pythonProcess: ChildProcess | null = null;
   private ready = false;
   private readyPromise: Promise<void> | null = null;
+  private synthQueue: Promise<Buffer> = Promise.resolve(Buffer.alloc(0));
 
   constructor(config: TTSConfig) {
     this.config = config;
@@ -218,7 +219,22 @@ for line in sys.stdin:
 
   async synthesize(
     text: string,
-    onChunk?: (chunk: Buffer) => void
+    onChunk?: (chunk: Buffer) => void,
+    voiceOverride?: string
+  ): Promise<Buffer> {
+    // Queue requests so only one synthesis runs at a time.
+    // The Python subprocess handles requests sequentially; concurrent
+    // callers attaching onData listeners causes response mix-ups.
+    const prev = this.synthQueue;
+    const result = prev.catch(() => {}).then(() => this._doSynthesize(text, onChunk, voiceOverride));
+    this.synthQueue = result.catch(() => Buffer.alloc(0));
+    return result;
+  }
+
+  private async _doSynthesize(
+    text: string,
+    onChunk?: (chunk: Buffer) => void,
+    voiceOverride?: string
   ): Promise<Buffer> {
     await this.ensureReady();
 
@@ -230,7 +246,7 @@ for line in sys.stdin:
 
       const cmd = JSON.stringify({
         text,
-        voice: this.voiceId,
+        voice: voiceOverride || this.voiceId,
         speed: this.speed,
       });
 

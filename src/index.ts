@@ -1110,8 +1110,8 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
 
           if (sampleProvider === "kokoro" || !sampleProvider || sampleProvider === "piper") {
             const tts = await getOrCreateKokoroSingleton(sampleVoice);
-            audioBuffer = await tts.synthesize(sampleText);
-            sampleRate = 24000; // Kokoro outputs 24kHz PCM
+            audioBuffer = await tts.synthesize(sampleText, undefined, sampleVoice);
+            sampleRate = 16000; // synthesize returns 16kHz after resampling
           } else {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: `Provider '${sampleProvider}' not supported for preview` }));
