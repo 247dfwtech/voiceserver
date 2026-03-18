@@ -70,8 +70,8 @@ model = AutoModelForSpeechSeq2Seq.from_pretrained(
     model_id,
     trust_remote_code=True,
     torch_dtype=torch_dtype,
-    device_map=device_str,
 )
+model = model.to(device_str)
 model.eval()
 
 # Build the transcription prompt with chat template (done once, reused per request)
