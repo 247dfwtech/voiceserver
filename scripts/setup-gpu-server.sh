@@ -15,6 +15,7 @@
 #   - Kokoro TTS:              ~0.5GB (persistent subprocess, loads once)
 #   - Qwen3.5:9b:              ~6.0GB (via Ollama)
 #   - Chatterbox Turbo:        ~4.2GB (persistent subprocess, 5-min idle timeout)
+#   - Deepgram STT:            0GB (cloud API, no GPU — needs DEEPGRAM_API_KEY)
 #   - Headroom:                ~13GB
 #
 # ⚠️  VAST.AI INSTANCE COPY NOTE:
@@ -37,12 +38,17 @@
 #      - hexgrad/Kokoro-82M (~313MB) + all 4 voice packs (af_heart, af_nicole, am_adam, af_sarah)
 #      - ResembleAI/chatterbox-turbo (~4GB) — voice cloning
 #   9. Clones/updates voiceserver repo, npm install, tsc build
-#  10. Creates .env with all required keys (including CHATTERBOX_VOICES_DIR, CONDA_PATH)
+#  10. Creates .env with all required keys (including DEEPGRAM_API_KEY placeholder)
 #  11. Creates cloudflared tunnel scripts
 #  12. Creates PM2 ecosystem config (fork mode) with all 5 processes
 #  13. Starts all processes, saves PM2 config for boot persistence
 #  14. Verifies GPU monitoring endpoints (/health with GPU data, /metrics/history)
 #  15. Prints tunnel URLs for Railway env var setup
+#
+# POST-SETUP: API keys (Deepgram, OpenAI, etc.) can be set via:
+#   - VapiClone Settings page (auto-syncs to GPU server via /settings API)
+#   - GitHub Secrets (auto-synced on deploy via GitHub Actions)
+#   - Manual: echo 'DEEPGRAM_API_KEY=xxx' >> /opt/voiceserver/.env
 ###############################################################################
 
 set -euo pipefail
@@ -120,8 +126,8 @@ CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | awk '{print $NF}')
 log "GPU detected: ${GPU_NAME} (${GPU_VRAM} MiB VRAM, CUDA ${CUDA_VERSION})"
 
 if [ "${GPU_VRAM}" -lt 8000 ]; then
-  warn "Less than 8GB VRAM detected. Granite STT + Kokoro TTS + qwen3:4b require ~5.5GB total."
-  warn "Consider a smaller LLM model."
+  warn "Less than 8GB VRAM detected. Whisper STT + Kokoro TTS + qwen3.5:9b require ~7GB total."
+  warn "Consider using Deepgram STT (cloud, 0 VRAM) and a smaller LLM model."
 fi
 
 ###############################################################################
@@ -275,15 +281,13 @@ info "Installing Kokoro TTS..."
 pip3 install --no-cache-dir "kokoro>=0.9" soundfile -q 2>&1 | tail -1
 log "Kokoro TTS installed"
 
-# Transformers + huggingface_hub for Granite STT (persistent subprocess)
-info "Installing Granite STT dependencies (transformers)..."
-pip3 install --no-cache-dir transformers huggingface_hub soundfile -q 2>&1 | tail -1
-log "Granite STT dependencies installed"
-
-# faster-whisper (STT fallback)
-info "Installing faster-whisper (STT fallback)..."
+# faster-whisper (PRIMARY STT — free, local GPU, keyword biasing)
+info "Installing faster-whisper (primary STT)..."
 pip3 install --no-cache-dir faster-whisper -q 2>&1 | tail -1
 log "faster-whisper installed"
+
+# huggingface_hub for model downloads
+pip3 install --no-cache-dir huggingface_hub soundfile -q 2>&1 | tail -1
 
 # Piper TTS (fallback for CPU-only)
 info "Installing piper-tts (TTS fallback)..."
@@ -360,7 +364,7 @@ fi
 # 6. Pre-download AI models (with HF_HOME set correctly)
 ###############################################################################
 
-mkdir -p "${MODELS_DIR}/piper" "${MODELS_DIR}/granite" "${MODELS_DIR}/kokoro"
+mkdir -p "${MODELS_DIR}/piper" "${MODELS_DIR}/kokoro"
 mkdir -p "${DATA_DIR}/cloned-voices" "${DATA_DIR}/chatterbox-voices/references"
 
 # Kokoro-82M TTS model + voice packs
@@ -501,8 +505,6 @@ IPC_PORT=8766
 
 # Model directories
 PIPER_MODELS_DIR=/models/piper
-WHISPER_MODEL=base.en
-GRANITE_MODELS_DIR=/models/granite
 KOKORO_MODELS_DIR=/models/kokoro
 KOKORO_VOICE=af_heart
 CLONED_VOICES_DIR=/data/cloned-voices
@@ -523,7 +525,7 @@ VAPICLONE_API_URL=${VAPICLONE_API_URL_DEFAULT}
 VAPICLONE_API_KEY=${VAPICLONE_API_KEY_DEFAULT}
 IPC_SECRET=${IPC_SECRET_DEFAULT}
 
-# Optional: Paid provider API keys (uncomment and fill in if needed)
+# Paid provider API keys (can also be set via VapiClone Settings UI)
 # DEEPGRAM_API_KEY=
 # ELEVENLABS_API_KEY=
 # OPENAI_API_KEY=

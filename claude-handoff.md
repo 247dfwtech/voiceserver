@@ -1,6 +1,6 @@
 # VoiceServer — Claude Handoff Document
 
-**Last updated:** 2026-03-18 (rev 7)
+**Last updated:** 2026-03-18 (rev 8)
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
@@ -20,14 +20,16 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 - **Full voice pipeline CONFIRMED WORKING** — STT → LLM → TTS end-to-end in live calls
 - **WebSocket server** (port 8765) — Accepts Twilio Media Stream connections
 - **IPC HTTP server** (port 8766) — Health checks, model management, call registration, TTS testing
-- **Whisper STT (small.en)** ✅ — Persistent Python subprocess using `faster-whisper` package. Model loads once into GPU VRAM. Keyword biasing via `initial_prompt` for domain terms. 1000ms silence threshold for natural phone pauses.
+- **Whisper STT (small.en)** ✅ — Persistent Python subprocess using `faster-whisper` package. Model loads once into GPU VRAM. Keyword biasing via `initial_prompt` for domain terms. 1000ms silence threshold for natural phone pauses. FIFO transcription queue (no race condition).
+- **Deepgram Flux STT** ✅ — Cloud-based turn-based streaming via `wss://api.deepgram.com/v2/listen`. Native end-of-turn detection (no manual VAD needed). Supports `flux-general-en` (recommended for voice agents), `nova-3-general`, `nova-2-general`. Keyterm prompting for domain terms. Requires `DEEPGRAM_API_KEY`.
 - **Kokoro-82M TTS** ✅ — Module-level singleton persistent Python subprocess shared across ALL call sessions. 54 voices, sub-0.3s latency on RTX 4090. All voice packs pre-downloaded.
 - **Ollama with qwen3.5:9b** ✅ — LLM for conversation + tool calling. `<think>` blocks handled with 2000-token minimum.
 - **Tool execution** ✅ — Function webhooks, call transfer, DTMF, end_call_tool confirmed working in live calls
 - **KokoClone voice cloning** — Clone voices from 3-10s reference audio samples using Kokoro + Kanade voice conversion
 - **Chatterbox Turbo voice cloning** ✅ — Clone voices from ~10s reference audio using Resemble AI's Chatterbox Turbo model. Persistent Python subprocess (conda env `chatterbox`), 24kHz output resampled to 16kHz, ~4.2GB VRAM. IPC endpoints at `/chatterbox/*`.
 - **Model manager** — Install/activate/remove LLM/STT/TTS models via IPC API
-- **Post-call analysis** — Summary generation and success evaluation (needs fix: hardcoded model name)
+- **Settings API** ✅ — `GET/PUT /settings` endpoint for runtime API key management. Keys persist to `.env` + `process.env` (no restart needed). VapiClone Settings page auto-syncs keys to GPU server.
+- **Post-call analysis** — Summary generation and success evaluation (uses DEFAULT_LLM env var)
 - **Voicemail detection** — Detects sustained speech patterns in first 5 seconds (disabled by default for testing)
 - **Cost tracking** — Per-call breakdown (STT, LLM, TTS, transport). Local models = $0.
 - **PM2 managed** — voiceserver + ollama + 3 cloudflared tunnels, auto-restart, boot persistence
@@ -40,12 +42,30 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 
 - **Cloudflared tunnel URLs are ephemeral** — Quick tunnels generate random `trycloudflare.com` URLs. If tunnel processes restart, URLs change and Railway env vars need manual updating. Need Cloudflare named tunnel.
 - **Post-call analysis model** — `analysis-runner.ts` uses `process.env.DEFAULT_LLM || "qwen3.5:9b"` (fixed). Old log errors referencing `qwen3:4b` are from before the fix was deployed.
-- **Transcription accuracy still improving** — Whisper `small.en` is better than `base.en` but phone audio (8kHz mulaw → 16kHz PCM) is inherently low quality. Consider `medium.en` or Deepgram for production.
-- **Granite STT experimental** — IBM Granite 4.0 1B Speech has a non-standard multimodal chat API (not a standard ASR pipeline). Works but had 4+ different API errors during development. Whisper is the recommended default. Granite code is kept as experimental option.
+- **Transcription accuracy still improving** — Whisper `small.en` is better than `base.en` but phone audio (8kHz mulaw → 16kHz PCM) is inherently low quality. Deepgram Flux is now available as a cloud alternative with native end-of-turn detection. Consider `medium.en` for higher local accuracy.
 
 ---
 
-## What Was Just Completed (Session 7 — March 2026)
+## What Was Just Completed (Session 8 — March 2026)
+
+### Deepgram STT + Bug Fixes + Settings API + Error Handling
+
+1. **Deepgram Flux STT provider** — New `src/providers/stt/deepgram.ts`. Turn-based streaming via WebSocket (`wss://api.deepgram.com/v2/listen`). Native end-of-turn detection — no manual VAD/silence thresholds needed. Supports `flux-general-en` (voice agent optimized), `nova-3-general`, `nova-2-general`. Keyterm prompting, auto-reconnect, 10s keepalive.
+2. **Whisper STT race condition fix** — Replaced single `pendingResolve`/`pendingReject` with proper FIFO queue. Concurrent transcription requests now serialize safely instead of dropping callbacks.
+3. **TTS stuck-state fix** — Added `onError` callback to `TTSProvider.synthesizeStream()` interface. All TTS providers (Kokoro, Chatterbox, Piper) now call `onError` on failure. Call session resets `isSpeaking` + state on TTS error.
+4. **LLM error recovery** — `onDone("")` now fires on stream error so sessions transition back to `waiting_for_speech` instead of hanging in `processing` state.
+5. **Settings API** — New `GET/PUT /settings` IPC endpoint. Allows VapiClone to push API keys (Deepgram, OpenAI, ElevenLabs, DeepSeek) at runtime. Persists to `.env` file + `process.env`. No restart needed.
+6. **Deploy workflow API key sync** — `.github/workflows/deploy.yml` now syncs API keys from GitHub Secrets into `.env` on every deploy.
+7. **Sentence chunking tuning** — TTS now splits on sentence-ending punctuation (`.!?`) at 20+ chars instead of eagerly splitting on commas. Long text (80+) still splits on commas.
+8. **Voicemail detection tuning** — Threshold increased 60→150 frames (1.2s→3s continuous speech), speech ratio 0.7→0.8, added min 100 speech frames check.
+9. **STT error counter** — 3 consecutive STT errors auto-end the call with reason `stt-failure`.
+10. **IPC error logging** — `ipcError()` helper replaces 11 silent catch blocks. All errors now logged with method + path context.
+11. **Pending config TTL** — 30s interval sweeps configs older than 60s (replaces per-call setTimeout).
+12. **Default STT changed** — Granite removed from provider factory. Default is now Whisper `small.en`. Granite code still exists but won't load/use GPU.
+
+---
+
+## Session 7 — March 2026
 
 ### GPU Monitoring + Server Debugging
 
@@ -130,7 +150,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 | Decision | Why |
 |---|---|
 | RTX 4090 on Vast.ai | Best price/performance. ~$0.30/hr reserved. Runs all 3 AI models with headroom. |
-| **Whisper over Granite for STT** | Granite has non-standard multimodal API that caused 4+ different errors. Whisper is battle-tested, simple, reliable. Granite kept as experimental. |
+| **Whisper as default STT, Deepgram as paid option** | Whisper is free/local/reliable. Deepgram Flux has native end-of-turn detection (best for voice agents) but costs $0.0059/min. Granite removed (non-standard API, 4+ errors). |
 | Persistent Python subprocesses | Models load once into GPU VRAM. Per-request subprocess was loading models every utterance (15-30s). Persistent process: 0.3-2s. |
 | `small.en` Whisper model | Best balance of accuracy and speed for real-time phone calls. `base.en` too inaccurate, `medium.en` too slow. |
 | Keyword biasing via initial_prompt | Whisper hears "Freedom Forever" correctly instead of "freedom for ever" when initial_prompt contains the term. |
@@ -147,13 +167,13 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 
 | Component | Model | VRAM | Status |
 |-----------|-------|------|--------|
-| **STT** | Whisper `small.en` | ~500MB | ✅ Active (persistent subprocess) |
+| **STT** | Whisper `small.en` | ~500MB | ✅ Active (persistent subprocess, default) |
+| **STT** | Deepgram Flux `flux-general-en` | 0 (cloud) | ✅ Available (needs `DEEPGRAM_API_KEY`) |
 | **LLM** | qwen3.5:9b | ~5-6GB | ✅ Active (Ollama) |
 | **TTS** | Kokoro-82M | ~500MB | ✅ Active (persistent subprocess) |
 | **TTS (cloning)** | Chatterbox Turbo | ~4.2GB | ✅ Available (persistent subprocess, idle timeout) |
 | TTS (cloning) | KokoClone | ~200MB | ✅ Available (one-off subprocess per synthesis) |
-| STT (experimental) | IBM Granite 4.0 1B Speech | ~2GB | ❌ Inactive (code exists, not recommended) |
-| LLM (deleted) | qwen3:4b | — | ❌ Deleted from Ollama |
+| STT (deprecated) | IBM Granite 4.0 1B Speech | ~2GB | ❌ Removed from factory (code exists, not loaded) |
 | **Total VRAM during call** | | **~7GB** (up to ~11GB with Chatterbox) | Within 24GB RTX 4090 |
 
 ---
@@ -194,8 +214,9 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 | `src/index.ts` | Main entry — WebSocket (8765) + IPC HTTP (8766), session management, `/logs`, `/health/gpu`, `/metrics/history` endpoints |
 | `src/gpu-monitor.ts` | **GPU/CPU/Memory metrics** — nvidia-smi integration, ring buffer (3-day, 30s interval), snapshot collection |
 | `src/model-manager.ts` | Model lifecycle — install/activate/remove. Default STT: whisper/small.en |
-| `src/providers/stt/whisper.ts` | **Whisper STT — persistent Python subprocess**, module-level singleton, JSON stdin protocol with keyword biasing |
-| `src/providers/stt/granite.ts` | Granite STT — experimental, non-standard multimodal chat API, not recommended |
+| `src/providers/stt/whisper.ts` | **Whisper STT — persistent Python subprocess**, module-level singleton, FIFO queue, keyword biasing |
+| `src/providers/stt/deepgram.ts` | **Deepgram Flux STT** — turn-based WebSocket streaming, native end-of-turn, keyterms |
+| `src/providers/stt/granite.ts` | Granite STT — deprecated, not loaded by provider factory |
 | `src/providers/tts/kokoro.ts` | **Kokoro-82M TTS — module-level singleton**, shared across all calls, binary PCM protocol |
 | `src/providers/tts/kokoclone.ts` | KokoClone voice cloning (Kokoro + Kanade voice conversion) |
 | `src/providers/tts/chatterbox.ts` | **Chatterbox Turbo voice cloning** — persistent subprocess in conda env, ChatterboxVoiceManager + ChatterboxTurboTTS |
@@ -338,7 +359,7 @@ Twilio → Caller hears AI response
 |---|---|
 | Runtime | Node.js 22+ (TypeScript) |
 | WebSocket | ws 8.18 |
-| STT | **Whisper small.en** (persistent subprocess, default), IBM Granite (experimental), Deepgram (paid) |
+| STT | **Whisper small.en** (persistent subprocess, default), **Deepgram Flux** (cloud, native end-of-turn, paid) |
 | TTS | **Kokoro-82M** (module-level singleton, default), **Chatterbox Turbo** (voice cloning, conda env), KokoClone (voice cloning), Piper (fallback), ElevenLabs (paid) |
 | LLM | **Ollama + qwen3.5:9b** (default), OpenAI/DeepSeek (paid) |
 | GPU | NVIDIA RTX 4090 (24GB VRAM) on Vast.ai |
