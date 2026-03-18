@@ -904,6 +904,8 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     openai_api_key: { envKey: "OPENAI_API_KEY", sensitive: true },
     elevenlabs_api_key: { envKey: "ELEVENLABS_API_KEY", sensitive: true },
     deepseek_api_key: { envKey: "DEEPSEEK_API_KEY", sensitive: true },
+    twilio_account_sid: { envKey: "TWILIO_ACCOUNT_SID", sensitive: true },
+    twilio_auth_token: { envKey: "TWILIO_AUTH_TOKEN", sensitive: true },
     default_llm: { envKey: "DEFAULT_LLM", sensitive: false },
     whisper_model: { envKey: "WHISPER_MODEL", sensitive: false },
     kokoro_voice: { envKey: "KOKORO_VOICE", sensitive: false },

@@ -19,18 +19,12 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: DEEPGRAM_API_KEY,OPENAI_API_KEY,ELEVENLABS_API_KEY,DEEPSEEK_API_KEY
-        env:
-          DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          envs: DEEPGRAM_API_KEY,OPENAI_API_KEY,ELEVENLABS_API_KEY,DEEPSEEK_API_KEY,TWILIO_ACCOUNT_SID,TWILIO_AUTH_TOKEN
           script: |
-            export PATH=/opt/nvm/versions/node/v24.12.0/bin:$PATH
+            export PATH=/usr/bin:/opt/nvm/versions/node/v24.12.0/bin:/opt/instance-tools/bin:$PATH
             cd /opt/voiceserver
 
             echo "--- Syncing API keys from secrets ---"
-            # Update or add API keys in .env from GitHub secrets (only if secret is set)
             update_env() {
               local key="$1" val="$2"
               if [ -n "$val" ]; then
@@ -46,6 +40,8 @@ jobs:
             update_env "OPENAI_API_KEY" "$OPENAI_API_KEY"
             update_env "ELEVENLABS_API_KEY" "$ELEVENLABS_API_KEY"
             update_env "DEEPSEEK_API_KEY" "$DEEPSEEK_API_KEY"
+            update_env "TWILIO_ACCOUNT_SID" "$TWILIO_ACCOUNT_SID"
+            update_env "TWILIO_AUTH_TOKEN" "$TWILIO_AUTH_TOKEN"
 
             echo "--- Pulling latest from GitHub ---"
             git pull origin main
@@ -53,14 +49,21 @@ jobs:
             echo "--- Installing dependencies ---"
             npm install
 
-            echo "--- Installing Python dependencies ---"
-            which python3 && python3 -m pip install faster-whisper || pip3 install faster-whisper || echo "WARN: failed to install faster-whisper"
-
             echo "--- Building TypeScript ---"
             npm run build
 
             echo "--- Restarting voiceserver ---"
             pm2 restart voiceserver --update-env
 
-            echo "--- Done ---"
+            echo "--- Verifying deploy ---"
+            sleep 3
             pm2 list
+            COMMIT=$(git log --oneline -1)
+            echo "Deployed commit: $COMMIT"
+        env:
+          DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
