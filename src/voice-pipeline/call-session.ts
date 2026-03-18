@@ -273,6 +273,11 @@ export class CallSession extends EventEmitter {
   private audioChunkCount = 0;
   private consecutiveSTTErrors = 0;
 
+  // Speaking plan state
+  private speechStartedAt: number | null = null;
+  private interimWordCount = 0;
+  private utteranceDelayTimer: ReturnType<typeof setTimeout> | null = null;
+
   constructor(config: CallSessionConfig) {
     super();
     this.config = config;
@@ -406,9 +411,22 @@ export class CallSession extends EventEmitter {
   }
 
   private handleSpeechStarted(): void {
-    if (this.isSpeaking) {
-      this.cancelSpeaking();
+    // Record when speech started for stopSpeakingPlan thresholds
+    this.speechStartedAt = Date.now();
+    this.interimWordCount = 0;
+
+    // Don't immediately cancel TTS — wait for enough speech to confirm barge-in
+    // The actual barge-in decision happens in handleTranscript when we have word counts
+    const minWords = this.config.stopSpeakingPlan?.numWords ?? 0;
+    const minVoiceSeconds = this.config.stopSpeakingPlan?.voiceSeconds ?? 0;
+    if (!this.isSpeaking || (minWords === 0 && minVoiceSeconds === 0)) {
+      // No stopSpeakingPlan configured or not speaking — use legacy behavior
+      if (this.isSpeaking) {
+        this.cancelSpeaking();
+      }
     }
+    // Otherwise: defer barge-in to handleTranscript where we check thresholds
+
     this.resetSilenceTimer();
   }
 
@@ -417,6 +435,20 @@ export class CallSession extends EventEmitter {
 
     // Reset STT error counter on successful transcription
     this.consecutiveSTTErrors = 0;
+
+    // Check stopSpeakingPlan barge-in thresholds while assistant is speaking
+    if (this.isSpeaking) {
+      const accumulated = (this.currentTranscript + " " + text).trim();
+      this.interimWordCount = accumulated.split(/\s+/).filter(Boolean).length;
+
+      const minWords = this.config.stopSpeakingPlan?.numWords ?? 0;
+      const minVoiceMs = (this.config.stopSpeakingPlan?.voiceSeconds ?? 0) * 1000;
+      const speechDuration = this.speechStartedAt ? Date.now() - this.speechStartedAt : 0;
+
+      if (this.interimWordCount >= minWords && speechDuration >= minVoiceMs) {
+        this.cancelSpeaking();
+      }
+    }
 
     if (isFinal) {
       this.currentTranscript += (this.currentTranscript ? " " : "") + text;
@@ -438,8 +470,32 @@ export class CallSession extends EventEmitter {
   private handleUtteranceEnd(): void {
     if (this.state === "ended" || !this.currentTranscript.trim()) return;
 
+    const waitSeconds = this.config.startSpeakingPlan?.waitSeconds ?? 0;
+
+    // Clear any existing utterance delay timer (resets if more speech arrives)
+    if (this.utteranceDelayTimer) {
+      clearTimeout(this.utteranceDelayTimer);
+      this.utteranceDelayTimer = null;
+    }
+
+    if (waitSeconds > 0) {
+      // Delay before processing — gives user time to continue speaking
+      this.utteranceDelayTimer = setTimeout(() => {
+        this.utteranceDelayTimer = null;
+        this.dispatchUtterance();
+      }, waitSeconds * 1000);
+    } else {
+      this.dispatchUtterance();
+    }
+  }
+
+  private dispatchUtterance(): void {
+    if (this.state === "ended" || !this.currentTranscript.trim()) return;
+
     const userText = this.currentTranscript.trim();
     this.currentTranscript = "";
+    this.speechStartedAt = null;
+    this.interimWordCount = 0;
 
     this.state = "processing";
     this.fullTranscript.push({ role: "User", content: userText });
@@ -694,6 +750,7 @@ export class CallSession extends EventEmitter {
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
     if (this.maxDurationTimer) clearTimeout(this.maxDurationTimer);
     if (this.endpointingTimer) clearTimeout(this.endpointingTimer);
+    if (this.utteranceDelayTimer) clearTimeout(this.utteranceDelayTimer);
 
     this.cancelSpeaking();
 

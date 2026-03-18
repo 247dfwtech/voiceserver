@@ -263,8 +263,8 @@ export class WhisperSTT extends EventEmitter implements STTProvider {
   private modelSize: string;
   private language: string;
   private keywords: string[];
-  private speechThreshold = 500;
-  private silenceThresholdFrames = 50; // 50 * 20ms = 1000ms of silence (phone conversations need longer pauses)
+  private speechThreshold: number;
+  private silenceThresholdFrames: number;
 
   constructor(config: STTConfig) {
     super();
@@ -272,6 +272,17 @@ export class WhisperSTT extends EventEmitter implements STTProvider {
     this.modelSize = config.model || process.env.WHISPER_MODEL || "small.en";
     this.language = config.language || "en";
     this.keywords = config.keywords || [];
+
+    // Configurable VAD thresholds via provider-agnostic config
+    // endOfTurnTimeoutMs → silence frames (each frame = 20ms)
+    const silenceMs = config.endOfTurnTimeoutMs ?? 1000;
+    this.silenceThresholdFrames = Math.round(silenceMs / 20);
+
+    // confidenceThreshold → speech RMS threshold (higher = less noise sensitivity)
+    this.speechThreshold = 500;
+    if (config.confidenceThreshold && config.confidenceThreshold > 0.4) {
+      this.speechThreshold = 500 + (config.confidenceThreshold - 0.4) * 1000;
+    }
   }
 
   async start(): Promise<void> {

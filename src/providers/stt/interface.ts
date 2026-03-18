@@ -7,6 +7,12 @@ export interface STTConfig {
   keywords?: string[];
   /** If true, the provider accepts raw mulaw 8kHz audio (no PCM conversion needed) */
   acceptsMulaw?: boolean;
+  /** Filter transcripts below this confidence (0-1, default 0). Provider-agnostic. */
+  confidenceThreshold?: number;
+  /** End-of-turn confidence threshold (0-1). Maps to Deepgram eot_threshold / Whisper sensitivity. */
+  endOfTurnConfidence?: number;
+  /** End-of-turn timeout in ms. Maps to Deepgram eot_timeout_ms / Whisper silence frames. */
+  endOfTurnTimeoutMs?: number;
 }
 
 export interface STTProvider extends EventEmitter {

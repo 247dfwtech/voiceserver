@@ -111,9 +111,9 @@ export class DeepgramSTT extends EventEmitter implements STTProvider {
       params.set("sample_rate", "8000");
 
       if (apiVersion === "v2") {
-        // Flux turn-based settings
-        params.set("eot_threshold", "0.7");
-        params.set("eot_timeout_ms", "5000");
+        // Flux turn-based settings — configurable per-assistant, with sensible defaults
+        params.set("eot_threshold", String(this.config.endOfTurnConfidence ?? 0.75));
+        params.set("eot_timeout_ms", String(this.config.endOfTurnTimeoutMs ?? 1800));
       }
 
       // Add keywords as keyterms for Flux, or as keywords for Nova
@@ -258,11 +258,13 @@ export class DeepgramSTT extends EventEmitter implements STTProvider {
       case "EndOfTurn": {
         // Definitive end of turn — emit final transcript and utterance_end
         const finalText = transcript || this.currentTurnTranscript;
-        if (finalText.trim()) {
+        const confidence = (msg.end_of_turn_confidence as number) ?? 1.0;
+        const confThreshold = this.config.confidenceThreshold ?? 0;
+        if (finalText.trim() && confidence >= confThreshold) {
           this.emit("transcript", {
             text: finalText.trim(),
             isFinal: true,
-            confidence: (msg.end_of_turn_confidence as number) ?? undefined,
+            confidence,
           });
           this.emit("utterance_end");
         }
