@@ -91,7 +91,7 @@ fi
 echo ""
 echo "============================================================"
 echo "  voiceserver — GPU Bare Metal Setup"
-echo "  STT: Whisper small.en (persistent subprocess, RECOMMENDED)"
+echo "  STT: Whisper small.en (FREE default) + Deepgram Flux (PAID cloud)"
 echo "  TTS: Kokoro-82M (persistent subprocess, default)"
 echo "  TTS: Chatterbox Turbo (voice cloning, conda env)"
 echo "  TTS: KokoClone (voice cloning, system Python)"

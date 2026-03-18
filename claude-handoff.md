@@ -1,6 +1,6 @@
 # VoiceServer — Claude Handoff Document
 
-**Last updated:** 2026-03-18 (rev 8)
+**Last updated:** 2026-03-18 (rev 9)
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
@@ -17,7 +17,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 
 ## Current State (What's Working) ✅
 
-- **Full voice pipeline CONFIRMED WORKING** — STT → LLM → TTS end-to-end in live calls
+- **Full voice pipeline CONFIRMED WORKING** — STT → LLM → TTS end-to-end in live calls. Both Whisper and Deepgram Flux STT tested successfully on real phone calls.
 - **WebSocket server** (port 8765) — Accepts Twilio Media Stream connections
 - **IPC HTTP server** (port 8766) — Health checks, model management, call registration, TTS testing
 - **Whisper STT (small.en)** ✅ — Persistent Python subprocess using `faster-whisper` package. Model loads once into GPU VRAM. Keyword biasing via `initial_prompt` for domain terms. 1000ms silence threshold for natural phone pauses. FIFO transcription queue (no race condition).
@@ -42,6 +42,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 
 - **Cloudflared tunnel URLs are ephemeral** — Quick tunnels generate random `trycloudflare.com` URLs. If tunnel processes restart, URLs change and Railway env vars need manual updating. Need Cloudflare named tunnel.
 - **Post-call analysis model** — `analysis-runner.ts` uses `process.env.DEFAULT_LLM || "qwen3.5:9b"` (fixed). Old log errors referencing `qwen3:4b` are from before the fix was deployed.
+- **Call transfer not executing** — LLM correctly decides to transfer and says "I'll transfer you", but the actual Twilio call transfer (SIP/dial) does not happen. Needs debugging: tool executor → call-transfer.ts → Twilio TwiML flow.
 - **Transcription accuracy still improving** — Whisper `small.en` is better than `base.en` but phone audio (8kHz mulaw → 16kHz PCM) is inherently low quality. Deepgram Flux is now available as a cloud alternative with native end-of-turn detection. Consider `medium.en` for higher local accuracy.
 
 ---
@@ -50,7 +51,9 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 
 ### Deepgram STT + Bug Fixes + Settings API + Error Handling
 
-1. **Deepgram Flux STT provider** — New `src/providers/stt/deepgram.ts`. Turn-based streaming via WebSocket (`wss://api.deepgram.com/v2/listen`). Native end-of-turn detection — no manual VAD/silence thresholds needed. Supports `flux-general-en` (voice agent optimized), `nova-3-general`, `nova-2-general`. Keyterm prompting, auto-reconnect, 10s keepalive.
+**MILESTONE: Deepgram Flux STT confirmed working in live phone call.** Assistant spoke first message, caller responded naturally, LLM understood context and responded correctly. Both Whisper and Deepgram now work as selectable STT options.
+
+1. **Deepgram Flux STT provider** — New `src/providers/stt/deepgram.ts`. Turn-based streaming via WebSocket (`wss://api.deepgram.com/v2/listen`). Native end-of-turn detection — no manual VAD/silence thresholds needed. Supports `flux-general-en` (voice agent optimized), `nova-3-general`, `nova-2-general`. Keyterm prompting, auto-reconnect, 10s keepalive. **Tested and confirmed working on real phone call.**
 2. **Whisper STT race condition fix** — Replaced single `pendingResolve`/`pendingReject` with proper FIFO queue. Concurrent transcription requests now serialize safely instead of dropping callbacks.
 3. **TTS stuck-state fix** — Added `onError` callback to `TTSProvider.synthesizeStream()` interface. All TTS providers (Kokoro, Chatterbox, Piper) now call `onError` on failure. Call session resets `isSpeaking` + state on TTS error.
 4. **LLM error recovery** — `onDone("")` now fires on stream error so sessions transition back to `waiting_for_speech` instead of hanging in `processing` state.
@@ -62,6 +65,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 10. **IPC error logging** — `ipcError()` helper replaces 11 silent catch blocks. All errors now logged with method + path context.
 11. **Pending config TTL** — 30s interval sweeps configs older than 60s (replaces per-call setTimeout).
 12. **Default STT changed** — Granite removed from provider factory. Default is now Whisper `small.en`. Granite code still exists but won't load/use GPU.
+13. **Test chat blank bubble fix** — Strip unclosed `<think>` tags, return fallback when LLM produces only thinking. UI shows error instead of blank bubble.
 
 ---
 
@@ -346,9 +350,9 @@ Twilio → Caller hears AI response
 
 ## Next Steps (In Order)
 
-1. **Set up Cloudflare named tunnel** — Permanent URLs that survive restarts. Currently tunnel URLs change on every PM2 restart.
-2. **Tune transcription accuracy** — Consider `medium.en` if latency is acceptable, or Deepgram for production scale.
-3. **Tune voicemail detection thresholds** — Increase `continuousSpeechFramesThreshold` from 60 to 150+ before re-enabling.
+1. **Fix call transfer** — LLM decides to transfer correctly but the Twilio SIP/dial action doesn't execute. Debug: tool-executor.ts → call-transfer.ts → Twilio TwiML. Check if transfer tool is registered, if destination number is set, and if Twilio credentials are available on voiceserver.
+2. **Set up Cloudflare named tunnel** — Permanent URLs that survive restarts. Currently tunnel URLs change on every PM2 restart.
+3. **Tune voicemail detection thresholds** — Now at 150 frames (3s). Test with voicemail detection enabled.
 4. **Full UI redesign** — Bushido Pros branding across vapiclone and dialer4clone (separate session).
 
 ---
