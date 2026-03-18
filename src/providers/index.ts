@@ -7,6 +7,7 @@ import { OpenAICompatLLM } from "./llm/openai-compat";
 import { PiperTTS } from "./tts/piper";
 import { KokoroTTS } from "./tts/kokoro";
 import { KokoCloneTTS } from "./tts/kokoclone";
+import { ChatterboxTurboTTS } from "./tts/chatterbox";
 import { modelManager } from "../model-manager";
 
 /**
@@ -91,6 +92,9 @@ export function createTTSProvider(config: TTSConfig): TTSProvider {
     case "kokoclone":
     case "clone":
       return new KokoCloneTTS(config);
+    case "chatterbox":
+    case "chatterbox-turbo":
+      return new ChatterboxTurboTTS(config);
     case "piper":
       return new PiperTTS(config);
     default:

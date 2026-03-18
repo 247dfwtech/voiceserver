@@ -1,6 +1,6 @@
 # VoiceServer — Claude Handoff Document
 
-**Last updated:** 2026-03-18 (rev 5)
+**Last updated:** 2026-03-18 (rev 6)
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
@@ -24,7 +24,8 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 - **Kokoro-82M TTS** ✅ — Module-level singleton persistent Python subprocess shared across ALL call sessions. 54 voices, sub-0.3s latency on RTX 4090. All voice packs pre-downloaded.
 - **Ollama with qwen3.5:9b** ✅ — LLM for conversation + tool calling. `<think>` blocks handled with 2000-token minimum.
 - **Tool execution** ✅ — Function webhooks, call transfer, DTMF, end_call_tool confirmed working in live calls
-- **KokoClone voice cloning** — Clone voices from 3-10s reference audio samples
+- **KokoClone voice cloning** — Clone voices from 3-10s reference audio samples using Kokoro + Kanade voice conversion
+- **Chatterbox Turbo voice cloning** ✅ — Clone voices from ~10s reference audio using Resemble AI's Chatterbox Turbo model. Persistent Python subprocess (conda env `chatterbox`), 24kHz output resampled to 16kHz, ~4.2GB VRAM. IPC endpoints at `/chatterbox/*`.
 - **Model manager** — Install/activate/remove LLM/STT/TTS models via IPC API
 - **Post-call analysis** — Summary generation and success evaluation (needs fix: hardcoded model name)
 - **Voicemail detection** — Detects sustained speech patterns in first 5 seconds (disabled by default for testing)
@@ -43,9 +44,28 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 
 ---
 
-## What Was Just Completed (Session 5 — March 2026)
+## What Was Just Completed (Session 6 — March 2026)
 
-### MILESTONE: Full voice pipeline working end-to-end in live calls 🎉
+### Added Chatterbox Turbo Voice Cloning
+
+1. **New TTS provider: Chatterbox Turbo** — Resemble AI's voice cloning model. Uses persistent Python subprocess running in conda env `chatterbox` (Python 3.11) on GPU. Model: `ResembleAI/chatterbox-turbo` from HuggingFace (public, no auth needed). Sample rate 24kHz, resampled to 16kHz. ~4.2GB VRAM.
+2. **Persistent subprocess with idle timeout** — Same singleton pattern as Kokoro. Model loads once, serves all requests. 5-minute idle timeout kills process to free GPU memory. Auto-respawns on next request.
+3. **Voice management** — `ChatterboxVoiceManager` stores reference audio in `/data/chatterbox-voices/references/` with `manifest.json`. Same CRUD pattern as KokoClone's `VoiceCloneManager`.
+4. **IPC endpoints** — `/chatterbox/status`, `/chatterbox/voices`, `/chatterbox/create`, `/chatterbox/voices/:id` (DELETE), `/chatterbox/test`. Same patterns as `/voice-clone/*`.
+5. **Fixed KokoClone import bug** — `from kanade import KanadeModel` → `from kanade_tokenizer import KanadeModel`. The pip package `kanade-tokenizer` exports as `kanade_tokenizer`, not `kanade`.
+6. **GPU server setup** — Installed miniconda (`/root/miniconda3/`), created conda env `chatterbox` at `/venv/chatterbox/`, cloned repo to `/opt/chatterbox-repo/`, installed `setuptools<71` (required for `pkg_resources` used by `resemble-perth` watermarker). Model downloaded and verified generating audio.
+
+### Gotchas discovered:
+- `conda run` on this server does NOT support `--no-banner` flag (conda 26.1.1)
+- `HF_TOKEN` env var must be set to any non-empty string (e.g. "skip") to bypass auth check in Chatterbox's `from_pretrained()` — model is public but code has `token=os.getenv("HF_TOKEN") or True`
+- `resemble-perth` watermarker needs `setuptools<71` for `pkg_resources` module (removed in setuptools 72+)
+- Chatterbox Turbo repo is `ResembleAI/chatterbox-turbo` (NOT `ResembleAI/chatterbox` which is multilingual)
+
+---
+
+## Session 5 — March 2026
+
+### MILESTONE: Full voice pipeline working end-to-end in live calls
 
 1. **Fixed Granite STT — 4 attempts, multiple API issues:**
    - Attempt 1: `AutoProcessor(audio_array)` → routes to text tokenizer ("Invalid text provided")
@@ -101,6 +121,9 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 | 1000ms silence threshold | Phone conversations have natural pauses. 500ms was cutting speakers off mid-sentence. |
 | `qwen3.5:9b` over `qwen3:4b` | 2x smarter, better conversation flow, proper tool calling. 6.1GB fits easily on RTX 4090. |
 | Kokoro TTS module-level singleton | ALL call sessions share one Python process. Without this, each call spawned a new 30-60s cold start → caller heard silence. |
+| Chatterbox Turbo persistent subprocess | Same singleton pattern as Kokoro but with 5-min idle timeout. GPU model loading takes 10-30s cold start. Idle timeout frees ~4.2GB VRAM when not in use. |
+| Separate `/chatterbox/*` endpoints (not reusing `/voice-clone/*`) | KokoClone and Chatterbox are distinct systems with different dependencies, conda envs, and storage dirs. Separate namespaces prevent confusion. |
+| Conda env for Chatterbox (not system Python) | Chatterbox has conflicting dependencies with the system Python packages (different torch versions, etc). Conda isolates it cleanly. |
 
 ---
 
@@ -111,9 +134,11 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 | **STT** | Whisper `small.en` | ~500MB | ✅ Active (persistent subprocess) |
 | **LLM** | qwen3.5:9b | ~5-6GB | ✅ Active (Ollama) |
 | **TTS** | Kokoro-82M | ~500MB | ✅ Active (persistent subprocess) |
+| **TTS (cloning)** | Chatterbox Turbo | ~4.2GB | ✅ Available (persistent subprocess, idle timeout) |
+| TTS (cloning) | KokoClone | ~200MB | ✅ Available (one-off subprocess per synthesis) |
 | STT (experimental) | IBM Granite 4.0 1B Speech | ~2GB | ❌ Inactive (code exists, not recommended) |
 | LLM (deleted) | qwen3:4b | — | ❌ Deleted from Ollama |
-| **Total VRAM during call** | | **~7GB** | Well within 24GB RTX 4090 |
+| **Total VRAM during call** | | **~7GB** (up to ~11GB with Chatterbox) | Within 24GB RTX 4090 |
 
 ---
 
@@ -122,6 +147,8 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 ### Critical — Will break calls if wrong
 
 - **Kokoro module-level singleton** — `kokoro.ts` uses module-level variables (`_proc`, `_ready`, `_sharedQueue`). ALL KokoroTTS instances share one Python process. Without this, each call spawns a 30-60s cold start. `destroy()` is a no-op. Never make the process per-instance.
+- **Chatterbox Turbo persistent subprocess** — `chatterbox.ts` uses same module-level singleton pattern. Runs in conda env `chatterbox` via `conda run -n chatterbox python3`. Has 5-min idle timeout to free GPU memory. Must set `HF_TOKEN` env to non-empty string to bypass auth check.
+- **KokoClone uses `kanade_tokenizer` not `kanade`** — The pip package `kanade-tokenizer` installs as Python module `kanade_tokenizer`. Previous import `from kanade import KanadeModel` was wrong.
 - **Kokoro stdout redirect** — Python subprocess redirects `sys.stdout = sys.stderr` before importing torch/kokoro. Prevents library warnings from corrupting binary PCM protocol.
 - **Whisper persistent subprocess** — `whisper.ts` uses same module-level singleton pattern. Sends JSON `{"path": "/tmp/audio.wav", "keywords": ["solar"]}` via stdin. Gets transcript line via stdout.
 - **firstMessageMode must be "assistant-speaks-first" for outbound calls** — If set to "assistant-waits-for-user", caller hears silence because STT must transcribe first but caller doesn't know to speak.
@@ -153,7 +180,8 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 | `src/providers/stt/whisper.ts` | **Whisper STT — persistent Python subprocess**, module-level singleton, JSON stdin protocol with keyword biasing |
 | `src/providers/stt/granite.ts` | Granite STT — experimental, non-standard multimodal chat API, not recommended |
 | `src/providers/tts/kokoro.ts` | **Kokoro-82M TTS — module-level singleton**, shared across all calls, binary PCM protocol |
-| `src/providers/tts/kokoclone.ts` | KokoClone voice cloning |
+| `src/providers/tts/kokoclone.ts` | KokoClone voice cloning (Kokoro + Kanade voice conversion) |
+| `src/providers/tts/chatterbox.ts` | **Chatterbox Turbo voice cloning** — persistent subprocess in conda env, ChatterboxVoiceManager + ChatterboxTurboTTS |
 | `src/providers/tts/piper.ts` | Piper TTS fallback (CPU-friendly) |
 | `src/providers/llm/openai-compat.ts` | OpenAI-compatible LLM client — 2000-token min for Ollama |
 | `src/providers/index.ts` | Provider factory — auto-selects based on config |
@@ -172,6 +200,8 @@ IPC_PORT=8766
 KOKORO_MODELS_DIR=/models/kokoro
 KOKORO_VOICE=af_heart
 CLONED_VOICES_DIR=/data/cloned-voices
+CHATTERBOX_VOICES_DIR=/data/chatterbox-voices
+CONDA_PATH=/root/miniconda3/bin/conda
 OLLAMA_URL=http://localhost:11434/v1
 DEFAULT_LLM=qwen3.5:9b
 NODE_ENV=production
@@ -293,7 +323,7 @@ Twilio → Caller hears AI response
 | Runtime | Node.js 22+ (TypeScript) |
 | WebSocket | ws 8.18 |
 | STT | **Whisper small.en** (persistent subprocess, default), IBM Granite (experimental), Deepgram (paid) |
-| TTS | **Kokoro-82M** (module-level singleton, default), Piper (fallback), ElevenLabs (paid) |
+| TTS | **Kokoro-82M** (module-level singleton, default), **Chatterbox Turbo** (voice cloning, conda env), KokoClone (voice cloning), Piper (fallback), ElevenLabs (paid) |
 | LLM | **Ollama + qwen3.5:9b** (default), OpenAI/DeepSeek (paid) |
 | GPU | NVIDIA RTX 4090 (24GB VRAM) on Vast.ai |
 | Process Manager | PM2 (auto-restart, boot persistence) |

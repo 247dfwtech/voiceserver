@@ -37,11 +37,11 @@ export interface InstalledModel {
 export interface ModelConfig {
   activeLLM: { provider: "ollama"; model: string } | null;
   activeSTT: { provider: "granite" | "whisper"; model: string } | null;
-  activeTTS: { provider: "kokoro" | "piper"; voice: string } | null;
+  activeTTS: { provider: "kokoro" | "piper" | "chatterbox"; voice: string } | null;
   installedModels: {
     llm: Array<{ name: string; size: string; provider: "ollama"; installedAt: string }>;
     stt: Array<{ name: string; size: string; provider: "granite" | "whisper"; installedAt: string }>;
-    tts: Array<{ name: string; size: string; provider: "kokoro" | "piper"; installedAt: string }>;
+    tts: Array<{ name: string; size: string; provider: "kokoro" | "piper" | "chatterbox"; installedAt: string }>;
   };
 }
 
@@ -97,7 +97,7 @@ const GRANITE_MODEL_CATALOG: STTModelInfo[] = [
 export interface TTSVoiceInfo {
   name: string;
   description: string;
-  provider: "kokoro" | "piper";
+  provider: "kokoro" | "piper" | "chatterbox";
   gender?: string;
   accent?: string;
 }
@@ -947,11 +947,28 @@ print('ok')
       // Directory may not exist yet
     }
 
+    // Check for Chatterbox cloned voices
+    try {
+      const { chatterboxVoiceManager: cvm } = await import("./providers/tts/chatterbox");
+      const cbVoices = await cvm.listVoices();
+      for (const v of cbVoices) {
+        installed.push({
+          name: v.id,
+          size: "cloned",
+          provider: "chatterbox",
+          installedAt: v.createdAt,
+          active: activeTTS?.provider === "chatterbox" && activeTTS?.voice === v.id,
+        });
+      }
+    } catch {
+      // Chatterbox module not available
+    }
+
     // Sync config
     this.config.installedModels.tts = installed.map((m) => ({
       name: m.name,
       size: m.size,
-      provider: m.provider as "kokoro" | "piper",
+      provider: m.provider as "kokoro" | "piper" | "chatterbox",
       installedAt: m.installedAt,
     }));
     await this.saveConfig();

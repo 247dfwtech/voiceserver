@@ -20,6 +20,7 @@ import { runPostCallAnalysis } from "./voice-pipeline/analysis-runner";
 import { transferCallWithDial } from "./voice-pipeline/call-transfer";
 import { modelManager } from "./model-manager";
 import { voiceCloneManager } from "./providers/tts/kokoclone";
+import { chatterboxVoiceManager } from "./providers/tts/chatterbox";
 
 // ---- Configuration ----
 
@@ -1095,6 +1096,152 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
+  // ---- Chatterbox Turbo Voice Cloning Endpoints ----
+
+  // GET /chatterbox/status -- Check if Chatterbox Turbo is installed
+  if (req.method === "GET" && url.pathname === "/chatterbox/status") {
+    chatterboxVoiceManager
+      .isInstalled()
+      .then(async (installed) => {
+        const voices = await chatterboxVoiceManager.listVoices();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ installed, voices, count: voices.length }));
+      })
+      .catch((err) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      });
+    return;
+  }
+
+  // GET /chatterbox/voices -- List all Chatterbox voices
+  if (req.method === "GET" && url.pathname === "/chatterbox/voices") {
+    chatterboxVoiceManager
+      .listVoices()
+      .then((voices) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ voices }));
+      })
+      .catch((err) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      });
+    return;
+  }
+
+  // POST /chatterbox/create -- Upload reference audio and create a Chatterbox voice
+  if (req.method === "POST" && url.pathname === "/chatterbox/create") {
+    readBody(req, 10_000_000) // 10MB max for audio upload
+      .then(async (body) => {
+        const { name, audio, filename } = JSON.parse(body);
+
+        if (!name || !audio) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing 'name' and 'audio' (base64) in request body" }));
+          return;
+        }
+
+        const audioBuffer = Buffer.from(audio, "base64");
+
+        if (audioBuffer.length < 1000) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Audio file too small. Need ~10 seconds of clear speech." }));
+          return;
+        }
+
+        if (audioBuffer.length > 5_000_000) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Audio file too large (max 5MB). Use a ~10 second clip." }));
+          return;
+        }
+
+        const result = await chatterboxVoiceManager.createVoice(
+          name,
+          audioBuffer,
+          filename || "reference.wav"
+        );
+
+        if (result.success) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, voice: result.voice }));
+        } else {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: result.error }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
+      });
+    return;
+  }
+
+  // DELETE /chatterbox/voices/:id -- Delete a Chatterbox voice
+  if (req.method === "DELETE" && url.pathname.startsWith("/chatterbox/voices/")) {
+    const voiceId = decodeURIComponent(url.pathname.slice("/chatterbox/voices/".length));
+    if (!voiceId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing voice ID in URL" }));
+      return;
+    }
+
+    chatterboxVoiceManager
+      .deleteVoice(voiceId)
+      .then((result) => {
+        if (result.success) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, deleted: voiceId }));
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: result.error }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      });
+    return;
+  }
+
+  // POST /chatterbox/test -- Test a Chatterbox voice with sample text
+  if (req.method === "POST" && url.pathname === "/chatterbox/test") {
+    readBody(req, MAX_IPC_BODY_BYTES)
+      .then(async (body) => {
+        const { voiceId, text } = JSON.parse(body);
+
+        if (!voiceId || !text) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing 'voiceId' and 'text' in request body" }));
+          return;
+        }
+
+        try {
+          const { ChatterboxTurboTTS: CBT } = await import("./providers/tts/chatterbox");
+          const tts = new CBT({ provider: "chatterbox", voiceId });
+          const audio = await tts.synthesize(text);
+
+          const wavBuffer = pcmToWav(audio, 16000, 1, 16);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            ok: true,
+            audio: wavBuffer.toString("base64"),
+            mimeType: "audio/wav",
+            sampleRate: 16000,
+            durationMs: Math.round((audio.length / 2) / 16000 * 1000),
+          }));
+        } catch (err) {
+          console.error("[voice-server] Chatterbox test error:", err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+        }
+      })
+      .catch((err) => {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
+      });
+    return;
+  }
+
   // GET /logs -- Return recent log lines for real-time debugging from vapiclone UI
   if (req.method === "GET" && url.pathname === "/logs") {
     import("fs").then(async (fs) => {
@@ -1212,7 +1359,7 @@ function pcmToWav(pcm: Buffer, sampleRate: number, numChannels: number, bitDepth
 const ipcServer = createServer(handleIPC);
 // Bind to 0.0.0.0 so it's accessible from Railway and other external services
 ipcServer.listen(IPC_PORT, "0.0.0.0", () => {
-  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /tts/test, /sessions, /metrics, /register-call, /end-call/:id, /voice-clone/*`);
+  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /tts/test, /sessions, /metrics, /register-call, /end-call/:id, /voice-clone/*, /chatterbox/*`);
 });
 
 // ---- Call Config Registration ----

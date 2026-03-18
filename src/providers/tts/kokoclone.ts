@@ -49,7 +49,7 @@ export class VoiceCloneManager {
   async isInstalled(): Promise<boolean> {
     try {
       const { stdout } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-        const proc = spawn("python3", ["-c", "import kokoro_onnx; from kanade import KanadeModel; print('ok')"], {
+        const proc = spawn("python3", ["-c", "import kokoro_onnx; from kanade_tokenizer import KanadeModel; print('ok')"], {
           stdio: ["pipe", "pipe", "pipe"],
         });
         let stdout = "";
@@ -246,7 +246,7 @@ import numpy as np
 
 try:
     from kokoro_onnx import Kokoro
-    from kanade import KanadeModel, vocode
+    from kanade_tokenizer import KanadeModel, vocode
     import torchaudio
     import torch
 except ImportError as e:

@@ -10,11 +10,12 @@
 # Tested on: Ubuntu 22.04 / 24.04 with NVIDIA RTX 4090, CUDA 12.x
 # Also works when copying/cloning an existing Vast.ai instance.
 #
-# Expected VRAM usage: ~7GB / 24GB
+# Expected VRAM usage: ~7GB baseline / ~11GB with Chatterbox / 24GB total
 #   - Whisper STT (small.en): ~0.5GB (persistent subprocess, loads once)
 #   - Kokoro TTS:              ~0.5GB (persistent subprocess, loads once)
 #   - Qwen3.5:9b:              ~6.0GB (via Ollama)
-#   - Headroom:                ~17GB
+#   - Chatterbox Turbo:        ~4.2GB (persistent subprocess, 5-min idle timeout)
+#   - Headroom:                ~13GB
 #
 # ⚠️  VAST.AI INSTANCE COPY NOTE:
 #   When you copy a Vast.ai instance, /etc/environment contains:
@@ -29,16 +30,18 @@
 #   3. Ollama + default LLM model (qwen3.5:9b — recommended for call quality)
 #   4. PyTorch with CUDA (correct wheel for detected CUDA version)
 #   5. Kokoro TTS + faster-whisper + transformers Python packages
-#   6. Pre-downloads ALL AI models to HuggingFace cache:
+#   6. KokoClone voice cloning dependencies (kokoro-onnx, kanade-tokenizer, torchaudio)
+#   7. Miniconda + Chatterbox Turbo conda env (python 3.11) + model download
+#   8. Pre-downloads ALL AI models to HuggingFace cache:
 #      - Whisper small.en (~244MB) + base.en (~74MB) — primary STT
 #      - hexgrad/Kokoro-82M (~313MB) + all 4 voice packs (af_heart, af_nicole, am_adam, af_sarah)
-#      - IBM Granite STT commented out (experimental, non-standard API)
-#   7. Clones/updates voiceserver repo, npm install, tsc build
-#   8. Creates .env with all required keys
-#   9. Creates cloudflared tunnel scripts
-#  10. Creates PM2 ecosystem config with all 5 processes
-#  11. Starts all processes, saves PM2 config for boot persistence
-#  12. Prints tunnel URLs for Railway env var setup
+#      - ResembleAI/chatterbox-turbo (~4GB) — voice cloning
+#   9. Clones/updates voiceserver repo, npm install, tsc build
+#  10. Creates .env with all required keys
+#  11. Creates cloudflared tunnel scripts
+#  12. Creates PM2 ecosystem config with all 5 processes
+#  13. Starts all processes, saves PM2 config for boot persistence
+#  14. Prints tunnel URLs for Railway env var setup
 ###############################################################################
 
 set -euo pipefail
@@ -82,7 +85,9 @@ echo ""
 echo "============================================================"
 echo "  voiceserver — GPU Bare Metal Setup"
 echo "  STT: Whisper small.en (persistent subprocess, RECOMMENDED)"
-echo "  TTS: Kokoro-82M (persistent subprocess)"
+echo "  TTS: Kokoro-82M (persistent subprocess, default)"
+echo "  TTS: Chatterbox Turbo (voice cloning, conda env)"
+echo "  TTS: KokoClone (voice cloning, system Python)"
 echo "  LLM: Qwen3.5:9b via Ollama (auto-pulled)"
 echo "============================================================"
 echo ""
@@ -284,12 +289,78 @@ info "Installing piper-tts (TTS fallback)..."
 pip3 install --no-cache-dir piper-tts -q 2>&1 | tail -1
 log "piper-tts installed"
 
+# KokoClone voice cloning dependencies (uses system Python)
+info "Installing KokoClone voice cloning dependencies..."
+pip3 install --no-cache-dir kokoro-onnx torchaudio soundfile -q 2>&1 | tail -1
+pip3 install --no-cache-dir git+https://github.com/frothywater/kanade-tokenizer -q 2>&1 | tail -1
+log "KokoClone dependencies installed (kokoro-onnx, kanade-tokenizer)"
+
 ###############################################################################
-# 5. Pre-download AI models (with HF_HOME set correctly)
+# 5. Miniconda + Chatterbox Turbo conda env
+###############################################################################
+
+CONDA_BIN="/root/miniconda3/bin/conda"
+
+if [ -x "${CONDA_BIN}" ]; then
+  log "Miniconda already installed at /root/miniconda3/"
+else
+  info "Installing Miniconda..."
+  curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh
+  bash /tmp/miniconda.sh -b -p /root/miniconda3
+  rm -f /tmp/miniconda.sh
+  log "Miniconda installed"
+fi
+
+# Add conda to PATH for current session and future shells
+export PATH="/root/miniconda3/bin:${PATH}"
+if ! grep -q 'miniconda3/bin' /root/.bashrc 2>/dev/null; then
+  echo 'export PATH=/root/miniconda3/bin:$PATH' >> /root/.bashrc
+fi
+
+# Create chatterbox conda env if it doesn't exist
+if ${CONDA_BIN} env list 2>/dev/null | grep -q chatterbox; then
+  log "Chatterbox conda env already exists"
+else
+  info "Creating Chatterbox conda env (Python 3.11)..."
+  ${CONDA_BIN} create -yn chatterbox python=3.11 -q 2>&1 | tail -3
+  log "Chatterbox conda env created"
+fi
+
+# Install Chatterbox Turbo into conda env
+info "Installing Chatterbox Turbo into conda env..."
+
+# Clone Chatterbox repo if not present
+if [ -d "/opt/chatterbox-repo/.git" ]; then
+  info "Updating existing Chatterbox repo..."
+  cd /opt/chatterbox-repo && git pull origin main 2>&1 | tail -2
+else
+  info "Cloning Chatterbox repo..."
+  git clone https://github.com/resemble-ai/chatterbox.git /opt/chatterbox-repo 2>&1 | tail -2
+fi
+
+cd /opt/chatterbox-repo
+${CONDA_BIN} run -n chatterbox pip install -e . -q 2>&1 | tail -3
+log "Chatterbox Turbo package installed"
+
+# Fix setuptools for resemble-perth watermarker (pkg_resources removed in v72+)
+info "Fixing setuptools for resemble-perth compatibility..."
+${CONDA_BIN} run -n chatterbox pip install 'setuptools<71' -q 2>&1 | tail -1
+log "setuptools pinned for perth compatibility"
+
+# Verify Chatterbox import works
+info "Verifying Chatterbox Turbo import..."
+if ${CONDA_BIN} run -n chatterbox python3 -c "from chatterbox.tts_turbo import ChatterboxTurboTTS; print('ok')" 2>&1 | grep -q "ok"; then
+  log "Chatterbox Turbo import verified"
+else
+  err "Chatterbox Turbo import failed — check conda env"
+fi
+
+###############################################################################
+# 6. Pre-download AI models (with HF_HOME set correctly)
 ###############################################################################
 
 mkdir -p "${MODELS_DIR}/piper" "${MODELS_DIR}/granite" "${MODELS_DIR}/kokoro"
-mkdir -p "${DATA_DIR}/cloned-voices"
+mkdir -p "${DATA_DIR}/cloned-voices" "${DATA_DIR}/chatterbox-voices/references"
 
 # Kokoro-82M TTS model + voice packs
 # The KPipeline downloads lazily per voice on first synthesis. Pre-downloading
@@ -358,8 +429,38 @@ else
   log "Piper default voice already exists"
 fi
 
+# Chatterbox Turbo model (voice cloning TTS — downloads from HuggingFace)
+info "Pre-downloading Chatterbox Turbo model (~4GB)..."
+HF_HOME="${HF_HOME_DIR}" ${CONDA_BIN} run -n chatterbox python3 -c "
+from huggingface_hub import snapshot_download
+import os
+path = snapshot_download(
+    repo_id='ResembleAI/chatterbox-turbo',
+    token=False,
+    allow_patterns=['*.safetensors', '*.json', '*.txt', '*.pt', '*.model']
+)
+print(f'Chatterbox Turbo model downloaded to: {path}')
+files = os.listdir(path)
+print(f'Files: {len(files)} ({", ".join(files[:5])}...)')
+" 2>&1
+log "Chatterbox Turbo model downloaded"
+
+# Verify Chatterbox model loads on GPU
+info "Verifying Chatterbox Turbo model loads on GPU..."
+HF_HOME="${HF_HOME_DIR}" HF_TOKEN=skip ${CONDA_BIN} run -n chatterbox python3 -c "
+import os, torch
+os.environ['HF_TOKEN'] = 'skip'
+from chatterbox.tts_turbo import ChatterboxTurboTTS
+model = ChatterboxTurboTTS.from_pretrained(device='cuda')
+print(f'Chatterbox Turbo loaded: sr={model.sr}, GPU={torch.cuda.memory_allocated()//1024//1024}MB')
+del model
+torch.cuda.empty_cache()
+print('Model unloaded, GPU memory freed')
+" 2>&1
+log "Chatterbox Turbo model verified on GPU"
+
 ###############################################################################
-# 6. Clone and build voiceserver
+# 7. Clone and build voiceserver
 ###############################################################################
 
 info "Setting up voiceserver..."
@@ -382,7 +483,7 @@ npm run build 2>&1 | tail -3
 log "voiceserver built successfully"
 
 ###############################################################################
-# 7. Environment configuration
+# 8. Environment configuration
 ###############################################################################
 
 ENV_FILE="${VOICESERVER_DIR}/.env"
@@ -404,6 +505,8 @@ GRANITE_MODELS_DIR=/models/granite
 KOKORO_MODELS_DIR=/models/kokoro
 KOKORO_VOICE=af_heart
 CLONED_VOICES_DIR=/data/cloned-voices
+CHATTERBOX_VOICES_DIR=/data/chatterbox-voices
+CONDA_PATH=/root/miniconda3/bin/conda
 
 # Ollama (local LLM)
 OLLAMA_URL=http://localhost:11434/v1
@@ -446,10 +549,18 @@ else
     echo "VAPICLONE_API_URL=${VAPICLONE_API_URL_DEFAULT}" >> "${ENV_FILE}"
     log "Added VAPICLONE_API_URL to existing .env"
   fi
+  if ! grep -q 'CHATTERBOX_VOICES_DIR' "${ENV_FILE}"; then
+    echo "CHATTERBOX_VOICES_DIR=/data/chatterbox-voices" >> "${ENV_FILE}"
+    log "Added CHATTERBOX_VOICES_DIR to existing .env"
+  fi
+  if ! grep -q 'CONDA_PATH' "${ENV_FILE}"; then
+    echo "CONDA_PATH=/root/miniconda3/bin/conda" >> "${ENV_FILE}"
+    log "Added CONDA_PATH to existing .env"
+  fi
 fi
 
 ###############################################################################
-# 8. Cloudflared tunnel scripts
+# 9. Cloudflared tunnel scripts
 ###############################################################################
 
 CLOUDFLARED_BIN=""
@@ -508,7 +619,7 @@ chmod +x \
 log "Cloudflared tunnel scripts created"
 
 ###############################################################################
-# 9. PM2 process management
+# 10. PM2 process management
 ###############################################################################
 
 info "Setting up pm2..."
@@ -604,7 +715,7 @@ pm2 save
 log "All PM2 processes started (voiceserver + ollama + 3 cloudflared tunnels)"
 
 ###############################################################################
-# 10. Wait for tunnels and show URLs
+# 11. Wait for tunnels and show URLs
 ###############################################################################
 
 info "Waiting for cloudflared tunnels to start (15s)..."
@@ -632,7 +743,7 @@ echo "    VASTAI_INSTANCE_ID             = <your new instance ID>"
 echo ""
 
 ###############################################################################
-# 11. Verification
+# 12. Verification
 ###############################################################################
 
 echo "============================================================"
@@ -655,21 +766,29 @@ check "Node.js $(node -v)"                    "node -v"
 check "npm $(npm -v)"                         "npm -v"
 check "pm2 installed"                         "pm2 -v"
 check "Ollama running"                        "curl -s http://localhost:11434/api/tags"
-check "qwen3:4b available"                    "ollama list | grep -q 'qwen3:4b'"
+check "qwen3.5:9b available"                  "ollama list | grep -q 'qwen3.5:9b'"
 check "Python3 available"                     "python3 --version"
 check "PyTorch installed (CUDA)"              "python3 -c 'import torch; assert torch.cuda.is_available()'"
 check "Kokoro TTS installed"                  "python3 -c 'from kokoro import KPipeline'"
-check "Transformers installed"                "python3 -c 'import transformers'"
 check "faster-whisper installed"              "python3 -c 'import faster_whisper'"
 check "soundfile installed"                   "python3 -c 'import soundfile'"
+check "KokoClone deps (kokoro-onnx)"          "python3 -c 'import kokoro_onnx'"
+check "KokoClone deps (kanade-tokenizer)"     "python3 -c 'from kanade_tokenizer import KanadeModel'"
+check "Miniconda installed"                   "test -x /root/miniconda3/bin/conda"
+check "Chatterbox conda env exists"           "${CONDA_BIN} env list | grep -q chatterbox"
+check "Chatterbox Turbo importable"           "${CONDA_BIN} run -n chatterbox python3 -c 'from chatterbox.tts_turbo import ChatterboxTurboTTS; print(\"ok\")' 2>&1 | grep -q ok"
+check "Chatterbox Turbo model cached"         "test -d ${HF_HOME_DIR}/hub/models--ResembleAI--chatterbox-turbo"
 check "Piper voice exists"                    "test -f /models/piper/en_US-lessac-medium.onnx"
 check "voiceserver built"                     "test -f /opt/voiceserver/dist/index.js"
 check "HF_HOME set correctly"                 "test -d ${HF_HOME_DIR}"
 check "Kokoro model cached"                   "test -d ${HF_HOME_DIR}/hub/models--hexgrad--Kokoro-82M"
-check "Granite model cached"                  "test -d ${HF_HOME_DIR}/hub/models--ibm-granite--granite-4.0-1b-speech"
+check "Whisper small.en cached"               "test -d ${HF_HOME_DIR}/hub/models--Systran--faster-whisper-small.en"
 check "cloudflared available"                 "test -x ${CLOUDFLARED_BIN}"
 check ".env has VAPICLONE_API_KEY"            "grep -q VAPICLONE_API_KEY ${ENV_FILE}"
 check ".env has IPC_SECRET"                   "grep -q IPC_SECRET ${ENV_FILE}"
+check ".env has CONDA_PATH"                   "grep -q CONDA_PATH ${ENV_FILE}"
+check "Chatterbox voices dir exists"          "test -d /data/chatterbox-voices/references"
+check "KokoClone voices dir exists"           "test -d /data/cloned-voices"
 
 # Check if voiceserver is actually running
 sleep 3
