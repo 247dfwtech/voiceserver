@@ -21,6 +21,7 @@ import { transferCallWithDial } from "./voice-pipeline/call-transfer";
 import { modelManager } from "./model-manager";
 import { voiceCloneManager } from "./providers/tts/kokoclone";
 import { chatterboxVoiceManager } from "./providers/tts/chatterbox";
+import { metricsBuffer, startMetricsCollection, stopMetricsCollection, setSessionCountProvider, collectSnapshot } from "./gpu-monitor";
 
 // ---- Configuration ----
 
@@ -90,6 +91,10 @@ modelManager.initialize().then(() => {
 }).catch((err) => {
   console.error("[voice-server] Model manager initialization failed:", err);
 });
+
+// Start GPU/CPU/memory metrics collection (30s interval, 3-day ring buffer)
+setSessionCountProvider(() => sessions.size);
+startMetricsCollection();
 
 wss.on("connection", (ws: WebSocket) => {
   if (isShuttingDown) {
@@ -397,9 +402,10 @@ async function checkOllama(): Promise<{ ok: boolean; models?: string[]; error?: 
 function handleIPC(req: IncomingMessage, res: ServerResponse): void {
   const url = new URL(req.url || "/", `http://localhost:${IPC_PORT}`);
 
-  // GET /health -- public health check
+  // GET /health -- public health check (enhanced with GPU data)
   if (req.method === "GET" && url.pathname === "/health") {
     const mem = process.memoryUsage();
+    const latest = metricsBuffer.getLatest();
 
     // Check Ollama connectivity asynchronously
     checkOllama().then((ollamaStatus) => {
@@ -415,6 +421,9 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
             rss: Math.round(mem.rss / 1024 / 1024),
             heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
           },
+          gpu: latest?.gpu || null,
+          cpu: latest?.cpu || null,
+          systemMemory: latest?.mem || null,
           ollama: ollamaStatus,
         })
       );
@@ -431,10 +440,45 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
             rss: Math.round(mem.rss / 1024 / 1024),
             heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
           },
+          gpu: latest?.gpu || null,
+          cpu: latest?.cpu || null,
+          systemMemory: latest?.mem || null,
           ollama: { ok: false, error: "check failed" },
         })
       );
     });
+    return;
+  }
+
+  // GET /health/gpu -- latest GPU snapshot only
+  if (req.method === "GET" && url.pathname === "/health/gpu") {
+    collectSnapshot().then((snap) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(snap));
+    }).catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+    });
+    return;
+  }
+
+  // GET /metrics/history -- historical metrics for charts
+  if (req.method === "GET" && url.pathname === "/metrics/history") {
+    const rangeParam = url.searchParams.get("range") || "1h";
+    const maxPoints = parseInt(url.searchParams.get("maxPoints") || "300", 10);
+
+    const rangeMs: Record<string, number> = {
+      "1h": 60 * 60 * 1000,
+      "6h": 6 * 60 * 60 * 1000,
+      "24h": 24 * 60 * 60 * 1000,
+      "3d": 3 * 24 * 60 * 60 * 1000,
+    };
+    const ms = rangeMs[rangeParam] || rangeMs["1h"];
+    const since = Date.now() - ms;
+    const snapshots = metricsBuffer.getRange(since, maxPoints);
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ snapshots, count: snapshots.length, rangeMs: ms }));
     return;
   }
 
@@ -1411,6 +1455,9 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   console.log(`\n[voice-server] ${signal} received -- starting graceful shutdown...`);
   console.log(`[voice-server] Active sessions: ${sessions.size}`);
+
+  // Stop metrics collection
+  stopMetricsCollection();
 
   // Stop accepting new connections
   wss.close();
