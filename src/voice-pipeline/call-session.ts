@@ -599,6 +599,23 @@ export class CallSession extends EventEmitter {
     this.emit("clear_audio");
   }
 
+  private waitForTTSFinish(timeoutMs: number = 30000): Promise<void> {
+    if (!this.isSpeaking) return Promise.resolve();
+    return new Promise((resolve) => {
+      const checkInterval = setInterval(() => {
+        if (!this.isSpeaking || this.state === "ended") {
+          clearInterval(checkInterval);
+          clearTimeout(timeout);
+          resolve();
+        }
+      }, 100);
+      const timeout = setTimeout(() => {
+        clearInterval(checkInterval);
+        resolve();
+      }, timeoutMs);
+    });
+  }
+
   private async handleToolCall(toolCall: LLMToolCall): Promise<void> {
     const result: ToolResult = await executeTool(toolCall, this.config.tools, {
       callId: this.config.callId,
@@ -612,11 +629,13 @@ export class CallSession extends EventEmitter {
     this.emit("tool_call", { toolCall, result });
 
     if (result.action === "endCall") {
+      await this.waitForTTSFinish();
       this.endCall("assistant-ended-call");
       return;
     }
 
     if (result.action === "transfer") {
+      await this.waitForTTSFinish();
       this.state = "transferring";
       this.emit("transfer", result.actionData);
       return;
