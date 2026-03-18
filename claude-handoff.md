@@ -1,6 +1,6 @@
 # VoiceServer — Claude Handoff Document
 
-**Last updated:** 2026-03-18 (rev 10)
+**Last updated:** 2026-03-18 (rev 11)
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
@@ -41,11 +41,23 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 ## What's Not Working / Known Issues
 
 - **Cloudflared tunnel URLs are ephemeral** — Quick tunnels generate random `trycloudflare.com` URLs. If tunnel processes restart, URLs change and Railway env vars need manual updating. Need Cloudflare named tunnel.
-- **Transcription accuracy still improving** — Whisper `small.en` is better than `base.en` but phone audio (8kHz mulaw → 16kHz PCM) is inherently low quality. Deepgram Flux is now available as a cloud alternative with native end-of-turn detection. Consider `medium.en` for higher local accuracy.
+- **Whisper hallucinations on 8kHz phone audio** — Whisper `small.en` produces severe hallucinations on Twilio phone audio (mulaw 8kHz resampled to 16kHz): "Thanks for watching!", "$100,000,000,000,000,000", "I'll get them ready" when user said something completely different. **Deepgram Flux is strongly recommended for production phone calls.** Whisper may work better with `medium.en` or `turbo` but untested.
+- **PM2 doesn't auto-reload .env on file change** — If you add/change API keys in `.env`, you must run `pm2 restart voiceserver --update-env`. The `dotenv/config` import only reads `.env` at process startup.
 
 ---
 
-## What Was Just Completed (Session 9 — March 18, 2026)
+## What Was Just Completed (Session 10 — March 18, 2026)
+
+### Deepgram Model Validation + STT Debugging
+
+1. **Fixed Deepgram HTTP 400 — wrong model name** — When assistant config had `provider: "deepgram"` with `model: "small.en"` (a Whisper model name left over from provider switch), Deepgram rejected the WebSocket connection with HTTP 400. Provider factory (`src/providers/index.ts`) now validates model names against `DEEPGRAM_MODELS` list and defaults to `flux-general-en` if invalid.
+2. **Discovered PM2 env not auto-loading .env changes** — `DEEPGRAM_API_KEY` was in `/opt/voiceserver/.env` but the PM2-managed process didn't have it in `process.env` because PM2 started before the key was added. Fixed with `pm2 restart voiceserver --update-env`. Documented as gotcha.
+3. **Confirmed Deepgram Flux v2 WebSocket works** — Direct test from GPU server: WebSocket connects to `wss://api.deepgram.com/v2/listen?model=flux-general-en` with stored API key. Connection succeeds.
+4. **Discovered Whisper hallucination severity** — Whisper `small.en` transcribing real phone calls produced: `"Thanks for watching!"`, `"$100,000,000,000,000,000"`, `"I'll get them ready"`, `"electric, and solar panels, and solar, and solar, holding, dollars"`. All completely wrong. Root cause: 8kHz mulaw phone audio resampled to 16kHz is too low quality for Whisper. Deepgram Flux recommended for production.
+
+---
+
+## Session 9 — March 18, 2026
 
 ### Call Transfer Fix + GitHub Actions Auto-Deploy Fix
 
@@ -210,6 +222,8 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 - **PyTorch CUDA wheel** — `pip install torch` installs CPU-only. Must use `pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu124`.
 - **PM2 needs PATH** — Node.js at `/opt/nvm/versions/node/v24.12.0/bin`. Always export PATH before PM2 commands.
 - **`pm2 restart --update-env`** — Picks up ecosystem env changes but NOT `/etc/environment` changes. For those: `pm2 delete voiceserver && pm2 start ecosystem.config.cjs --only voiceserver`.
+- **PM2 does NOT auto-reload .env on file change** — `dotenv/config` reads `.env` once at process startup. If you add/change keys in `.env`, you MUST run `pm2 restart voiceserver --update-env`. Without this, the running process won't see new keys even though they're in the file.
+- **Deepgram model name validation** — Provider factory validates `config.model` against known Deepgram models. If a Whisper model name (e.g. `small.en`) is passed when Deepgram is selected, it auto-defaults to `flux-general-en`. This catches stale model names from UI provider switches.
 - **Twilio credentials required on GPU VPS** — `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` must be in voiceserver `.env` for call transfers to work. Without them, `ff_transfer` tool fires but transfer silently fails. Set via GitHub Secrets (auto-synced on deploy), VapiClone Settings page, or manually.
 - **GitHub Actions deploy.yml `script:` must be under `with:`, NOT `env:`** — Previously the `script:` was nested under `env:` which made YAML treat it as an env var. Result: SSH connected but executed empty command, every deploy showed "success" but did nothing. The `env:` block must be a sibling of `with:`, not nested inside it.
 

@@ -373,12 +373,26 @@ export class CallSession extends EventEmitter {
     if (this.state === "ended") return;
 
     const mulaw = decodeBase64Audio(base64Audio);
-    const pcm = mulawToPcm16k(mulaw);
 
     this.audioChunkCount++;
 
     // Track STT cost: each chunk is 20ms of audio
     this.costTracker.addSTTUsage(0.02);
+
+    // If STT accepts raw mulaw (e.g. Deepgram), send it directly — better quality, no conversion
+    if (this.stt && (this.stt as any).config?.acceptsMulaw) {
+      this.stt.send(mulaw);
+
+      // Voicemail detector still needs PCM
+      if (this.voicemailDetector && !this.voicemailDetector.isResolved()) {
+        const pcm = mulawToPcm16k(mulaw);
+        this.voicemailDetector.analyzeFrame(pcm);
+      }
+      return;
+    }
+
+    // Default path: convert to PCM 16kHz for Whisper and other local STT
+    const pcm = mulawToPcm16k(mulaw);
 
     // Feed to voicemail detector if active
     if (this.voicemailDetector && !this.voicemailDetector.isResolved()) {

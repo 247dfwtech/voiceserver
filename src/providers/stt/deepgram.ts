@@ -44,7 +44,7 @@ export class DeepgramSTT extends EventEmitter implements STTProvider {
 
   constructor(config: STTConfig, apiKey: string) {
     super();
-    this.config = config;
+    this.config = { ...config, acceptsMulaw: true }; // Deepgram accepts raw mulaw — skip PCM conversion
     this.apiKey = apiKey;
     this.model = config.model || DEFAULT_MODEL;
   }
@@ -53,9 +53,15 @@ export class DeepgramSTT extends EventEmitter implements STTProvider {
     await this.connect();
   }
 
+  private audioBytesSent = 0;
+
   send(audio: Buffer): void {
     if (this.closed || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    // Send raw PCM audio as binary WebSocket frame
+    this.audioBytesSent += audio.length;
+    // Log first audio send and periodically
+    if (this.audioBytesSent === audio.length || this.audioBytesSent % 32000 < audio.length) {
+      console.log(`[stt/deepgram] Audio sent: ${this.audioBytesSent} bytes total, chunk=${audio.length}B, ws=${this.ws.readyState}`);
+    }
     this.ws.send(audio);
   }
 
@@ -99,10 +105,11 @@ export class DeepgramSTT extends EventEmitter implements STTProvider {
       const apiVersion = modelInfo?.api === "v1" ? "v1" : "v2";
 
       // Build WebSocket URL with query parameters
+      // Use mulaw 8kHz directly from Twilio — no PCM conversion needed, better quality
       const params = new URLSearchParams();
       params.set("model", this.model);
-      params.set("encoding", "linear16");
-      params.set("sample_rate", "16000");
+      params.set("encoding", "mulaw");
+      params.set("sample_rate", "8000");
 
       if (apiVersion === "v2") {
         // Flux turn-based settings

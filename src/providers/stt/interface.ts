@@ -5,6 +5,8 @@ export interface STTConfig {
   model?: string;
   language?: string;
   keywords?: string[];
+  /** If true, the provider accepts raw mulaw 8kHz audio (no PCM conversion needed) */
+  acceptsMulaw?: boolean;
 }
 
 export interface STTProvider extends EventEmitter {
