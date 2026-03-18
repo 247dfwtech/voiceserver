@@ -72,6 +72,7 @@ export async function executeTool(
     customerName?: string;
     assistantId: string;
     metadata?: Record<string, unknown>;
+    fallbackDestination?: string;
   }
 ): Promise<ToolResult> {
   const toolDef = toolDefinitions.find(
@@ -99,7 +100,14 @@ export async function executeTool(
   }
 
   if (toolDef.type === "transferCall") {
-    const destination = toolDef.config?.destination;
+    const destination = toolDef.config?.destination || callContext.fallbackDestination;
+    if (!destination) {
+      return {
+        toolCallId: toolCall.id,
+        name: toolCall.function.name,
+        result: "Transfer failed: no destination configured",
+      };
+    }
     return {
       toolCallId: toolCall.id,
       name: toolCall.function.name,

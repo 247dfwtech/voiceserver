@@ -233,6 +233,7 @@ export interface CallSessionConfig {
   customerName?: string;
   variableValues?: Record<string, string>;
   metadata?: Record<string, unknown>;
+  fallbackDestination?: string;
   serverUrl?: string;
   backgroundDenoising?: boolean;
   startSpeakingPlan?: { waitSeconds?: number; smartEndpointingEnabled?: boolean };
@@ -459,6 +460,26 @@ export class CallSession extends EventEmitter {
           },
         });
       }
+      if (t.type === "transferCall" && !t.functionDefinition) {
+        llmTools.push({
+          type: "function",
+          function: {
+            name: t.name,
+            description: t.description || "Transfer the call",
+            parameters: { type: "object", properties: {} },
+          },
+        });
+      }
+      if (t.type === "dtmf" && !t.functionDefinition) {
+        llmTools.push({
+          type: "function",
+          function: {
+            name: t.name,
+            description: t.description || "Send DTMF tones",
+            parameters: { type: "object", properties: {} },
+          },
+        });
+      }
     }
 
     let fullResponse = "";
@@ -571,6 +592,7 @@ export class CallSession extends EventEmitter {
       customerName: this.config.customerName,
       assistantId: this.config.assistantId,
       metadata: this.config.metadata,
+      fallbackDestination: this.config.fallbackDestination,
     });
 
     this.emit("tool_call", { toolCall, result });

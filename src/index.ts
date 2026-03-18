@@ -193,10 +193,12 @@ wss.on("connection", (ws: WebSocket) => {
 
           // Handle call transfer
           session.on("transfer", async (transferData: { destination?: string }) => {
+            console.log(`[voice-server] [${callId}] Transfer requested, destination=${transferData.destination || "NONE"}`);
             if (transferData.destination) {
               try {
                 const twilioCallSid = msg.start?.callSid;
                 if (twilioCallSid) {
+                  console.log(`[voice-server] [${callId}] Executing Twilio transfer to ${transferData.destination}`);
                   const result = await transferCallWithDial({
                     callSid: twilioCallSid,
                     destination: transferData.destination,
@@ -204,12 +206,18 @@ wss.on("connection", (ws: WebSocket) => {
                     callerNumber: config.customerNumber,
                   });
                   if (!result.success) {
-                    console.error(`[voice-server] Transfer failed:`, result.error);
+                    console.error(`[voice-server] [${callId}] Transfer failed:`, result.error);
+                  } else {
+                    console.log(`[voice-server] [${callId}] Transfer initiated successfully`);
                   }
+                } else {
+                  console.error(`[voice-server] [${callId}] Transfer failed: no Twilio callSid`);
                 }
               } catch (err) {
-                console.error(`[voice-server] Transfer error:`, err);
+                console.error(`[voice-server] [${callId}] Transfer error:`, err);
               }
+            } else {
+              console.error(`[voice-server] [${callId}] Transfer skipped: no destination`);
             }
           });
 
