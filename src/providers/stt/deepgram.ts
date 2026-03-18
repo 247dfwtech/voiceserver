@@ -29,7 +29,7 @@ const DEFAULT_MODEL = "flux-general-en";
 const DEEPGRAM_WS_BASE = "wss://api.deepgram.com";
 const RECONNECT_DELAY_MS = 2000;
 const MAX_RECONNECTS = 5;
-const KEEPALIVE_INTERVAL_MS = 10_000;
+const KEEPALIVE_INTERVAL_MS = 5_000; // Deepgram closes after 10s of no audio/keepalive — send every 5s
 
 export class DeepgramSTT extends EventEmitter implements STTProvider {
   private config: STTConfig;
