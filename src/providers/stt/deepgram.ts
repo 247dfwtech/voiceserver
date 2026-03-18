@@ -29,7 +29,7 @@ const DEFAULT_MODEL = "flux-general-en";
 const DEEPGRAM_WS_BASE = "wss://api.deepgram.com";
 const RECONNECT_DELAY_MS = 2000;
 const MAX_RECONNECTS = 5;
-const KEEPALIVE_INTERVAL_MS = 5_000; // Deepgram closes after 10s of no audio/keepalive — send every 5s
+const KEEPALIVE_INTERVAL_MS = 5_000; // v1 only — Deepgram v1 closes after 10s of no audio/keepalive
 
 export class DeepgramSTT extends EventEmitter implements STTProvider {
   private config: STTConfig;
@@ -67,7 +67,6 @@ export class DeepgramSTT extends EventEmitter implements STTProvider {
 
   async finish(): Promise<void> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      // Send Finalize to flush any remaining audio
       this.ws.send(JSON.stringify({ type: "Finalize" }));
     }
   }
@@ -314,9 +313,14 @@ export class DeepgramSTT extends EventEmitter implements STTProvider {
 
   private startKeepalive(): void {
     this.stopKeepalive();
+    // Use WebSocket ping frames instead of text KeepAlive messages.
+    // Deepgram docs warn that sending KeepAlive as text data frames
+    // interleaved with binary audio "will cause the audio processing to choke."
+    // Twilio sends continuous audio so text KeepAlive is redundant during calls,
+    // but ping frames keep the TCP connection alive without disrupting audio processing.
     this.keepaliveTimer = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: "KeepAlive" }));
+        this.ws.ping();
       }
     }, KEEPALIVE_INTERVAL_MS);
   }
