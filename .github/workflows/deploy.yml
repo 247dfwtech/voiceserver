@@ -29,6 +29,9 @@ jobs:
             echo "--- Installing dependencies ---"
             npm install
 
+            echo "--- Installing Python dependencies ---"
+            pip install -q faster-whisper 2>/dev/null || pip3 install -q faster-whisper 2>/dev/null || true
+
             echo "--- Building TypeScript ---"
             npm run build
 
