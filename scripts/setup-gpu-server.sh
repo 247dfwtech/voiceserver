@@ -45,10 +45,18 @@
 #  14. Verifies GPU monitoring endpoints (/health with GPU data, /metrics/history)
 #  15. Prints tunnel URLs for Railway env var setup
 #
-# POST-SETUP: API keys (Deepgram, OpenAI, etc.) can be set via:
+# POST-SETUP: API keys can be set via:
 #   - VapiClone Settings page (auto-syncs to GPU server via /settings API)
 #   - GitHub Secrets (auto-synced on deploy via GitHub Actions)
-#   - Manual: echo 'DEEPGRAM_API_KEY=xxx' >> /opt/voiceserver/.env
+#   - Manual: echo 'KEY=value' >> /opt/voiceserver/.env && pm2 restart voiceserver --update-env
+#
+# REQUIRED KEYS for full functionality:
+#   - TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN — needed for call transfers (Twilio <Dial>)
+#   - DEEPGRAM_API_KEY — needed if using Deepgram STT (Whisper works without it)
+#
+# GitHub Actions auto-deploy: push to main → SSH into GPU → pull, build, restart
+# Secrets needed in GitHub repo: SSH_HOST, SSH_PORT, SSH_USER, SSH_PRIVATE_KEY,
+#   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, DEEPGRAM_API_KEY
 ###############################################################################
 
 set -euo pipefail
@@ -525,6 +533,11 @@ VAPICLONE_API_URL=${VAPICLONE_API_URL_DEFAULT}
 VAPICLONE_API_KEY=${VAPICLONE_API_KEY_DEFAULT}
 IPC_SECRET=${IPC_SECRET_DEFAULT}
 
+# Twilio credentials — REQUIRED for call transfers (ff_transfer tool)
+# Set via VapiClone Settings page, GitHub Secrets, or manually here
+# TWILIO_ACCOUNT_SID=
+# TWILIO_AUTH_TOKEN=
+
 # Paid provider API keys (can also be set via VapiClone Settings UI)
 # DEEPGRAM_API_KEY=
 # ELEVENLABS_API_KEY=
@@ -848,8 +861,8 @@ echo ""
 echo "  ⚠️  Tunnel URLs are EPHEMERAL — they change when PM2 restarts tunnels."
 echo "     After any server reboot or tunnel restart, get new URLs and update Railway."
 echo ""
-echo "  Deploy new voiceserver code:"
-echo "    export PATH=\"/opt/nvm/versions/node/v24.12.0/bin:/opt/instance-tools/bin:\$PATH\""
+echo "  Deploy new voiceserver code (auto-deploys via GitHub Actions on push to main):"
+echo "    Manual: export PATH=\"/usr/bin:/opt/nvm/versions/node/v24.12.0/bin:/opt/instance-tools/bin:\$PATH\""
 echo "    cd /opt/voiceserver && git pull && npm run build && pm2 restart voiceserver --update-env"
 echo ""
 echo "  Check logs:"

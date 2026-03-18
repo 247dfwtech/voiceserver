@@ -1,6 +1,6 @@
 # VoiceServer — Claude Handoff Document
 
-**Last updated:** 2026-03-18 (rev 9)
+**Last updated:** 2026-03-18 (rev 10)
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
@@ -33,7 +33,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 - **Voicemail detection** — Detects sustained speech patterns in first 5 seconds (disabled by default for testing)
 - **Cost tracking** — Per-call breakdown (STT, LLM, TTS, transport). Local models = $0.
 - **PM2 managed** — voiceserver + ollama + 3 cloudflared tunnels, auto-restart, boot persistence
-- **GitHub Actions auto-deploy** — Push to main → SSH into Vast.ai → build → restart
+- **GitHub Actions auto-deploy** ✅ — Push to main → SSH into Vast.ai → pull, build, restart. Deploy logs deployed commit hash. Syncs Twilio + Deepgram + OpenAI keys from GitHub Secrets to `.env`.
 - **GPU/CPU/Memory monitoring** ✅ — `gpu-monitor.ts` collects metrics every 30s via nvidia-smi + os module. 3-day in-memory ring buffer (8640 entries, ~1.7MB). Endpoints: `/health` (enhanced with GPU data inline), `/health/gpu` (fresh snapshot), `/metrics/history?range=1h|6h|24h|3d` (historical data for charts)
 - **`/logs` endpoint** — `GET /logs?lines=N` returns recent PM2 log lines; requires `x-ipc-secret` header
 - **IPC auth** — All IPC calls require either `Authorization: Bearer <VAPICLONE_API_KEY>` or `x-ipc-secret: <IPC_SECRET>` header
@@ -210,6 +210,8 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 - **PyTorch CUDA wheel** — `pip install torch` installs CPU-only. Must use `pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cu124`.
 - **PM2 needs PATH** — Node.js at `/opt/nvm/versions/node/v24.12.0/bin`. Always export PATH before PM2 commands.
 - **`pm2 restart --update-env`** — Picks up ecosystem env changes but NOT `/etc/environment` changes. For those: `pm2 delete voiceserver && pm2 start ecosystem.config.cjs --only voiceserver`.
+- **Twilio credentials required on GPU VPS** — `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` must be in voiceserver `.env` for call transfers to work. Without them, `ff_transfer` tool fires but transfer silently fails. Set via GitHub Secrets (auto-synced on deploy), VapiClone Settings page, or manually.
+- **GitHub Actions deploy.yml `script:` must be under `with:`, NOT `env:`** — Previously the `script:` was nested under `env:` which made YAML treat it as an env var. Result: SSH connected but executed empty command, every deploy showed "success" but did nothing. The `env:` block must be a sibling of `with:`, not nested inside it.
 
 ### Important — Will cause confusion if forgotten
 
@@ -246,7 +248,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 | `src/voice-pipeline/tool-executor.ts` | Tool execution with SSRF protection |
 | `src/voice-pipeline/audio-utils.ts` | Audio format conversion (mu-law ↔ PCM, resampling) |
 | `scripts/setup-gpu-server.sh` | **One-click bare metal setup** — installs all deps, pre-downloads models, configures PM2 |
-| `.github/workflows/deploy.yml` | GitHub Actions — SSH deploy, installs Python deps, builds, restarts PM2 |
+| `.github/workflows/deploy.yml` | GitHub Actions — SSH deploy to Vast.ai: syncs API keys (Twilio, Deepgram, etc.), pulls, builds, restarts PM2. Logs deployed commit hash. |
 
 ### Current .env on Vast.ai (`/opt/voiceserver/.env`)
 
@@ -269,6 +271,18 @@ TWILIO_ACCOUNT_SID=***
 TWILIO_AUTH_TOKEN=***
 DEEPGRAM_API_KEY=***
 ```
+
+### GitHub Secrets (for auto-deploy)
+
+| Secret | Purpose |
+|---|---|
+| `SSH_HOST` | Vast.ai instance IP (70.29.210.33) |
+| `SSH_PORT` | Vast.ai SSH port (45194) |
+| `SSH_USER` | root |
+| `SSH_PRIVATE_KEY` | SSH private key for Vast.ai |
+| `TWILIO_ACCOUNT_SID` | Twilio account SID — synced to .env on deploy |
+| `TWILIO_AUTH_TOKEN` | Twilio auth token — synced to .env on deploy |
+| `DEEPGRAM_API_KEY` | Deepgram API key — synced to .env on deploy |
 
 ### Current Cloudflared Tunnel URLs
 
@@ -307,8 +321,8 @@ curl -s -X POST -H "x-ipc-secret: vs-ipc-2026" -H "Content-Type: application/jso
 # SSH into GPU
 ssh -p 45194 root@70.29.210.33
 
-# After SSH: deploy latest code
-export PATH="/opt/nvm/versions/node/v24.12.0/bin:/opt/instance-tools/bin:$PATH"
+# After SSH: deploy latest code (normally auto-deploys via GitHub Actions)
+export PATH="/usr/bin:/opt/nvm/versions/node/v24.12.0/bin:/opt/instance-tools/bin:$PATH"
 cd /opt/voiceserver && git pull && npm run build && pm2 restart voiceserver --update-env
 
 # Check GPU usage
