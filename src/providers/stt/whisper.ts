@@ -1,19 +1,217 @@
 import { EventEmitter } from "events";
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 import { writeFile, unlink } from "fs/promises";
 import type { STTProvider, STTConfig } from "./interface";
 
 /**
- * Whisper STT provider -- uses faster-whisper CLI for transcription.
+ * Whisper STT provider -- uses faster-whisper Python package via persistent subprocess.
  *
  * Strategy: Buffer audio until an utterance boundary (silence detection),
- * then write to a temp WAV file and run faster-whisper on it.
+ * then write to a temp WAV file and send the path to the persistent Python process.
  *
- * This is a batch approach (not true streaming like Deepgram), but it's free.
- * Latency is ~0.5-2s per utterance depending on GPU/CPU.
+ * Uses the same module-level singleton pattern as Kokoro TTS and Granite STT:
+ * one Python process loads the model once into GPU memory and handles all
+ * transcription requests via stdin/stdout protocol.
+ *
+ * Latency: ~0.3-1s per utterance on GPU, ~1-3s on CPU.
  */
+
+// Module-level singleton so all call sessions share one loaded model process
+let whisperProcess: ChildProcess | null = null;
+let whisperReady = false;
+let whisperReadyPromise: Promise<void> | null = null;
+let pendingResolve: ((text: string) => void) | null = null;
+let pendingReject: ((err: Error) => void) | null = null;
+let stdoutBuffer = "";
+
+function buildWhisperScript(modelSize: string, language: string): string {
+  return `
+import sys
+
+# Redirect all stdout noise to stderr BEFORE importing heavy libs
+_orig_stdout = sys.stdout.buffer
+sys.stdout = sys.stderr
+
+from faster_whisper import WhisperModel
+
+model_size = "${modelSize}"
+language = "${language}"
+
+print(f"WHISPER_LOADING model={model_size}", flush=True)
+
+# Use GPU if available (auto detects CUDA), fallback to CPU with int8
+try:
+    model = WhisperModel(model_size, device="cuda", compute_type="float16")
+    print(f"WHISPER_READY device=cuda compute=float16", flush=True)
+except Exception:
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    print(f"WHISPER_READY device=cpu compute=int8", flush=True)
+
+# Main loop: read audio file paths from stdin, write transcription to stdout
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+
+    try:
+        segments, info = model.transcribe(
+            line,
+            language=language,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=300),
+        )
+        transcription = " ".join(seg.text.strip() for seg in segments).strip()
+        _orig_stdout.write((transcription + "\\n").encode())
+        _orig_stdout.flush()
+        print(f"WHISPER_OK lang={info.language} prob={info.language_probability:.2f} chars={len(transcription)}", flush=True)
+
+    except Exception as e:
+        _orig_stdout.write(f"ERROR: {e}\\n".encode())
+        _orig_stdout.flush()
+        print(f"WHISPER_ERR {e}", flush=True)
+`.trim();
+}
+
+function ensureWhisperProcess(modelSize: string, language: string): Promise<void> {
+  if (whisperReady && whisperProcess && !whisperProcess.killed) return Promise.resolve();
+  if (whisperReadyPromise) return whisperReadyPromise;
+
+  whisperReadyPromise = new Promise<void>((resolve, reject) => {
+    console.log(`[stt/whisper] Starting Whisper persistent Python process (model=${modelSize})...`);
+
+    const script = buildWhisperScript(modelSize, language);
+    whisperProcess = spawn("python3", ["-u", "-c", script], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    });
+
+    let stderrBuf = "";
+    let resolved = false;
+
+    // Parse stdout lines — each line is a transcription response or ERROR:
+    whisperProcess.stdout!.on("data", (data: Buffer) => {
+      stdoutBuffer += data.toString();
+      const newline = stdoutBuffer.indexOf("\n");
+      if (newline !== -1) {
+        const line = stdoutBuffer.slice(0, newline).trim();
+        stdoutBuffer = stdoutBuffer.slice(newline + 1);
+
+        if (pendingResolve) {
+          const cb = pendingResolve;
+          const cbErr = pendingReject;
+          pendingResolve = null;
+          pendingReject = null;
+
+          if (line.startsWith("ERROR:")) {
+            cbErr?.(new Error(line.slice(6).trim()));
+          } else {
+            cb(line);
+          }
+        }
+      }
+    });
+
+    whisperProcess.stderr!.on("data", (data: Buffer) => {
+      const text = data.toString();
+      stderrBuf += text;
+
+      for (const line of text.split("\n").filter((l) => l.trim())) {
+        if (line.includes("WHISPER_READY")) {
+          if (!resolved) {
+            resolved = true;
+            whisperReady = true;
+            console.log(`[stt/whisper] ${line.trim()}`);
+            resolve();
+          }
+        } else if (line.includes("WHISPER_OK") || line.includes("WHISPER_LOADING")) {
+          console.log(`[stt/whisper] ${line.trim()}`);
+        } else if (line.includes("WHISPER_ERR")) {
+          console.error(`[stt/whisper] ${line.trim()}`);
+        }
+      }
+    });
+
+    whisperProcess.on("error", (err) => {
+      console.error("[stt/whisper] Python process error:", err.message);
+      whisperReady = false;
+      whisperReadyPromise = null;
+      whisperProcess = null;
+      pendingReject?.(err);
+      pendingResolve = null;
+      pendingReject = null;
+      if (!resolved) reject(err);
+    });
+
+    whisperProcess.on("exit", (code) => {
+      console.warn(`[stt/whisper] Python process exited with code ${code}`);
+      whisperReady = false;
+      whisperProcess = null;
+      whisperReadyPromise = null;
+      if (pendingReject) {
+        pendingReject(new Error(`Whisper process exited (code ${code})`));
+        pendingResolve = null;
+        pendingReject = null;
+      }
+      if (!resolved) reject(new Error(`Whisper process exited (code ${code}): ${stderrBuf.slice(-500)}`));
+    });
+
+    // Allow up to 120s for first cold-start model download + load
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        whisperProcess?.kill("SIGTERM");
+        whisperReady = false;
+        whisperReadyPromise = null;
+        reject(new Error(`Whisper model load timed out after 120s. stderr: ${stderrBuf.slice(-300)}`));
+      }
+    }, 120_000);
+  });
+
+  return whisperReadyPromise;
+}
+
+async function transcribeFile(audioPath: string, modelSize: string, language: string): Promise<string> {
+  await ensureWhisperProcess(modelSize, language);
+
+  return new Promise<string>((resolve, reject) => {
+    if (!whisperProcess || !whisperProcess.stdin) {
+      reject(new Error("Whisper process not available"));
+      return;
+    }
+
+    if (pendingResolve) {
+      reject(new Error("Whisper is already processing a request"));
+      return;
+    }
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      pendingResolve = null;
+      pendingReject = null;
+      reject(new Error("Whisper transcription timed out after 15s"));
+    }, 15_000);
+
+    pendingResolve = (text) => {
+      if (!timedOut) {
+        clearTimeout(timer);
+        resolve(text);
+      }
+    };
+    pendingReject = (err) => {
+      if (!timedOut) {
+        clearTimeout(timer);
+        reject(err);
+      }
+    };
+
+    whisperProcess.stdin.write(audioPath + "\n");
+  });
+}
+
 export class WhisperSTT extends EventEmitter implements STTProvider {
   private config: STTConfig;
   private audioBuffer: Buffer[] = [];
@@ -22,33 +220,23 @@ export class WhisperSTT extends EventEmitter implements STTProvider {
   private speechDetected = false;
   private closed = false;
 
-  // Whisper process config
-  private whisperModel: string;
-  private whisperBinary: string;
+  private modelSize: string;
+  private language: string;
   private speechThreshold = 500;
   private silenceThresholdFrames = 25; // 25 * 20ms = 500ms of silence
 
   constructor(config: STTConfig) {
     super();
     this.config = config;
-    this.whisperModel = config.model || process.env.WHISPER_MODEL || "base.en";
-    this.whisperBinary = process.env.WHISPER_BINARY || "faster-whisper";
+    this.modelSize = config.model || process.env.WHISPER_MODEL || "base.en";
+    this.language = config.language || "en";
   }
 
   async start(): Promise<void> {
-    // Verify faster-whisper is available
-    try {
-      const proc = spawn(this.whisperBinary, ["--help"], { stdio: "pipe" });
-      await new Promise<void>((resolve, reject) => {
-        proc.on("close", (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`faster-whisper not found (exit code ${code}). Run scripts/install-whisper.sh`));
-        });
-        proc.on("error", () => reject(new Error("faster-whisper binary not found. Run scripts/install-whisper.sh")));
-      });
-    } catch (err) {
-      console.warn(`[stt/whisper] ${err instanceof Error ? err.message : err}. Whisper STT may not work.`);
-    }
+    // Kick off model loading in the background so first utterance isn't slow
+    ensureWhisperProcess(this.modelSize, this.language).catch((err) => {
+      console.warn(`[stt/whisper] Background model load failed: ${err.message}`);
+    });
   }
 
   send(audio: Buffer): void {
@@ -93,7 +281,6 @@ export class WhisperSTT extends EventEmitter implements STTProvider {
     if (this.isProcessing || this.audioBuffer.length === 0) return;
     this.isProcessing = true;
 
-    // Collect buffered audio
     const pcmData = Buffer.concat(this.audioBuffer);
     this.audioBuffer = [];
 
@@ -115,67 +302,16 @@ export class WhisperSTT extends EventEmitter implements STTProvider {
   }
 
   private async transcribeWithWhisper(pcmData: Buffer): Promise<string> {
-    // Write PCM to temp WAV file
     const tmpPath = join(tmpdir(), `whisper-${Date.now()}.wav`);
-
     try {
       const wavBuffer = this.pcmToWav(pcmData, 16000, 16, 1);
       await writeFile(tmpPath, wavBuffer);
-
-      // Run faster-whisper
-      const result = await new Promise<string>((resolve, reject) => {
-        const args = [
-          tmpPath,
-          "--model", this.whisperModel,
-          "--language", this.config.language || "en",
-          "--output_format", "txt",
-          "--output_dir", tmpdir(),
-        ];
-
-        const proc: ChildProcess = spawn(this.whisperBinary, args, {
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-
-        let stdout = "";
-        let stderr = "";
-
-        proc.stdout?.on("data", (data) => (stdout += data.toString()));
-        proc.stderr?.on("data", (data) => (stderr += data.toString()));
-
-        proc.on("close", (code) => {
-          if (code === 0) {
-            resolve(stdout.trim() || stderr.trim());
-          } else {
-            reject(new Error(`Whisper failed (exit ${code}): ${stderr}`));
-          }
-        });
-
-        proc.on("error", reject);
-
-        // Timeout after 10 seconds
-        setTimeout(() => {
-          proc.kill("SIGTERM");
-          reject(new Error("Whisper transcription timed out"));
-        }, 10000);
-      });
-
-      return result;
+      return await transcribeFile(tmpPath, this.modelSize, this.language);
     } finally {
-      // Clean up temp file
-      try {
-        await unlink(tmpPath);
-      } catch {
-        // ignore
-      }
-      try {
-        await unlink(tmpPath.replace(".wav", ".txt"));
-      } catch {
-        // ignore
-      }
+      try { await unlink(tmpPath); } catch {}
     }
   }
 
-  /** Convert raw PCM to WAV format */
   private pcmToWav(pcm: Buffer, sampleRate: number, bitsPerSample: number, channels: number): Buffer {
     const byteRate = sampleRate * channels * (bitsPerSample / 8);
     const blockAlign = channels * (bitsPerSample / 8);
@@ -187,8 +323,8 @@ export class WhisperSTT extends EventEmitter implements STTProvider {
     header.writeUInt32LE(dataSize + headerSize - 8, 4);
     header.write("WAVE", 8);
     header.write("fmt ", 12);
-    header.writeUInt32LE(16, 16); // fmt chunk size
-    header.writeUInt16LE(1, 20); // PCM format
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
     header.writeUInt16LE(channels, 22);
     header.writeUInt32LE(sampleRate, 24);
     header.writeUInt32LE(byteRate, 28);
