@@ -2,7 +2,7 @@ import type { STTConfig, STTProvider } from "./stt/interface";
 import type { TTSConfig, TTSProvider } from "./tts/interface";
 import type { LLMConfig, LLMProvider } from "./llm/interface";
 import { WhisperSTT } from "./stt/whisper";
-import { DeepgramSTT } from "./stt/deepgram";
+import { DeepgramSTT, DEEPGRAM_MODELS } from "./stt/deepgram";
 import { OpenAICompatLLM } from "./llm/openai-compat";
 import { PiperTTS } from "./tts/piper";
 import { KokoroTTS } from "./tts/kokoro";
@@ -38,7 +38,16 @@ export function createSTTProvider(config: STTConfig): STTProvider {
         console.warn("[providers] Deepgram requested but DEEPGRAM_API_KEY not set, falling back to Whisper");
         return new WhisperSTT(config);
       }
-      console.log(`[providers] Using Deepgram STT (model=${config.model || "flux-general-en"})`);
+      // Validate model name — reject Whisper model names sent by mistake
+      const validDGModels = DEEPGRAM_MODELS.map(m => m.id);
+      if (config.model && !validDGModels.includes(config.model)) {
+        console.warn(`[providers] Invalid Deepgram model "${config.model}", defaulting to flux-general-en`);
+        config = { ...config, model: "flux-general-en" };
+      }
+      if (!config.model) {
+        config = { ...config, model: "flux-general-en" };
+      }
+      console.log(`[providers] Using Deepgram STT (model=${config.model})`);
       return new DeepgramSTT(config, apiKey);
     }
     case "whisper":
