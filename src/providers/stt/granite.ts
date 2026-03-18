@@ -47,22 +47,29 @@ _orig_stdout = sys.stdout.buffer
 sys.stdout = sys.stderr
 
 import torch
-from transformers import pipeline as hf_pipeline
+import numpy as np
+import soundfile as sf
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 
 model_id = "${modelId}"
-device = 0 if torch.cuda.is_available() else -1
-torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+use_cuda = torch.cuda.is_available()
+device_str = "cuda" if use_cuda else "cpu"
+torch_dtype = torch.float16 if use_cuda else torch.float32
 
-print(f"GRANITE_LOADING model={model_id} device={device}", flush=True)
+print(f"GRANITE_LOADING model={model_id} device={device_str}", flush=True)
 
-# Use pipeline abstraction — handles AutoProcessor calling convention automatically
-pipe = hf_pipeline(
-    "automatic-speech-recognition",
-    model=model_id,
-    device=device,
-    torch_dtype=torch_dtype,
+# Load processor and model directly.
+# IMPORTANT: GraniteSpeechFeatureExtractor.__call__() does NOT accept a
+# 'sampling_rate' keyword argument — hf_pipeline() always passes it, so we
+# must bypass pipeline and call the model ourselves.
+processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForSpeechSeq2Seq.from_pretrained(
+    model_id,
     trust_remote_code=True,
+    torch_dtype=torch_dtype,
 )
+model = model.to(device_str)
+model.eval()
 
 print("GRANITE_READY", flush=True)
 
@@ -73,8 +80,25 @@ for line in sys.stdin:
         continue
 
     try:
-        result = pipe(line)
-        transcription = (result.get("text", "") if isinstance(result, dict) else "").strip()
+        # Load WAV file (already 16kHz mono from our pcmToWav encoder)
+        audio_array, sr = sf.read(line, dtype="float32")
+        if len(audio_array.shape) > 1:
+            audio_array = audio_array.mean(axis=1)  # stereo → mono
+
+        # Call processor WITHOUT sampling_rate kwarg — Granite's feature
+        # extractor has a fixed expected rate and rejects that argument.
+        inputs = processor(audio_array, return_tensors="pt")
+
+        # Move tensors to device; cast float tensors to model dtype
+        inputs = {
+            k: (v.to(device_str, dtype=torch_dtype) if v.dtype.is_floating_point else v.to(device_str))
+            for k, v in inputs.items()
+        }
+
+        with torch.no_grad():
+            generated_ids = model.generate(**inputs, max_new_tokens=440)
+
+        transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
         _orig_stdout.write((transcription + "\\n").encode())
         _orig_stdout.flush()
         print(f"GRANITE_OK chars={len(transcription)}", flush=True)
