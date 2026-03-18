@@ -28,7 +28,7 @@ let stdoutBuffer = "";
 
 function buildWhisperScript(modelSize: string, language: string): string {
   return `
-import sys
+import sys, json
 
 # Redirect all stdout noise to stderr BEFORE importing heavy libs
 _orig_stdout = sys.stdout.buffer
@@ -49,19 +49,33 @@ except Exception:
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
     print(f"WHISPER_READY device=cpu compute=int8", flush=True)
 
-# Main loop: read audio file paths from stdin, write transcription to stdout
+# Main loop: read JSON commands from stdin
+# Format: {"path": "/tmp/audio.wav", "keywords": ["solar", "Freedom Forever"]}
+# Or plain file path for backward compatibility
 for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
 
     try:
+        # Parse JSON or treat as plain file path
+        initial_prompt = None
+        if line.startswith("{"):
+            cmd = json.loads(line)
+            audio_path = cmd["path"]
+            keywords = cmd.get("keywords", [])
+            if keywords:
+                initial_prompt = ", ".join(keywords)
+        else:
+            audio_path = line
+
         segments, info = model.transcribe(
-            line,
+            audio_path,
             language=language,
             beam_size=5,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=300),
+            initial_prompt=initial_prompt,
         )
         transcription = " ".join(seg.text.strip() for seg in segments).strip()
         _orig_stdout.write((transcription + "\\n").encode())
@@ -173,7 +187,7 @@ function ensureWhisperProcess(modelSize: string, language: string): Promise<void
   return whisperReadyPromise;
 }
 
-async function transcribeFile(audioPath: string, modelSize: string, language: string): Promise<string> {
+async function transcribeFile(audioPath: string, modelSize: string, language: string, keywords?: string[]): Promise<string> {
   await ensureWhisperProcess(modelSize, language);
 
   return new Promise<string>((resolve, reject) => {
@@ -208,7 +222,9 @@ async function transcribeFile(audioPath: string, modelSize: string, language: st
       }
     };
 
-    whisperProcess.stdin.write(audioPath + "\n");
+    // Send JSON with path + keywords for initial_prompt biasing
+    const cmd = JSON.stringify({ path: audioPath, keywords: keywords || [] });
+    whisperProcess.stdin.write(cmd + "\n");
   });
 }
 
@@ -222,14 +238,16 @@ export class WhisperSTT extends EventEmitter implements STTProvider {
 
   private modelSize: string;
   private language: string;
+  private keywords: string[];
   private speechThreshold = 500;
-  private silenceThresholdFrames = 25; // 25 * 20ms = 500ms of silence
+  private silenceThresholdFrames = 50; // 50 * 20ms = 1000ms of silence (phone conversations need longer pauses)
 
   constructor(config: STTConfig) {
     super();
     this.config = config;
-    this.modelSize = config.model || process.env.WHISPER_MODEL || "base.en";
+    this.modelSize = config.model || process.env.WHISPER_MODEL || "small.en";
     this.language = config.language || "en";
+    this.keywords = config.keywords || [];
   }
 
   async start(): Promise<void> {
@@ -306,7 +324,7 @@ export class WhisperSTT extends EventEmitter implements STTProvider {
     try {
       const wavBuffer = this.pcmToWav(pcmData, 16000, 16, 1);
       await writeFile(tmpPath, wavBuffer);
-      return await transcribeFile(tmpPath, this.modelSize, this.language);
+      return await transcribeFile(tmpPath, this.modelSize, this.language, this.keywords);
     } finally {
       try { await unlink(tmpPath); } catch {}
     }
