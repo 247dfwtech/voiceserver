@@ -19,6 +19,7 @@ import { CallSession, type CallSessionConfig, type CostBreakdown } from "./voice
 import { runPostCallAnalysis } from "./voice-pipeline/analysis-runner";
 import { transferCallWithDial } from "./voice-pipeline/call-transfer";
 import { modelManager } from "./model-manager";
+import { warmupKokoro } from "./providers/tts/kokoro";
 import { voiceCloneManager } from "./providers/tts/kokoclone";
 import { chatterboxVoiceManager } from "./providers/tts/chatterbox";
 import { metricsBuffer, startMetricsCollection, stopMetricsCollection, setSessionCountProvider, collectSnapshot } from "./gpu-monitor";
@@ -113,6 +114,9 @@ modelManager.initialize().then(() => {
 }).catch((err) => {
   console.error("[voice-server] Model manager initialization failed:", err);
 });
+
+// Pre-warm Kokoro TTS so first call doesn't wait 6+ seconds for model load
+warmupKokoro();
 
 // Start GPU/CPU/memory metrics collection (30s interval, 3-day ring buffer)
 setSessionCountProvider(() => sessions.size);

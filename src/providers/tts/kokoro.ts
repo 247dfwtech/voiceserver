@@ -284,6 +284,13 @@ function _resampleTo16k(input: Buffer, sourceRate: number): Buffer {
   return output;
 }
 
+/** Pre-warm Kokoro so the first call doesn't wait 6+ seconds for model load */
+export function warmupKokoro(): void {
+  _ensureKokoroReady(DEFAULT_VOICE).catch((err) => {
+    console.warn(`[tts/kokoro] Pre-warm failed: ${err.message}`);
+  });
+}
+
 export class KokoroTTS implements TTSProvider {
   private config: TTSConfig;
   private voiceId: string;
