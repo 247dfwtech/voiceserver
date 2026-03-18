@@ -47,29 +47,37 @@ _orig_stdout = sys.stdout.buffer
 sys.stdout = sys.stderr
 
 import torch
-import numpy as np
-import soundfile as sf
+import torchaudio
 from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 
 model_id = "${modelId}"
 use_cuda = torch.cuda.is_available()
 device_str = "cuda" if use_cuda else "cpu"
-torch_dtype = torch.float16 if use_cuda else torch.float32
+# Granite docs specify bfloat16, not float16
+torch_dtype = torch.bfloat16 if use_cuda else torch.float32
 
 print(f"GRANITE_LOADING model={model_id} device={device_str}", flush=True)
 
-# Load processor and model directly.
-# IMPORTANT: GraniteSpeechFeatureExtractor.__call__() does NOT accept a
-# 'sampling_rate' keyword argument — hf_pipeline() always passes it, so we
-# must bypass pipeline and call the model ourselves.
+# Granite 4.0 Speech is a MULTIMODAL CHAT model, not a standard ASR pipeline.
+# The processor expects BOTH a text prompt (with <|audio|> token) AND audio.
+# Passing audio alone routes to the text tokenizer → "Invalid text" error.
+# Passing audio via hf_pipeline adds sampling_rate kwarg → also errors.
+# Correct API (from HuggingFace model card):
+#   model_inputs = processor(prompt_text, audio_tensor, device=device, return_tensors="pt")
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+tokenizer = processor.tokenizer
 model = AutoModelForSpeechSeq2Seq.from_pretrained(
     model_id,
     trust_remote_code=True,
     torch_dtype=torch_dtype,
+    device_map=device_str,
 )
-model = model.to(device_str)
 model.eval()
+
+# Build the transcription prompt with chat template (done once, reused per request)
+user_prompt = "<|audio|>can you transcribe the speech into a written format?"
+chat = [{"role": "user", "content": user_prompt}]
+prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
 
 print("GRANITE_READY", flush=True)
 
@@ -80,25 +88,24 @@ for line in sys.stdin:
         continue
 
     try:
-        # Load WAV file (already 16kHz mono from our pcmToWav encoder)
-        audio_array, sr = sf.read(line, dtype="float32")
-        if len(audio_array.shape) > 1:
-            audio_array = audio_array.mean(axis=1)  # stereo → mono
+        # Load WAV as tensor (our pcmToWav writes 16kHz mono)
+        wav, sr = torchaudio.load(line, normalize=True)
+        if sr != 16000:
+            wav = torchaudio.transforms.Resample(sr, 16000)(wav)
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)  # stereo → mono
 
-        # Call processor WITHOUT sampling_rate kwarg — Granite's feature
-        # extractor has a fixed expected rate and rejects that argument.
-        inputs = processor(audio_array, return_tensors="pt")
-
-        # Move tensors to device; cast float tensors to model dtype
-        inputs = {
-            k: (v.to(device_str, dtype=torch_dtype) if v.dtype.is_floating_point else v.to(device_str))
-            for k, v in inputs.items()
-        }
+        # Process: pass BOTH text prompt AND audio tensor (multimodal API)
+        model_inputs = processor(prompt, wav, device=device_str, return_tensors="pt").to(device_str)
 
         with torch.no_grad():
-            generated_ids = model.generate(**inputs, max_new_tokens=440)
+            model_outputs = model.generate(**model_inputs, max_new_tokens=200, do_sample=False, num_beams=1)
 
-        transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        # Extract only generated tokens (skip the input tokens)
+        num_input_tokens = model_inputs["input_ids"].shape[-1]
+        new_tokens = model_outputs[0, num_input_tokens:].unsqueeze(0)
+        transcription = tokenizer.batch_decode(new_tokens, add_special_tokens=False, skip_special_tokens=True)[0].strip()
+
         _orig_stdout.write((transcription + "\\n").encode())
         _orig_stdout.flush()
         print(f"GRANITE_OK chars={len(transcription)}", flush=True)
