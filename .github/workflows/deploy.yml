@@ -30,7 +30,7 @@ jobs:
             npm install
 
             echo "--- Installing Python dependencies ---"
-            pip install -q faster-whisper 2>/dev/null || pip3 install -q faster-whisper 2>/dev/null || true
+            which python3 && python3 -m pip install faster-whisper || pip3 install faster-whisper || echo "WARN: failed to install faster-whisper"
 
             echo "--- Building TypeScript ---"
             npm run build
