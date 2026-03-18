@@ -41,13 +41,27 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 ## What's Not Working / Known Issues
 
 - **Cloudflared tunnel URLs are ephemeral** — Quick tunnels generate random `trycloudflare.com` URLs. If tunnel processes restart, URLs change and Railway env vars need manual updating. Need Cloudflare named tunnel.
-- **Post-call analysis model** — `analysis-runner.ts` uses `process.env.DEFAULT_LLM || "qwen3.5:9b"` (fixed). Old log errors referencing `qwen3:4b` are from before the fix was deployed.
-- **Call transfer not executing** — LLM correctly decides to transfer and says "I'll transfer you", but the actual Twilio call transfer (SIP/dial) does not happen. Needs debugging: tool executor → call-transfer.ts → Twilio TwiML flow.
 - **Transcription accuracy still improving** — Whisper `small.en` is better than `base.en` but phone audio (8kHz mulaw → 16kHz PCM) is inherently low quality. Deepgram Flux is now available as a cloud alternative with native end-of-turn detection. Consider `medium.en` for higher local accuracy.
 
 ---
 
-## What Was Just Completed (Session 8 — March 2026)
+## What Was Just Completed (Session 9 — March 18, 2026)
+
+### Call Transfer Fix + GitHub Actions Auto-Deploy Fix
+
+**MILESTONE: Call transfer fully working.** LLM invokes `ff_transfer` tool → voiceserver executes Twilio `<Dial>` → customer is transferred to fallback number. End-to-end confirmed.
+
+1. **Fixed transferCall/dtmf tools invisible to LLM** — `call-session.ts` only sent tools with `functionDefinition` to the LLM. transferCall/dtmf tools had `functionDefinition: null`. Added auto-generated function schemas for these types (mirroring existing endCall fallback).
+2. **Fixed transfer destination always `undefined`** — UI stored destination as `config.url` but executor read `config.destination`. Fixed UI to use correct field. Also added `fallbackDestination` from phone number config as fallback when tool has no explicit destination.
+3. **Added Twilio credentials to voiceserver `.env`** — Transfer requires `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` on the GPU server. Added to `.env`, GitHub Secrets, deploy workflow, and settings sync.
+4. **Fixed GitHub Actions auto-deploy (was no-op since creation)** — The `deploy.yml` had `script:` nested under `env:` instead of `with:`, so SSH connected but executed an empty command. Every deploy showed "success" but did nothing. GPU server was stuck on session 7 code. Fixed YAML structure; deploy now pulls, builds, restarts, and logs the deployed commit.
+5. **Added Twilio creds to vapiclone settings sync** — `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` now sync from vapiclone Settings page to voiceserver via IPC `/settings` PUT endpoint.
+6. **Fixed `DEFAULT_LLM=qwen3:4b` on VPS** — Was causing all post-call analysis to fail with 404. Updated to `qwen3.5:9b`.
+7. **Added detailed transfer logging** — Transfer events now log destination, callSid, success/failure, and error details for debugging.
+
+---
+
+## Session 8 — March 2026
 
 ### Deepgram STT + Bug Fixes + Settings API + Error Handling
 
@@ -251,6 +265,9 @@ HF_HOME=/root/.cache/huggingface
 VAPICLONE_API_URL=https://vapiclone-production.up.railway.app
 VAPICLONE_API_KEY=vs-internal-secret-2026
 IPC_SECRET=vs-ipc-2026
+TWILIO_ACCOUNT_SID=***
+TWILIO_AUTH_TOKEN=***
+DEEPGRAM_API_KEY=***
 ```
 
 ### Current Cloudflared Tunnel URLs
@@ -350,10 +367,9 @@ Twilio → Caller hears AI response
 
 ## Next Steps (In Order)
 
-1. **Fix call transfer** — LLM decides to transfer correctly but the Twilio SIP/dial action doesn't execute. Debug: tool-executor.ts → call-transfer.ts → Twilio TwiML. Check if transfer tool is registered, if destination number is set, and if Twilio credentials are available on voiceserver.
-2. **Set up Cloudflare named tunnel** — Permanent URLs that survive restarts. Currently tunnel URLs change on every PM2 restart.
-3. **Tune voicemail detection thresholds** — Now at 150 frames (3s). Test with voicemail detection enabled.
-4. **Full UI redesign** — Bushido Pros branding across vapiclone and dialer4clone (separate session).
+1. **Set up Cloudflare named tunnel** — Permanent URLs that survive restarts. Currently tunnel URLs change on every PM2 restart.
+2. **Tune voicemail detection thresholds** — Now at 150 frames (3s). Test with voicemail detection enabled.
+3. **Full UI redesign** — Bushido Pros branding across vapiclone and dialer4clone (separate session).
 
 ---
 
