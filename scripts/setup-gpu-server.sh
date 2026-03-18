@@ -37,11 +37,12 @@
 #      - hexgrad/Kokoro-82M (~313MB) + all 4 voice packs (af_heart, af_nicole, am_adam, af_sarah)
 #      - ResembleAI/chatterbox-turbo (~4GB) — voice cloning
 #   9. Clones/updates voiceserver repo, npm install, tsc build
-#  10. Creates .env with all required keys
+#  10. Creates .env with all required keys (including CHATTERBOX_VOICES_DIR, CONDA_PATH)
 #  11. Creates cloudflared tunnel scripts
-#  12. Creates PM2 ecosystem config with all 5 processes
+#  12. Creates PM2 ecosystem config (fork mode) with all 5 processes
 #  13. Starts all processes, saves PM2 config for boot persistence
-#  14. Prints tunnel URLs for Railway env var setup
+#  14. Verifies GPU monitoring endpoints (/health with GPU data, /metrics/history)
+#  15. Prints tunnel URLs for Railway env var setup
 ###############################################################################
 
 set -euo pipefail
@@ -798,10 +799,20 @@ else
   warn "voiceserver may still be starting up — check: pm2 logs voiceserver"
 fi
 
-# Test health endpoint
+# Test health endpoint (now includes GPU data)
 sleep 3
 if curl -s http://localhost:8766/health | grep -q '"ok":true'; then
   log "Voice server health check passed"
+  # Verify GPU monitoring is working
+  if curl -s http://localhost:8766/health | grep -q '"gpu":{'; then
+    log "GPU monitoring active (nvidia-smi integration)"
+  else
+    warn "GPU data not in health response — nvidia-smi may not be available"
+  fi
+  # Verify metrics history endpoint
+  if curl -s http://localhost:8766/metrics/history?range=1h | grep -q '"snapshots"'; then
+    log "Metrics history endpoint working (3-day ring buffer)"
+  fi
 else
   warn "Voice server health check not ready yet — may still be loading models"
 fi

@@ -1,6 +1,6 @@
 # VoiceServer — Claude Handoff Document
 
-**Last updated:** 2026-03-18 (rev 6)
+**Last updated:** 2026-03-18 (rev 7)
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
@@ -32,19 +32,35 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 - **Cost tracking** — Per-call breakdown (STT, LLM, TTS, transport). Local models = $0.
 - **PM2 managed** — voiceserver + ollama + 3 cloudflared tunnels, auto-restart, boot persistence
 - **GitHub Actions auto-deploy** — Push to main → SSH into Vast.ai → build → restart
+- **GPU/CPU/Memory monitoring** ✅ — `gpu-monitor.ts` collects metrics every 30s via nvidia-smi + os module. 3-day in-memory ring buffer (8640 entries, ~1.7MB). Endpoints: `/health` (enhanced with GPU data inline), `/health/gpu` (fresh snapshot), `/metrics/history?range=1h|6h|24h|3d` (historical data for charts)
 - **`/logs` endpoint** — `GET /logs?lines=N` returns recent PM2 log lines; requires `x-ipc-secret` header
 - **IPC auth** — All IPC calls require either `Authorization: Bearer <VAPICLONE_API_KEY>` or `x-ipc-secret: <IPC_SECRET>` header
 
 ## What's Not Working / Known Issues
 
 - **Cloudflared tunnel URLs are ephemeral** — Quick tunnels generate random `trycloudflare.com` URLs. If tunnel processes restart, URLs change and Railway env vars need manual updating. Need Cloudflare named tunnel.
-- **Post-call analysis hardcoded model** — `analysis-runner.ts` still references `qwen3:4b` which was deleted. Needs to use the active LLM from model-manager. Quick fix.
+- **Post-call analysis model** — `analysis-runner.ts` uses `process.env.DEFAULT_LLM || "qwen3.5:9b"` (fixed). Old log errors referencing `qwen3:4b` are from before the fix was deployed.
 - **Transcription accuracy still improving** — Whisper `small.en` is better than `base.en` but phone audio (8kHz mulaw → 16kHz PCM) is inherently low quality. Consider `medium.en` or Deepgram for production.
 - **Granite STT experimental** — IBM Granite 4.0 1B Speech has a non-standard multimodal chat API (not a standard ASR pipeline). Works but had 4+ different API errors during development. Whisper is the recommended default. Granite code is kept as experimental option.
 
 ---
 
-## What Was Just Completed (Session 6 — March 2026)
+## What Was Just Completed (Session 7 — March 2026)
+
+### GPU Monitoring + Server Debugging
+
+1. **GPU/CPU/Memory metrics backend** — New `src/gpu-monitor.ts`: nvidia-smi integration, CPU utilization via `os.cpus()`, system RAM. Collects snapshots every 30 seconds into an in-memory ring buffer (8640 entries = 3 days, ~1.7MB).
+2. **Enhanced `/health` endpoint** — Now includes `gpu` (util%, VRAM, temp, power, name), `cpu` (util%), `systemMemory` (used/total MB) inline. Backward-compatible.
+3. **New `/health/gpu` endpoint** — Fresh GPU snapshot on demand (runs nvidia-smi immediately).
+4. **New `/metrics/history` endpoint** — Historical data for charts. Params: `?range=1h|6h|24h|3d&maxPoints=300`. Downsamples automatically.
+5. **Fixed PM2 exec_mode** — Was `cluster` (causing 25+ restarts). Fixed to `fork` in ecosystem.config.cjs. Persistent Python subprocesses require fork mode.
+6. **Killed orphan processes** — Stale Kokoro test processes (PIDs 9544/9545) from previous session consuming 1.6GB RAM.
+7. **Fixed analysis-runner.ts** — Already uses `DEFAULT_LLM` env var (was wrongly listed as broken in previous handoff).
+8. **Updated tunnel URLs** — Tunnels regenerated after PM2 restart. Railway env vars updated.
+
+---
+
+## Session 6 — March 2026
 
 ### Added Chatterbox Turbo Voice Cloning
 
@@ -175,7 +191,8 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 
 | Path | What's In It |
 |---|---|
-| `src/index.ts` | Main entry — WebSocket (8765) + IPC HTTP (8766), session management, `/logs` endpoint |
+| `src/index.ts` | Main entry — WebSocket (8765) + IPC HTTP (8766), session management, `/logs`, `/health/gpu`, `/metrics/history` endpoints |
+| `src/gpu-monitor.ts` | **GPU/CPU/Memory metrics** — nvidia-smi integration, ring buffer (3-day, 30s interval), snapshot collection |
 | `src/model-manager.ts` | Model lifecycle — install/activate/remove. Default STT: whisper/small.en |
 | `src/providers/stt/whisper.ts` | **Whisper STT — persistent Python subprocess**, module-level singleton, JSON stdin protocol with keyword biasing |
 | `src/providers/stt/granite.ts` | Granite STT — experimental, non-standard multimodal chat API, not recommended |
@@ -186,7 +203,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 | `src/providers/llm/openai-compat.ts` | OpenAI-compatible LLM client — 2000-token min for Ollama |
 | `src/providers/index.ts` | Provider factory — auto-selects based on config |
 | `src/voice-pipeline/call-session.ts` | Core call handler — STT→LLM→TTS loop, tool execution, firstMessage |
-| `src/voice-pipeline/analysis-runner.ts` | Post-call summary + success evaluation (⚠️ hardcoded qwen3:4b — needs fix) |
+| `src/voice-pipeline/analysis-runner.ts` | Post-call summary + success evaluation (uses DEFAULT_LLM env var) |
 | `src/voice-pipeline/tool-executor.ts` | Tool execution with SSRF protection |
 | `src/voice-pipeline/audio-utils.ts` | Audio format conversion (mu-law ↔ PCM, resampling) |
 | `scripts/setup-gpu-server.sh` | **One-click bare metal setup** — installs all deps, pre-downloads models, configures PM2 |
@@ -215,9 +232,9 @@ IPC_SECRET=vs-ipc-2026
 
 | Service | URL |
 |---|---|
-| IPC (VOICE_SERVER_IPC_URL) | `https://plaintiff-databases-brave-isolation.trycloudflare.com` |
-| WebSocket (VOICE_SERVER_URL) | `wss://cup-delegation-shake-stickers.trycloudflare.com` |
-| Ollama (OLLAMA_URL) | `https://occupational-briefly-flag-cas.trycloudflare.com/v1` |
+| IPC (VOICE_SERVER_IPC_URL) | `https://additionally-recovery-rice-deposit.trycloudflare.com` |
+| WebSocket (VOICE_SERVER_URL) | `wss://diy-brakes-ping-collaboration.trycloudflare.com` |
+| Ollama (OLLAMA_URL) | `https://health-selling-moment-oregon.trycloudflare.com/v1` |
 
 ---
 
@@ -226,23 +243,23 @@ IPC_SECRET=vs-ipc-2026
 ```bash
 # Check voiceserver logs remotely (no SSH needed)
 curl -s -H "x-ipc-secret: vs-ipc-2026" \
-  "https://plaintiff-databases-brave-isolation.trycloudflare.com/logs?lines=50" \
+  "https://additionally-recovery-rice-deposit.trycloudflare.com/logs?lines=50" \
   | python3 -c "import sys,json; [print(l) for l in json.load(sys.stdin)['lines']]"
 
 # Check model status
 curl -s -H "x-ipc-secret: vs-ipc-2026" \
-  "https://plaintiff-databases-brave-isolation.trycloudflare.com/models/status" \
+  "https://additionally-recovery-rice-deposit.trycloudflare.com/models/status" \
   | python3 -m json.tool
 
 # Pre-warm Kokoro TTS
 curl -s -H "x-ipc-secret: vs-ipc-2026" \
-  "https://plaintiff-databases-brave-isolation.trycloudflare.com/tts/test" \
+  "https://additionally-recovery-rice-deposit.trycloudflare.com/tts/test" \
   -X POST -H "Content-Type: application/json" \
   -d '{"text":"Test.","voice":"af_heart"}'
 
 # Switch active STT/LLM
 curl -s -X POST -H "x-ipc-secret: vs-ipc-2026" -H "Content-Type: application/json" \
-  "https://plaintiff-databases-brave-isolation.trycloudflare.com/models/stt/activate" \
+  "https://additionally-recovery-rice-deposit.trycloudflare.com/models/stt/activate" \
   -d '{"name":"small.en"}'
 
 # SSH into GPU
@@ -308,11 +325,10 @@ Twilio → Caller hears AI response
 
 ## Next Steps (In Order)
 
-1. **Fix post-call analysis model reference** — `analysis-runner.ts` hardcodes `qwen3:4b` (deleted). Should use active LLM from model-manager.
+1. **Set up Cloudflare named tunnel** — Permanent URLs that survive restarts. Currently tunnel URLs change on every PM2 restart.
 2. **Tune transcription accuracy** — Consider `medium.en` if latency is acceptable, or Deepgram for production scale.
-3. **Set up Cloudflare named tunnel** — Permanent URLs that survive restarts.
-4. **Tune voicemail detection thresholds** — Increase `continuousSpeechFramesThreshold` from 60 to 150+ before re-enabling.
-5. **Full UI redesign** — Bushido Pros branding across vapiclone and dialer4clone (separate session).
+3. **Tune voicemail detection thresholds** — Increase `continuousSpeechFramesThreshold` from 60 to 150+ before re-enabling.
+4. **Full UI redesign** — Bushido Pros branding across vapiclone and dialer4clone (separate session).
 
 ---
 
@@ -329,4 +345,5 @@ Twilio → Caller hears AI response
 | Process Manager | PM2 (auto-restart, boot persistence) |
 | Tunneling | Cloudflared quick tunnels (ephemeral URLs) |
 | CI/CD | GitHub Actions → SSH deploy to Vast.ai |
+| Monitoring | nvidia-smi + os module → in-memory ring buffer (3 days) → `/metrics/history` API |
 | Audio | mu-law ↔ PCM conversion, 8kHz ↔ 16kHz ↔ 24kHz resampling |
