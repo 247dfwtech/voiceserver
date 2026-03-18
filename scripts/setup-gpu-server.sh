@@ -10,11 +10,11 @@
 # Tested on: Ubuntu 22.04 / 24.04 with NVIDIA RTX 4090, CUDA 12.x
 # Also works when copying/cloning an existing Vast.ai instance.
 #
-# Expected VRAM usage: ~8.5GB / 24GB
-#   - Granite STT:  ~2.0GB (persistent subprocess, loads once)
-#   - Kokoro TTS:   ~0.5GB (persistent subprocess, loads once)
-#   - Qwen3:4b:     ~3.0GB  (or qwen3.5:9b at ~6GB)
-#   - Headroom:     ~18.5GB
+# Expected VRAM usage: ~7GB / 24GB
+#   - Whisper STT (small.en): ~0.5GB (persistent subprocess, loads once)
+#   - Kokoro TTS:              ~0.5GB (persistent subprocess, loads once)
+#   - Qwen3.5:9b:              ~6.0GB (via Ollama)
+#   - Headroom:                ~17GB
 #
 # ⚠️  VAST.AI INSTANCE COPY NOTE:
 #   When you copy a Vast.ai instance, /etc/environment contains:
@@ -26,13 +26,13 @@
 # WHAT THIS SCRIPT SETS UP:
 #   1. System deps (python3, ffmpeg, libsndfile1, etc.)
 #   2. Node.js (NVM if present, else NodeSource) + PM2
-#   3. Ollama + default LLM model (qwen3:4b)
+#   3. Ollama + default LLM model (qwen3.5:9b — recommended for call quality)
 #   4. PyTorch with CUDA (correct wheel for detected CUDA version)
-#   5. Kokoro TTS + Granite STT + faster-whisper Python packages
+#   5. Kokoro TTS + faster-whisper + transformers Python packages
 #   6. Pre-downloads ALL AI models to HuggingFace cache:
-#      - ibm-granite/granite-4.0-1b-speech (~2GB)
+#      - Whisper small.en (~244MB) + base.en (~74MB) — primary STT
 #      - hexgrad/Kokoro-82M (~313MB) + all 4 voice packs (af_heart, af_nicole, am_adam, af_sarah)
-#      - Whisper base.en (~150MB)
+#      - IBM Granite STT commented out (experimental, non-standard API)
 #   7. Clones/updates voiceserver repo, npm install, tsc build
 #   8. Creates .env with all required keys
 #   9. Creates cloudflared tunnel scripts
@@ -81,9 +81,9 @@ fi
 echo ""
 echo "============================================================"
 echo "  voiceserver — GPU Bare Metal Setup"
-echo "  STT: Granite 4.0 1B Speech (persistent subprocess)"
-echo "  TTS: Kokoro-82M (persistent subprocess) + Piper fallback"
-echo "  LLM: Qwen3:4b via Ollama (auto-pulled)"
+echo "  STT: Whisper small.en (persistent subprocess, RECOMMENDED)"
+echo "  TTS: Kokoro-82M (persistent subprocess)"
+echo "  LLM: Qwen3.5:9b via Ollama (auto-pulled)"
 echo "============================================================"
 echo ""
 
@@ -222,19 +222,14 @@ for i in $(seq 1 30); do
   fi
 done
 
-# Pull default LLM model (qwen3:4b — smaller, works on all GPUs ≥8GB)
-info "Pulling qwen3:4b (default LLM, ~2.5GB)... this may take a few minutes"
-if ollama list 2>/dev/null | grep -q "qwen3:4b"; then
-  log "qwen3:4b already downloaded"
+# Pull default LLM model — qwen3.5:9b recommended for call quality
+info "Pulling qwen3.5:9b (recommended LLM, ~6GB)... this may take a few minutes"
+if ollama list 2>/dev/null | grep -q "qwen3.5:9b"; then
+  log "qwen3.5:9b already downloaded"
 else
-  ollama pull qwen3:4b
-  log "qwen3:4b downloaded"
+  ollama pull qwen3.5:9b
+  log "qwen3.5:9b downloaded"
 fi
-
-# Optionally pull larger model
-# Uncomment if you have ≥16GB VRAM:
-# info "Pulling qwen3.5:9b (better quality, ~6GB)..."
-# ollama pull qwen3.5:9b
 
 ###############################################################################
 # 4. Python AI packages (with CUDA-enabled PyTorch)
@@ -321,34 +316,36 @@ print('Kokoro model and voice packs ready')
 " 2>&1
 log "Kokoro TTS model and voice packs downloaded"
 
-# Granite 4.0 1B Speech STT model (~2GB)
-# Voiceserver uses a persistent subprocess — model loads ONCE and stays in GPU memory.
-# Pre-downloading ensures no download delay on first call.
-info "Pre-downloading Granite 4.0 1B Speech STT model (~2GB)..."
-HF_HOME="${HF_HOME_DIR}" python3 -c "
-import torch
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-
-model_id = 'ibm-granite/granite-4.0-1b-speech'
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
-print(f'Downloading {model_id} to {device}...')
-AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-AutoModelForSpeechSeq2Seq.from_pretrained(model_id, trust_remote_code=True, dtype=dtype)
-print('Granite STT model ready')
-" 2>&1
-log "Granite STT model downloaded"
-
-# Whisper base.en (fallback STT, ~150MB)
-info "Pre-downloading Whisper base.en (fallback STT, ~150MB)..."
+# Whisper small.en (PRIMARY STT — recommended for phone audio quality)
+info "Pre-downloading Whisper small.en (primary STT, ~244MB)..."
 HF_HOME="${HF_HOME_DIR}" python3 -c "
 from faster_whisper import WhisperModel
-print('Downloading Whisper base.en...')
+print('Downloading Whisper small.en...')
+WhisperModel('small.en', device='cpu', compute_type='int8')
+print('Whisper small.en ready')
+" 2>&1
+log "Whisper small.en downloaded"
+
+# Also download base.en as fast fallback option
+info "Pre-downloading Whisper base.en (fallback, ~74MB)..."
+HF_HOME="${HF_HOME_DIR}" python3 -c "
+from faster_whisper import WhisperModel
 WhisperModel('base.en', device='cpu', compute_type='int8')
 print('Whisper base.en ready')
 " 2>&1
 log "Whisper base.en downloaded"
+
+# Granite STT (OPTIONAL / EXPERIMENTAL — non-standard API, not recommended as default)
+# Uncomment if you want Granite available as an option:
+# info "Pre-downloading Granite 4.0 1B Speech STT model (~2GB)..."
+# HF_HOME="${HF_HOME_DIR}" python3 -c "
+# from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+# model_id = 'ibm-granite/granite-4.0-1b-speech'
+# AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+# AutoModelForSpeechSeq2Seq.from_pretrained(model_id, trust_remote_code=True)
+# print('Granite STT model ready')
+# " 2>&1
+# log "Granite STT model downloaded"
 
 # Piper default voice (fallback TTS)
 info "Downloading Piper default voice..."
@@ -410,7 +407,7 @@ CLONED_VOICES_DIR=/data/cloned-voices
 
 # Ollama (local LLM)
 OLLAMA_URL=http://localhost:11434/v1
-DEFAULT_LLM=qwen3:4b
+DEFAULT_LLM=qwen3.5:9b
 
 # HuggingFace cache (fixes stale /workspace mount on Vast.ai copies)
 HF_HOME=${HF_HOME_DIR}
