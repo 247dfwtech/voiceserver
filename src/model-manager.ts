@@ -36,11 +36,11 @@ export interface InstalledModel {
 
 export interface ModelConfig {
   activeLLM: { provider: "ollama"; model: string } | null;
-  activeSTT: { provider: "granite" | "whisper"; model: string } | null;
+  activeSTT: { provider: "granite" | "whisper" | "deepgram" | "deepgram"; model: string } | null;
   activeTTS: { provider: "kokoro" | "piper" | "chatterbox"; voice: string } | null;
   installedModels: {
     llm: Array<{ name: string; size: string; provider: "ollama"; installedAt: string }>;
-    stt: Array<{ name: string; size: string; provider: "granite" | "whisper"; installedAt: string }>;
+    stt: Array<{ name: string; size: string; provider: "granite" | "whisper" | "deepgram"; installedAt: string }>;
     tts: Array<{ name: string; size: string; provider: "kokoro" | "piper" | "chatterbox"; installedAt: string }>;
   };
 }
@@ -49,7 +49,7 @@ export interface STTModelInfo {
   name: string;
   size: string;
   description: string;
-  provider: "granite" | "whisper";
+  provider: "granite" | "whisper" | "deepgram";
 }
 
 export interface WhisperModelInfo {
@@ -181,7 +181,7 @@ export class ModelManager {
   private defaultConfig(): ModelConfig {
     return {
       activeLLM: { provider: "ollama", model: ModelManager.DEFAULT_LLM },
-      activeSTT: { provider: "granite", model: "ibm-granite/granite-4.0-1b-speech" },
+      activeSTT: { provider: "whisper", model: "small.en" },
       activeTTS: { provider: "kokoro", voice: "af_heart" },
       installedModels: {
         llm: [],
@@ -665,7 +665,7 @@ export class ModelManager {
     this.config.installedModels.stt = installed.map((m) => ({
       name: m.name,
       size: m.size,
-      provider: m.provider as "granite" | "whisper",
+      provider: m.provider as "granite" | "whisper" | "deepgram",
       installedAt: m.installedAt,
     }));
     await this.saveConfig();
@@ -682,7 +682,7 @@ export class ModelManager {
 
   async installSTTModel(
     name: string,
-    provider?: "granite" | "whisper"
+    provider?: "granite" | "whisper" | "deepgram"
   ): Promise<{ success: boolean; error?: string }> {
     // Auto-detect provider from model name
     const isGranite = provider === "granite" || name.includes("granite");
@@ -843,7 +843,7 @@ print('ok')
 
   async activateSTT(
     name: string,
-    provider?: "granite" | "whisper"
+    provider?: "granite" | "whisper" | "deepgram"
   ): Promise<{ success: boolean; error?: string }> {
     const isGranite = provider === "granite" || name.includes("granite");
 
@@ -1225,14 +1225,12 @@ print('ok')
     type: "llm" | "stt" | "tts"
   ): Promise<HuggingFaceSearchResult[]> {
     if (type === "stt") {
-      // Return Granite + Whisper model lists
-      const graniteResults = GRANITE_MODEL_CATALOG.map((m) => ({
-        id: m.name,
-        name: m.name.split("/").pop() || m.name,
-        downloads: 0,
-        likes: 0,
-        description: `[GRANITE] ${m.description} (${m.size})`,
-      }));
+      // Return Deepgram + Whisper model lists (Deepgram first as recommended for voice agents)
+      const deepgramResults = [
+        { id: "deepgram/flux-general-en", name: "flux-general-en", downloads: 0, likes: 0, description: "[DEEPGRAM] Conversational STT with native end-of-turn detection (recommended for voice agents)" },
+        { id: "deepgram/nova-3-general", name: "nova-3-general", downloads: 0, likes: 0, description: "[DEEPGRAM] Latest general-purpose model, highest accuracy" },
+        { id: "deepgram/nova-2-general", name: "nova-2-general", downloads: 0, likes: 0, description: "[DEEPGRAM] Previous generation, stable" },
+      ];
       const whisperResults = WHISPER_MODEL_CATALOG.map((m) => ({
         id: `openai/whisper-${m.name}`,
         name: m.name,
@@ -1240,7 +1238,7 @@ print('ok')
         likes: 0,
         description: `[WHISPER] ${m.description} (${m.size})`,
       }));
-      return [...graniteResults, ...whisperResults];
+      return [...deepgramResults, ...whisperResults];
     }
 
     try {

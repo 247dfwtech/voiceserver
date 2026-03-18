@@ -17,6 +17,7 @@ export interface TTSProvider {
   synthesizeStream(
     text: string,
     onChunk: (chunk: Buffer) => void,
-    onDone: () => void
+    onDone: () => void,
+    onError?: (err: Error) => void
   ): { cancel: () => void };
 }

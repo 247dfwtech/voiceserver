@@ -325,7 +325,8 @@ export class KokoroTTS implements TTSProvider {
   synthesizeStream(
     text: string,
     onChunk: (chunk: Buffer) => void,
-    onDone: () => void
+    onDone: () => void,
+    onError?: (err: Error) => void
   ): { cancel: () => void } {
     let cancelled = false;
 
@@ -343,8 +344,13 @@ export class KokoroTTS implements TTSProvider {
       })
       .catch((err) => {
         if (!cancelled) {
-          console.error("[tts/kokoro] Stream error:", err.message);
-          onDone();
+          const error = err instanceof Error ? err : new Error(String(err));
+          console.error("[tts/kokoro] Stream error:", error.message);
+          if (onError) {
+            onError(error);
+          } else {
+            onDone(); // Fallback: signal completion so session doesn't hang
+          }
         }
       });
 

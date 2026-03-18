@@ -19,9 +19,33 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DEEPGRAM_API_KEY,OPENAI_API_KEY,ELEVENLABS_API_KEY,DEEPSEEK_API_KEY
+        env:
+          DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           script: |
             export PATH=/opt/nvm/versions/node/v24.12.0/bin:$PATH
             cd /opt/voiceserver
+
+            echo "--- Syncing API keys from secrets ---"
+            # Update or add API keys in .env from GitHub secrets (only if secret is set)
+            update_env() {
+              local key="$1" val="$2"
+              if [ -n "$val" ]; then
+                if grep -q "^${key}=" .env 2>/dev/null; then
+                  sed -i "s|^${key}=.*|${key}=${val}|" .env
+                else
+                  echo "${key}=${val}" >> .env
+                fi
+                echo "  ${key}=***set***"
+              fi
+            }
+            update_env "DEEPGRAM_API_KEY" "$DEEPGRAM_API_KEY"
+            update_env "OPENAI_API_KEY" "$OPENAI_API_KEY"
+            update_env "ELEVENLABS_API_KEY" "$ELEVENLABS_API_KEY"
+            update_env "DEEPSEEK_API_KEY" "$DEEPSEEK_API_KEY"
 
             echo "--- Pulling latest from GitHub ---"
             git pull origin main

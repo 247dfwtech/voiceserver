@@ -22,9 +22,18 @@ import type { STTProvider, STTConfig } from "./interface";
 let whisperProcess: ChildProcess | null = null;
 let whisperReady = false;
 let whisperReadyPromise: Promise<void> | null = null;
-let pendingResolve: ((text: string) => void) | null = null;
-let pendingReject: ((err: Error) => void) | null = null;
 let stdoutBuffer = "";
+
+// FIFO queue for serialized transcription requests (Whisper processes one at a time)
+interface QueueEntry {
+  resolve: (text: string) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  audioPath: string;
+  keywords?: string[];
+}
+const transcriptionQueue: QueueEntry[] = [];
+let activeEntry: QueueEntry | null = null;
 
 function buildWhisperScript(modelSize: string, language: string): string {
   return `
@@ -108,22 +117,24 @@ function ensureWhisperProcess(modelSize: string, language: string): Promise<void
     // Parse stdout lines — each line is a transcription response or ERROR:
     whisperProcess.stdout!.on("data", (data: Buffer) => {
       stdoutBuffer += data.toString();
-      const newline = stdoutBuffer.indexOf("\n");
-      if (newline !== -1) {
+      let newline: number;
+      while ((newline = stdoutBuffer.indexOf("\n")) !== -1) {
         const line = stdoutBuffer.slice(0, newline).trim();
         stdoutBuffer = stdoutBuffer.slice(newline + 1);
 
-        if (pendingResolve) {
-          const cb = pendingResolve;
-          const cbErr = pendingReject;
-          pendingResolve = null;
-          pendingReject = null;
+        if (activeEntry) {
+          const entry = activeEntry;
+          activeEntry = null;
+          clearTimeout(entry.timer);
 
           if (line.startsWith("ERROR:")) {
-            cbErr?.(new Error(line.slice(6).trim()));
+            entry.reject(new Error(line.slice(6).trim()));
           } else {
-            cb(line);
+            entry.resolve(line);
           }
+
+          // Process next queued request
+          processNextInQueue();
         }
       }
     });
@@ -153,9 +164,7 @@ function ensureWhisperProcess(modelSize: string, language: string): Promise<void
       whisperReady = false;
       whisperReadyPromise = null;
       whisperProcess = null;
-      pendingReject?.(err);
-      pendingResolve = null;
-      pendingReject = null;
+      drainQueueWithError(err);
       if (!resolved) reject(err);
     });
 
@@ -164,11 +173,7 @@ function ensureWhisperProcess(modelSize: string, language: string): Promise<void
       whisperReady = false;
       whisperProcess = null;
       whisperReadyPromise = null;
-      if (pendingReject) {
-        pendingReject(new Error(`Whisper process exited (code ${code})`));
-        pendingResolve = null;
-        pendingReject = null;
-      }
+      drainQueueWithError(new Error(`Whisper process exited (code ${code})`));
       if (!resolved) reject(new Error(`Whisper process exited (code ${code}): ${stderrBuf.slice(-500)}`));
     });
 
@@ -187,6 +192,30 @@ function ensureWhisperProcess(modelSize: string, language: string): Promise<void
   return whisperReadyPromise;
 }
 
+/** Send the next queued request's command to the Python subprocess stdin */
+function processNextInQueue(): void {
+  if (activeEntry || transcriptionQueue.length === 0) return;
+  if (!whisperProcess || !whisperProcess.stdin) return;
+
+  activeEntry = transcriptionQueue.shift()!;
+  const cmd = JSON.stringify({ path: activeEntry.audioPath, keywords: activeEntry.keywords || [] });
+  whisperProcess.stdin.write(cmd + "\n");
+}
+
+/** Reject all queued + active entries (used on process crash/exit) */
+function drainQueueWithError(err: Error): void {
+  if (activeEntry) {
+    clearTimeout(activeEntry.timer);
+    activeEntry.reject(err);
+    activeEntry = null;
+  }
+  while (transcriptionQueue.length > 0) {
+    const entry = transcriptionQueue.shift()!;
+    clearTimeout(entry.timer);
+    entry.reject(err);
+  }
+}
+
 async function transcribeFile(audioPath: string, modelSize: string, language: string, keywords?: string[]): Promise<string> {
   await ensureWhisperProcess(modelSize, language);
 
@@ -196,35 +225,30 @@ async function transcribeFile(audioPath: string, modelSize: string, language: st
       return;
     }
 
-    if (pendingResolve) {
-      reject(new Error("Whisper is already processing a request"));
-      return;
+    const entry: QueueEntry = {
+      resolve,
+      reject,
+      audioPath,
+      keywords,
+      timer: setTimeout(() => {
+        // Remove from queue if still queued, or clear active
+        const idx = transcriptionQueue.indexOf(entry);
+        if (idx !== -1) {
+          transcriptionQueue.splice(idx, 1);
+        } else if (activeEntry === entry) {
+          activeEntry = null;
+          processNextInQueue();
+        }
+        reject(new Error("Whisper transcription timed out after 15s"));
+      }, 15_000),
+    };
+
+    transcriptionQueue.push(entry);
+
+    // If nothing is active, kick off processing
+    if (!activeEntry) {
+      processNextInQueue();
     }
-
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      pendingResolve = null;
-      pendingReject = null;
-      reject(new Error("Whisper transcription timed out after 15s"));
-    }, 15_000);
-
-    pendingResolve = (text) => {
-      if (!timedOut) {
-        clearTimeout(timer);
-        resolve(text);
-      }
-    };
-    pendingReject = (err) => {
-      if (!timedOut) {
-        clearTimeout(timer);
-        reject(err);
-      }
-    };
-
-    // Send JSON with path + keywords for initial_prompt biasing
-    const cmd = JSON.stringify({ path: audioPath, keywords: keywords || [] });
-    whisperProcess.stdin.write(cmd + "\n");
   });
 }
 

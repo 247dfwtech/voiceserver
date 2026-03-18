@@ -81,7 +81,8 @@ export class PiperTTS implements TTSProvider {
   synthesizeStream(
     text: string,
     onChunk: (chunk: Buffer) => void,
-    onDone: () => void
+    onDone: () => void,
+    onError?: (err: Error) => void
   ): { cancel: () => void } {
     let cancelled = false;
 
@@ -108,7 +109,11 @@ export class PiperTTS implements TTSProvider {
     proc.on("error", (err) => {
       if (!cancelled) {
         console.error("[tts/piper] Error:", err.message);
-        onDone();
+        if (onError) {
+          onError(err);
+        } else {
+          onDone();
+        }
       }
     });
 

@@ -125,7 +125,7 @@ class VoicemailDetector {
   constructor(config: { analysisWindowSeconds?: number; speechThreshold?: number; continuousSpeechFramesThreshold?: number; twilioAmdResult?: string } = {}) {
     this.analysisWindowSeconds = config.analysisWindowSeconds ?? 5;
     this.speechThreshold = config.speechThreshold ?? 300;
-    this.continuousSpeechFramesThreshold = config.continuousSpeechFramesThreshold ?? 60;
+    this.continuousSpeechFramesThreshold = config.continuousSpeechFramesThreshold ?? 150; // 150 * 20ms = 3s of unbroken speech
 
     if (config.twilioAmdResult) {
       const amd = config.twilioAmdResult.toLowerCase();
@@ -175,7 +175,9 @@ class VoicemailDetector {
   private makeDecision(): void {
     if (this.resolved) return;
     const speechRatio = this.speechFrameCount / this.totalFrames;
-    if (speechRatio > 0.7 && this.maxContinuousSpeech > 40) {
+    // Require high speech ratio (80%), long continuous speech (40+ frames = 800ms),
+    // and minimum total speech frames (100+) to avoid false positives on talkative humans
+    if (speechRatio > 0.8 && this.maxContinuousSpeech > 40 && this.speechFrameCount > 100) {
       this.resolve("voicemail");
     } else {
       this.resolve("human");
@@ -268,6 +270,7 @@ export class CallSession extends EventEmitter {
   private voicemailDetector: VoicemailDetector | null = null;
   private startedAt: Date | null = null;
   private audioChunkCount = 0;
+  private consecutiveSTTErrors = 0;
 
   constructor(config: CallSessionConfig) {
     super();
@@ -310,7 +313,12 @@ export class CallSession extends EventEmitter {
     });
 
     this.stt.on("error", (err: Error) => {
-      console.error(`[session:${this.config.callId}] STT error:`, err);
+      this.consecutiveSTTErrors++;
+      console.error(`[session:${this.config.callId}] STT error (${this.consecutiveSTTErrors}/3):`, err.message);
+      if (this.consecutiveSTTErrors >= 3) {
+        console.error(`[session:${this.config.callId}] 3 consecutive STT errors, ending call`);
+        this.endCall("stt-failure");
+      }
     });
 
     // Start STT
@@ -391,6 +399,9 @@ export class CallSession extends EventEmitter {
 
   private handleTranscript(text: string, isFinal: boolean): void {
     if (this.state === "ended") return;
+
+    // Reset STT error counter on successful transcription
+    this.consecutiveSTTErrors = 0;
 
     if (isFinal) {
       this.currentTranscript += (this.currentTranscript ? " " : "") + text;
@@ -486,12 +497,23 @@ export class CallSession extends EventEmitter {
   }
 
   private shouldStartTTS(text: string): boolean {
-    return /[.!?,;:]/.test(text) && text.length > 10;
+    // Prefer splitting on sentence-ending punctuation (.!?) with min length
+    if (/[.!?]/.test(text) && text.length > 20) return true;
+    // For long accumulated text (80+ chars), also split on commas/semicolons to flush
+    if (/[,;:]/.test(text) && text.length > 80) return true;
+    return false;
   }
 
   private extractCompleteSentence(text: string): string | null {
-    const match = text.match(/^(.*?[.!?,;:])\s*/);
-    return match ? match[1] : null;
+    // First try sentence-ending punctuation
+    const sentenceMatch = text.match(/^(.*?[.!?])\s*/);
+    if (sentenceMatch && sentenceMatch[1].length >= 20) return sentenceMatch[1];
+    // For long text, fall back to comma/semicolon split
+    if (text.length > 80) {
+      const commaMatch = text.match(/^(.*?[,;:])\s*/);
+      if (commaMatch) return commaMatch[1];
+    }
+    return null;
   }
 
   private speak(text: string): void {
@@ -510,6 +532,14 @@ export class CallSession extends EventEmitter {
         this.emit("audio", base64);
       },
       () => {
+        this.isSpeaking = false;
+        if (this.state !== "ended") {
+          this.state = "waiting_for_speech";
+          this.resetSilenceTimer();
+        }
+      },
+      (err: Error) => {
+        console.error(`[session:${this.config.callId}] TTS error:`, err.message);
         this.isSpeaking = false;
         if (this.state !== "ended") {
           this.state = "waiting_for_speech";

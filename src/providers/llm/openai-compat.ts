@@ -30,6 +30,9 @@ export class OpenAICompatLLM implements LLMProvider {
         const rawMax = this.config.maxTokens ?? 300;
         const isOllama = this.config.provider === "ollama";
         const effectiveMaxTokens = (isOllama && rawMax < 2000) ? 2000 : rawMax;
+        if (isOllama && rawMax < 2000) {
+          console.warn(`[llm] Ollama thinking model: overriding maxTokens from ${rawMax} to 2000 (chain-of-thought needs ~1000 tokens)`);
+        }
 
         const streamParams: OpenAI.ChatCompletionCreateParamsStreaming = {
           model: this.config.model,
@@ -90,8 +93,12 @@ export class OpenAICompatLLM implements LLMProvider {
           params.onDone(fullText);
         }
       } catch (err: unknown) {
-        if (!cancelled && err instanceof Error && err.name !== "AbortError") {
-          console.error("[llm] Stream error:", err);
+        if (!cancelled) {
+          if (err instanceof Error && err.name !== "AbortError") {
+            console.error("[llm] Stream error:", err);
+          }
+          // Always signal done so the session transitions back to waiting_for_speech
+          params.onDone("");
         }
       }
     };

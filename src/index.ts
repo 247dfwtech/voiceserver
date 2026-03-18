@@ -48,13 +48,35 @@ interface SessionEntry {
 }
 
 const sessions = new Map<string, SessionEntry>();
-const pendingConfigs = new Map<string, CallSessionConfig>();
+const pendingConfigs = new Map<string, { config: CallSessionConfig; createdAt: number }>();
 const startedAt = Date.now();
 let totalCallsHandled = 0;
 let isShuttingDown = false;
 
 const MAX_PENDING_CONFIGS = 200;
 const MAX_IPC_BODY_BYTES = 1_000_000; // 1MB
+const PENDING_CONFIG_TTL_MS = 60_000; // 60s TTL for pending configs
+
+/** Helper: log and return IPC error response */
+function ipcError(res: ServerResponse, err: unknown, context: string, status = 400): void {
+  const msg = err instanceof Error ? err.message : "Bad request";
+  console.error(`[ipc] ${context}:`, err instanceof Error ? err.message : err);
+  if (!res.headersSent) {
+    res.writeHead(status, { "Content-Type": "application/json" });
+  }
+  res.end(JSON.stringify({ error: msg }));
+}
+
+// Sweep stale pending configs every 30s
+setInterval(() => {
+  const now = Date.now();
+  for (const [callId, entry] of pendingConfigs) {
+    if (now - entry.createdAt > PENDING_CONFIG_TTL_MS) {
+      pendingConfigs.delete(callId);
+      console.warn(`[voice-server] Swept stale pending config for call ${callId} (registered ${Math.round((now - entry.createdAt) / 1000)}s ago, WebSocket never connected)`);
+    }
+  }
+}, 30_000);
 
 // Singleton KokoroTTS instance — keeps the Python process alive between /tts/test calls
 // so the model doesn't need to reload on every preview request (cold start is 60-90s)
@@ -138,13 +160,14 @@ wss.on("connection", (ws: WebSocket) => {
               `(${sessions.size + 1}/${MAX_SESSIONS} sessions)`
           );
 
-          const config = pendingConfigs.get(callId);
-          if (!config) {
+          const pendingEntry = pendingConfigs.get(callId);
+          if (!pendingEntry) {
             console.error(`[voice-server] No pending config for callId=${callId}`);
             ws.close();
             return;
           }
           pendingConfigs.delete(callId);
+          const config = pendingEntry.config;
 
           const session = new CallSession(config);
 
@@ -427,7 +450,8 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           ollama: ollamaStatus,
         })
       );
-    }).catch(() => {
+    }).catch((err) => {
+      console.warn(`[ipc] Health check Ollama probe failed:`, err instanceof Error ? err.message : err);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
@@ -599,10 +623,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: result.error }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -626,10 +647,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: result.error }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -695,10 +713,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: result.error }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -722,10 +737,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: result.error }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -791,10 +803,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: result.error }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -818,10 +827,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: result.error }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -882,6 +888,92 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
+  // ---- Settings / API Key Management ----
+
+  // Allowed settings keys that can be read/written via IPC
+  const ALLOWED_SETTINGS: Record<string, { envKey: string; sensitive: boolean }> = {
+    deepgram_api_key: { envKey: "DEEPGRAM_API_KEY", sensitive: true },
+    openai_api_key: { envKey: "OPENAI_API_KEY", sensitive: true },
+    elevenlabs_api_key: { envKey: "ELEVENLABS_API_KEY", sensitive: true },
+    deepseek_api_key: { envKey: "DEEPSEEK_API_KEY", sensitive: true },
+    default_llm: { envKey: "DEFAULT_LLM", sensitive: false },
+    whisper_model: { envKey: "WHISPER_MODEL", sensitive: false },
+    kokoro_voice: { envKey: "KOKORO_VOICE", sensitive: false },
+  };
+
+  // GET /settings -- List current settings (sensitive values masked)
+  if (req.method === "GET" && url.pathname === "/settings") {
+    const settings: Record<string, string | null> = {};
+    for (const [key, def] of Object.entries(ALLOWED_SETTINGS)) {
+      const val = process.env[def.envKey] || null;
+      if (def.sensitive && val) {
+        settings[key] = val.slice(0, 4) + "..." + val.slice(-4);
+      } else {
+        settings[key] = val;
+      }
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ settings }));
+    return;
+  }
+
+  // PUT /settings -- Update one or more settings (persists to .env and process.env)
+  if (req.method === "PUT" && url.pathname === "/settings") {
+    readBody(req, MAX_IPC_BODY_BYTES)
+      .then(async (body) => {
+        const updates = JSON.parse(body) as Record<string, string>;
+        const applied: string[] = [];
+
+        for (const [key, value] of Object.entries(updates)) {
+          const def = ALLOWED_SETTINGS[key];
+          if (!def) {
+            console.warn(`[settings] Ignoring unknown setting: ${key}`);
+            continue;
+          }
+          // Update in-memory env
+          process.env[def.envKey] = value;
+          applied.push(key);
+          console.log(`[settings] Updated ${def.envKey} in process.env`);
+        }
+
+        // Persist to .env file
+        if (applied.length > 0) {
+          try {
+            const fs = await import("fs");
+            const envPath = process.env.ENV_FILE_PATH || "/opt/voiceserver/.env";
+            let envContent = "";
+            try {
+              envContent = fs.readFileSync(envPath, "utf-8");
+            } catch {
+              envContent = "";
+            }
+
+            for (const key of applied) {
+              const def = ALLOWED_SETTINGS[key]!;
+              const val = process.env[def.envKey] || "";
+              const regex = new RegExp(`^${def.envKey}=.*$`, "m");
+              if (regex.test(envContent)) {
+                envContent = envContent.replace(regex, `${def.envKey}=${val}`);
+              } else {
+                envContent += `\n${def.envKey}=${val}`;
+              }
+            }
+
+            fs.writeFileSync(envPath, envContent);
+            console.log(`[settings] Persisted ${applied.length} setting(s) to ${envPath}`);
+          } catch (err) {
+            console.warn(`[settings] Failed to persist to .env file:`, err instanceof Error ? err.message : err);
+            // Not fatal — in-memory env is already updated
+          }
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, applied }));
+      })
+      .catch((err) => ipcError(res, err, `PUT ${url.pathname}`));
+    return;
+  }
+
   // POST /register-call -- Register pending call config
   if (req.method === "POST" && url.pathname === "/register-call") {
     if (isShuttingDown) {
@@ -916,10 +1008,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, sessions: sessions.size }));
       })
-      .catch(() => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `POST ${url.pathname}`));
     return;
   }
 
@@ -1068,10 +1157,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: result.error }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -1133,10 +1219,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -1213,10 +1296,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: result.error }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -1279,10 +1359,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -1369,10 +1446,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
         }
       })
-      .catch((err) => {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : "Bad request" }));
-      });
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
     return;
   }
 
@@ -1403,21 +1477,13 @@ function pcmToWav(pcm: Buffer, sampleRate: number, numChannels: number, bitDepth
 const ipcServer = createServer(handleIPC);
 // Bind to 0.0.0.0 so it's accessible from Railway and other external services
 ipcServer.listen(IPC_PORT, "0.0.0.0", () => {
-  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /tts/test, /sessions, /metrics, /register-call, /end-call/:id, /voice-clone/*, /chatterbox/*`);
+  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /tts/test, /sessions, /metrics, /settings, /register-call, /end-call/:id, /voice-clone/*, /chatterbox/*`);
 });
 
 // ---- Call Config Registration ----
 
 function registerCallConfig(callId: string, config: CallSessionConfig): void {
-  pendingConfigs.set(callId, config);
-
-  // Auto-expire after 60 seconds if Twilio never connects
-  setTimeout(() => {
-    if (pendingConfigs.has(callId)) {
-      pendingConfigs.delete(callId);
-      console.warn(`[voice-server] Pending config expired: ${callId}`);
-    }
-  }, 60000);
+  pendingConfigs.set(callId, { config, createdAt: Date.now() });
 }
 
 // ---- Periodic Health & Stale Session Cleanup ----

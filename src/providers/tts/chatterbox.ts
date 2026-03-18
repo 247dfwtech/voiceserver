@@ -436,7 +436,8 @@ export class ChatterboxTurboTTS implements TTSProvider {
   synthesizeStream(
     text: string,
     onChunk: (chunk: Buffer) => void,
-    onDone: () => void
+    onDone: () => void,
+    onError?: (err: Error) => void
   ): { cancel: () => void } {
     let cancelled = false;
 
@@ -454,8 +455,13 @@ export class ChatterboxTurboTTS implements TTSProvider {
       })
       .catch((err) => {
         if (!cancelled) {
-          console.error("[tts/chatterbox] Stream error:", err.message);
-          onDone();
+          const error = err instanceof Error ? err : new Error(String(err));
+          console.error("[tts/chatterbox] Stream error:", error.message);
+          if (onError) {
+            onError(error);
+          } else {
+            onDone();
+          }
         }
       });
 
