@@ -277,6 +277,8 @@ export class CallSession extends EventEmitter {
   private speechStartedAt: number | null = null;
   private interimWordCount = 0;
   private utteranceDelayTimer: ReturnType<typeof setTimeout> | null = null;
+  private playingFirstMessage = false; // true while first message TTS is playing — ignore user speech
+  private pendingAudioDurationMs = 0; // tracks audio duration queued but not yet played by Twilio
 
   constructor(config: CallSessionConfig) {
     super();
@@ -364,6 +366,7 @@ export class CallSession extends EventEmitter {
       if (this.config.variableValues) {
         firstMsg = substituteVariables(firstMsg, this.config.variableValues);
       }
+      this.playingFirstMessage = true;
       this.speak(firstMsg);
       this.conversationHistory.push({ role: "assistant", content: firstMsg });
       this.fullTranscript.push({ role: "AI", content: firstMsg });
@@ -411,6 +414,9 @@ export class CallSession extends EventEmitter {
   }
 
   private handleSpeechStarted(): void {
+    // Ignore speech during first message — don't barge in on the greeting
+    if (this.playingFirstMessage) return;
+
     // Record when speech started for stopSpeakingPlan thresholds
     this.speechStartedAt = Date.now();
     this.interimWordCount = 0;
@@ -432,6 +438,9 @@ export class CallSession extends EventEmitter {
 
   private handleTranscript(text: string, isFinal: boolean): void {
     if (this.state === "ended") return;
+
+    // Ignore user speech during first message playback — it's not a response
+    if (this.playingFirstMessage) return;
 
     // Reset STT error counter on successful transcription
     this.consecutiveSTTErrors = 0;
@@ -627,10 +636,13 @@ export class CallSession extends EventEmitter {
       (pcmChunk: Buffer) => {
         const mulaw = pcm16kToMulaw(pcmChunk);
         const base64 = encodeBase64Audio(mulaw);
+        // Track audio duration: mulaw 8kHz = 8000 bytes/sec
+        this.pendingAudioDurationMs += (mulaw.length / 8000) * 1000;
         this.emit("audio", base64);
       },
       () => {
         this.isSpeaking = false;
+        this.playingFirstMessage = false;
         if (this.state !== "ended") {
           this.state = "waiting_for_speech";
           this.resetSilenceTimer();
@@ -639,6 +651,7 @@ export class CallSession extends EventEmitter {
       (err: Error) => {
         console.error(`[session:${this.config.callId}] TTS error:`, err.message);
         this.isSpeaking = false;
+        this.playingFirstMessage = false;
         if (this.state !== "ended") {
           this.state = "waiting_for_speech";
           this.resetSilenceTimer();
@@ -659,21 +672,37 @@ export class CallSession extends EventEmitter {
       this.currentLLMCancel = null;
     }
     this.isSpeaking = false;
+    this.pendingAudioDurationMs = 0;
     this.emit("clear_audio");
   }
 
   private waitForTTSFinish(timeoutMs: number = 30000): Promise<void> {
-    if (!this.isSpeaking) return Promise.resolve();
+    // Wait for TTS synthesis to complete, then wait for Twilio to play the audio.
+    // pendingAudioDurationMs tracks how much audio was queued — we wait that long
+    // after synthesis finishes so the caller actually hears the message.
+    const startPending = this.pendingAudioDurationMs;
     return new Promise((resolve) => {
+      if (!this.isSpeaking) {
+        // TTS just finished or hasn't started — wait for any pending audio to play
+        const waitMs = Math.min(this.pendingAudioDurationMs, 10000);
+        this.pendingAudioDurationMs = 0;
+        setTimeout(resolve, waitMs > 0 ? waitMs : 500);
+        return;
+      }
       const checkInterval = setInterval(() => {
         if (!this.isSpeaking || this.state === "ended") {
           clearInterval(checkInterval);
           clearTimeout(timeout);
-          resolve();
+          // Synthesis done — now wait for Twilio to play the audio
+          const audioMs = this.pendingAudioDurationMs - startPending;
+          const waitMs = Math.min(Math.max(audioMs, 1000), 10000);
+          this.pendingAudioDurationMs = 0;
+          setTimeout(resolve, waitMs);
         }
       }, 100);
       const timeout = setTimeout(() => {
         clearInterval(checkInterval);
+        this.pendingAudioDurationMs = 0;
         resolve();
       }, timeoutMs);
     });
