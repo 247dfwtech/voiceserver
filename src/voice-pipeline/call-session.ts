@@ -372,7 +372,11 @@ export class CallSession extends EventEmitter {
       // TTS synthesis finishes in ~1s but audio plays for 10-15s on the phone.
       // Estimate playback: ~60ms per character is a rough TTS duration heuristic.
       const estimatedPlaybackMs = Math.max(firstMsg.length * 60, 5000);
-      setTimeout(() => { this.playingFirstMessage = false; }, estimatedPlaybackMs);
+      setTimeout(() => {
+        this.playingFirstMessage = false;
+        // Discard any sub-threshold words that were said during first message
+        this.currentTranscript = "";
+      }, estimatedPlaybackMs);
       this.conversationHistory.push({ role: "assistant", content: firstMsg });
       this.fullTranscript.push({ role: "AI", content: firstMsg });
     } else {
@@ -419,12 +423,13 @@ export class CallSession extends EventEmitter {
   }
 
   private handleSpeechStarted(): void {
-    // Ignore speech during first message — don't barge in on the greeting
-    if (this.playingFirstMessage) return;
-
     // Record when speech started for stopSpeakingPlan thresholds
     this.speechStartedAt = Date.now();
     this.interimWordCount = 0;
+
+    // During first message: always defer to handleTranscript for threshold-based barge-in
+    // Short acknowledgements ("right", "yes") will be discarded; 3+ words will barge in
+    if (this.playingFirstMessage) return;
 
     // Don't immediately cancel TTS — wait for enough speech to confirm barge-in
     // The actual barge-in decision happens in handleTranscript when we have word counts
@@ -444,11 +449,28 @@ export class CallSession extends EventEmitter {
   private handleTranscript(text: string, isFinal: boolean): void {
     if (this.state === "ended") return;
 
-    // Ignore user speech during first message playback — it's not a response
-    if (this.playingFirstMessage) return;
-
     // Reset STT error counter on successful transcription
     this.consecutiveSTTErrors = 0;
+
+    // During first message: only allow barge-in if user says enough words (stopSpeakingPlan threshold)
+    // Short acknowledgements like "right", "yes", "hello" are discarded
+    if (this.playingFirstMessage) {
+      if (!isFinal) return; // Only check on final transcripts
+
+      const testAccumulated = (this.currentTranscript + " " + text).trim();
+      const wordCount = testAccumulated.split(/\s+/).filter(Boolean).length;
+      const minWords = this.config.stopSpeakingPlan?.numWords ?? 3;
+
+      if (wordCount >= minWords) {
+        // User said enough — barge in, stop first message, treat as real speech
+        this.playingFirstMessage = false;
+        this.currentTranscript += (this.currentTranscript ? " " : "") + text;
+        this.cancelSpeaking();
+        console.log(`[session:${this.config.callId}] First message barge-in: "${testAccumulated}" (${wordCount} words)`);
+      }
+      // Otherwise: discard — don't accumulate short words for later
+      return;
+    }
 
     // Check stopSpeakingPlan barge-in thresholds while assistant is speaking
     if (this.isSpeaking) {
