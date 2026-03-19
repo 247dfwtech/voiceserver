@@ -293,7 +293,6 @@ export class ParakeetSTT extends EventEmitter implements STTProvider {
   send(audio: Buffer): void {
     if (this.closed) return;
 
-    this.audioBuffer.push(audio);
     this.audioChunkCount++;
 
     // Simple VAD: detect speech/silence transitions
@@ -309,21 +308,29 @@ export class ParakeetSTT extends EventEmitter implements STTProvider {
     if (rms > this.speechThreshold) {
       if (!this.speechDetected) {
         this.speechDetected = true;
+        // IMPORTANT: Only start buffering when speech is first detected.
+        // Don't include pre-speech silence in the buffer — it confuses the model.
+        this.audioBuffer = [];
         console.log(`[stt/parakeet] Speech started (rms=${rms.toFixed(0)}, threshold=${this.speechThreshold})`);
         this.emit("speech_started");
       }
       this.silenceFrames = 0;
+      // Only buffer audio DURING speech
+      this.audioBuffer.push(audio);
     } else if (this.speechDetected) {
+      // Still buffer a bit of trailing silence (helps model with word boundaries)
+      this.audioBuffer.push(audio);
       this.silenceFrames++;
 
       if (this.silenceFrames >= this.silenceThresholdFrames) {
         const bufferDurationMs = this.audioBuffer.length * 20;
-        console.log(`[stt/parakeet] Silence detected, processing ${bufferDurationMs}ms of audio (${this.audioBuffer.length} chunks)`);
+        console.log(`[stt/parakeet] Silence detected, processing ${bufferDurationMs}ms of speech audio (${this.audioBuffer.length} chunks)`);
         this.processBufferedAudio();
         this.silenceFrames = 0;
         this.speechDetected = false;
       }
     }
+    // When speech is NOT detected, we intentionally DON'T buffer — discard silence
   }
 
   async finish(): Promise<void> {
