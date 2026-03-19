@@ -210,8 +210,8 @@ export class VoskSTT extends EventEmitter implements STTProvider {
     this.config = config;
     this.modelName = config.model || DEFAULT_MODEL;
 
-    // VAD thresholds
-    const silenceMs = config.endOfTurnTimeoutMs ?? 1200;
+    // VAD thresholds — endOfTurnTimeoutMs is configurable from assistant UI
+    const silenceMs = config.endOfTurnTimeoutMs ?? 800;
     this.silenceThresholdFrames = Math.round(silenceMs / 20);
     this.speechThreshold = 500;
     if (config.confidenceThreshold && config.confidenceThreshold > 0.4) {
