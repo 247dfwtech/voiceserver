@@ -46,14 +46,22 @@ class CostTracker {
   private ttsProvider: string;
 
   private static readonly PRICING = {
-    stt: { deepgram: 0.0059, whisper: 0.0 } as Record<string, number>,
+    stt: {
+      deepgram: parseFloat(process.env.COST_STT_DEEPGRAM || "0.0059"),
+      whisper: parseFloat(process.env.COST_STT_WHISPER || "0"),
+    } as Record<string, number>,
     llm: {
       "gpt-4o": { input: 0.0025, output: 0.01 },
       "gpt-4o-mini": { input: 0.00015, output: 0.0006 },
       "deepseek-chat": { input: 0.00014, output: 0.00028 },
     } as Record<string, { input: number; output: number }>,
-    tts: { elevenlabs: 0.18, piper: 0.0 } as Record<string, number>,
-    transport: { twilio: 0.014 },
+    tts: {
+      elevenlabs: parseFloat(process.env.COST_TTS_ELEVENLABS || "0.18"),
+      piper: 0.0,
+      kokoro: 0.0,
+      chatterbox: 0.0,
+    } as Record<string, number>,
+    transport: { twilio: parseFloat(process.env.COST_TRANSPORT_TWILIO || "0.014") },
   };
 
   constructor(providers: { stt: string; llm: string; tts: string }) {

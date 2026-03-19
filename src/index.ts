@@ -366,6 +366,8 @@ async function notifyCallEnded(
           transcript: endData.transcript,
           duration: endData.duration,
           cost: endData.cost,
+          sttProvider: config.transcriber?.provider || "unknown",
+          sttModel: config.transcriber?.model || "unknown",
           analysis,
           customer: {
             number: config.customerNumber,
