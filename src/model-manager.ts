@@ -1,8 +1,12 @@
 /**
- * Model Manager -- Manages LLM (Ollama), STT (Granite/Whisper), and TTS (Kokoro/Piper) models.
+ * Model Manager -- Manages LLM (Ollama), STT (Parakeet/Granite/Vosk), and TTS (Kokoro/Piper) models.
  *
- * Default STT: IBM Granite 4.0 1B Speech (#1 OpenASR, keyword biasing, Apache 2.0)
- * Fallback STT: faster-whisper (can be enabled if Granite is not preferred)
+ * Default STT: NVIDIA Parakeet TDT 0.6B v2 (6.32% WER, best self-hosted English accuracy)
+ * Fallback STT: Vosk (CPU-only, lightweight, 8kHz native — auto-fallback when GPU STT fails)
+ * Cloud STT: Deepgram Flux (paid, native end-of-turn detection)
+ * Legacy STT: IBM Granite 4.0 1B Speech (still supported but not default)
+ *
+ * NOTE: Whisper has been removed — it hallucinates on 8kHz Twilio phone audio.
  *
  * Default TTS: Kokoro-82M (#1 TTS Arena, near-human quality, Apache 2.0)
  * Fallback TTS: Piper (ultra-lightweight CPU option)
@@ -18,7 +22,8 @@ import { exec } from "child_process";
 // ---- Configuration ----
 
 const DATA_DIR = process.env.DATA_DIR || "/data";
-const WHISPER_MODELS_DIR = process.env.WHISPER_MODELS_DIR || "/models/whisper";
+const PARAKEET_MODELS_DIR = process.env.PARAKEET_MODELS_DIR || "/models/parakeet";
+const VOSK_MODELS_DIR = process.env.VOSK_MODELS_DIR || "/models/vosk";
 const GRANITE_MODELS_DIR = process.env.GRANITE_MODELS_DIR || "/models/granite";
 const PIPER_MODELS_DIR = process.env.PIPER_MODELS_DIR || "/models/piper";
 const KOKORO_MODELS_DIR = process.env.KOKORO_MODELS_DIR || "/models/kokoro";
@@ -34,13 +39,15 @@ export interface InstalledModel {
   installedAt: string;
 }
 
+export type STTProviderName = "parakeet" | "vosk" | "granite" | "deepgram";
+
 export interface ModelConfig {
   activeLLM: { provider: "ollama"; model: string } | null;
-  activeSTT: { provider: "granite" | "whisper" | "deepgram" | "deepgram"; model: string } | null;
+  activeSTT: { provider: STTProviderName; model: string } | null;
   activeTTS: { provider: "kokoro" | "piper" | "chatterbox"; voice: string } | null;
   installedModels: {
     llm: Array<{ name: string; size: string; provider: "ollama"; installedAt: string }>;
-    stt: Array<{ name: string; size: string; provider: "granite" | "whisper" | "deepgram"; installedAt: string }>;
+    stt: Array<{ name: string; size: string; provider: STTProviderName; installedAt: string }>;
     tts: Array<{ name: string; size: string; provider: "kokoro" | "piper" | "chatterbox"; installedAt: string }>;
   };
 }
@@ -49,13 +56,7 @@ export interface STTModelInfo {
   name: string;
   size: string;
   description: string;
-  provider: "granite" | "whisper" | "deepgram";
-}
-
-export interface WhisperModelInfo {
-  name: string;
-  size: string;
-  description: string;
+  provider: STTProviderName;
 }
 
 export interface HuggingFaceSearchResult {
@@ -66,19 +67,32 @@ export interface HuggingFaceSearchResult {
   description: string;
 }
 
-// ---- Hardcoded Whisper model catalog ----
+// ---- Parakeet TDT model catalog (default STT) ----
 
-const WHISPER_MODEL_CATALOG: WhisperModelInfo[] = [
-  { name: "tiny", size: "39MB", description: "Fastest, multilingual, lowest accuracy" },
-  { name: "tiny.en", size: "39MB", description: "Fastest, English only, lower accuracy" },
-  { name: "base", size: "74MB", description: "Good balance, multilingual" },
-  { name: "base.en", size: "74MB", description: "Good balance, English only" },
-  { name: "small", size: "244MB", description: "Better accuracy, multilingual" },
-  { name: "small.en", size: "244MB", description: "Better accuracy, English only" },
-  { name: "medium", size: "769MB", description: "High accuracy, multilingual" },
-  { name: "medium.en", size: "769MB", description: "High accuracy, English only" },
-  { name: "large-v3", size: "1.5GB", description: "Best accuracy, multilingual" },
-  { name: "turbo", size: "809MB", description: "Fast + accurate, multilingual" },
+const PARAKEET_MODEL_CATALOG: STTModelInfo[] = [
+  {
+    name: "nvidia/parakeet-tdt-0.6b-v2",
+    size: "~1.2GB",
+    description: "6.32% WER, best self-hosted English accuracy, TDT architecture (DEFAULT)",
+    provider: "parakeet",
+  },
+];
+
+// ---- Vosk model catalog (CPU fallback STT) ----
+
+const VOSK_MODEL_CATALOG: STTModelInfo[] = [
+  {
+    name: "vosk-model-small-en-us-0.15",
+    size: "~40MB",
+    description: "Small English model, CPU-only, fast (FALLBACK)",
+    provider: "vosk",
+  },
+  {
+    name: "vosk-model-en-us-0.22",
+    size: "~1.8GB",
+    description: "Large English model, CPU-only, higher accuracy",
+    provider: "vosk",
+  },
 ];
 
 // ---- Hardcoded Granite STT model catalog ----
@@ -87,7 +101,7 @@ const GRANITE_MODEL_CATALOG: STTModelInfo[] = [
   {
     name: "ibm-granite/granite-4.0-1b-speech",
     size: "~2GB",
-    description: "#1 OpenASR leaderboard, keyword biasing, Apache 2.0 (DEFAULT)",
+    description: "Granite 4.0 1B Speech, keyword biasing, Apache 2.0",
     provider: "granite",
   },
 ];
@@ -181,7 +195,7 @@ export class ModelManager {
   private defaultConfig(): ModelConfig {
     return {
       activeLLM: { provider: "ollama", model: ModelManager.DEFAULT_LLM },
-      activeSTT: { provider: "whisper", model: "small.en" },
+      activeSTT: { provider: "parakeet", model: "nvidia/parakeet-tdt-0.6b-v2" },
       activeTTS: { provider: "kokoro", voice: "af_heart" },
       installedModels: {
         llm: [],
@@ -390,8 +404,9 @@ export class ModelManager {
       },
       available: {
         stt: [
+          ...PARAKEET_MODEL_CATALOG,
+          ...VOSK_MODEL_CATALOG,
           ...GRANITE_MODEL_CATALOG,
-          ...WHISPER_MODEL_CATALOG.map((m) => ({ ...m, provider: "whisper" as const })),
         ],
         tts: [
           ...KOKORO_VOICE_CATALOG,
@@ -590,6 +605,43 @@ export class ModelManager {
     const activeSTT = this.config.activeSTT;
     const installed: Array<InstalledModel & { active: boolean }> = [];
 
+    // Check for installed Parakeet models via NeMo / HuggingFace cache
+    try {
+      const { stdout } = await runCommand(
+        `python3 -c "import nemo.collections.asr as nemo_asr; nemo_asr.models.ASRModel.from_pretrained('nvidia/parakeet-tdt-0.6b-v2', return_config=True); print('ok')" 2>/dev/null`
+      );
+      if (stdout.includes("ok")) {
+        installed.push({
+          name: "nvidia/parakeet-tdt-0.6b-v2",
+          size: "~1.2GB",
+          provider: "parakeet",
+          installedAt: "",
+          active: activeSTT?.provider === "parakeet" && activeSTT?.model === "nvidia/parakeet-tdt-0.6b-v2",
+        });
+      }
+    } catch {
+      // Parakeet not installed
+    }
+
+    // Check for installed Vosk models
+    try {
+      const voskEntries = await fs.promises.readdir(VOSK_MODELS_DIR, { withFileTypes: true });
+      for (const entry of voskEntries) {
+        if (entry.isDirectory() && entry.name.startsWith("vosk-model")) {
+          const catalogEntry = VOSK_MODEL_CATALOG.find((c) => c.name === entry.name);
+          installed.push({
+            name: entry.name,
+            size: catalogEntry?.size || "unknown",
+            provider: "vosk",
+            installedAt: "",
+            active: activeSTT?.provider === "vosk" && activeSTT?.model === entry.name,
+          });
+        }
+      }
+    } catch {
+      // Directory may not exist yet
+    }
+
     // Check for installed Granite models
     try {
       const graniteEntries = await fs.promises.readdir(GRANITE_MODELS_DIR, { withFileTypes: true });
@@ -630,42 +682,11 @@ export class ModelManager {
       }
     }
 
-    // Check for installed Whisper models
-    try {
-      const entries = await fs.promises.readdir(WHISPER_MODELS_DIR, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          const catalogEntry = WHISPER_MODEL_CATALOG.find((c) => entry.name.includes(c.name));
-          const modelName = catalogEntry?.name || entry.name;
-
-          let size = catalogEntry?.size || "unknown";
-          try {
-            const stat = await fs.promises.stat(path.join(WHISPER_MODELS_DIR, entry.name));
-            if (!catalogEntry) {
-              size = formatBytes(stat.size);
-            }
-          } catch {
-            // ignore
-          }
-
-          installed.push({
-            name: modelName,
-            size,
-            provider: "whisper",
-            installedAt: "",
-            active: activeSTT?.provider === "whisper" && activeSTT?.model === modelName,
-          });
-        }
-      }
-    } catch {
-      // Directory may not exist yet
-    }
-
     // Sync the config's installed list
     this.config.installedModels.stt = installed.map((m) => ({
       name: m.name,
       size: m.size,
-      provider: m.provider as "granite" | "whisper" | "deepgram",
+      provider: m.provider as STTProviderName,
       installedAt: m.installedAt,
     }));
     await this.saveConfig();
@@ -675,22 +696,32 @@ export class ModelManager {
 
   getSTTCatalog(): STTModelInfo[] {
     return [
+      ...PARAKEET_MODEL_CATALOG,
+      ...VOSK_MODEL_CATALOG,
       ...GRANITE_MODEL_CATALOG,
-      ...WHISPER_MODEL_CATALOG.map((m) => ({ ...m, provider: "whisper" as const })),
     ];
   }
 
   async installSTTModel(
     name: string,
-    provider?: "granite" | "whisper" | "deepgram"
+    provider?: STTProviderName
   ): Promise<{ success: boolean; error?: string }> {
     // Auto-detect provider from model name
     const isGranite = provider === "granite" || name.includes("granite");
+    const isParakeet = provider === "parakeet" || name.includes("parakeet");
+    const isVosk = provider === "vosk" || name.includes("vosk");
 
+    if (isParakeet) {
+      return this.installParakeetModel(name);
+    }
+    if (isVosk) {
+      return this.installVoskModel(name);
+    }
     if (isGranite) {
       return this.installGraniteModel(name);
     }
-    return this.installWhisperModel(name);
+    // Default to Parakeet
+    return this.installParakeetModel(name);
   }
 
   private async installGraniteModel(name: string): Promise<{ success: boolean; error?: string }> {
@@ -730,31 +761,29 @@ print('ok')
     }
   }
 
-  private async installWhisperModel(name: string): Promise<{ success: boolean; error?: string }> {
-    const validModel = WHISPER_MODEL_CATALOG.find((m) => m.name === name);
-    if (!validModel) {
-      return {
-        success: false,
-        error: `Unknown Whisper model "${name}". Valid models: ${WHISPER_MODEL_CATALOG.map((m) => m.name).join(", ")}`,
-      };
-    }
+  private async installParakeetModel(name: string): Promise<{ success: boolean; error?: string }> {
+    const modelId = name.includes("/") ? name : "nvidia/parakeet-tdt-0.6b-v2";
 
     try {
-      console.log(`[model-manager] Installing Whisper STT model: ${name}`);
+      console.log(`[model-manager] Installing Parakeet TDT STT model: ${modelId}`);
 
-      await fs.promises.mkdir(WHISPER_MODELS_DIR, { recursive: true });
-
-      const cmd = `python3 -c "from faster_whisper import WhisperModel; WhisperModel('${name}', download_root='${WHISPER_MODELS_DIR}')"`;
+      // Download model via NVIDIA NeMo (auto-caches in HuggingFace cache)
+      const cmd = `python3 -c "
+import nemo.collections.asr as nemo_asr
+print('Downloading Parakeet TDT model...')
+model = nemo_asr.models.ASRModel.from_pretrained('${modelId}')
+print('ok')
+"`;
       await runCommand(cmd);
 
-      console.log(`[model-manager] Whisper STT model ${name} installed successfully`);
+      console.log(`[model-manager] Parakeet TDT model ${modelId} installed successfully`);
 
-      const existing = this.config.installedModels.stt.find((m) => m.name === name);
+      const existing = this.config.installedModels.stt.find((m) => m.name === modelId);
       if (!existing) {
         this.config.installedModels.stt.push({
-          name,
-          size: validModel.size,
-          provider: "whisper",
+          name: modelId,
+          size: "~1.2GB",
+          provider: "parakeet",
           installedAt: new Date().toISOString(),
         });
       }
@@ -762,18 +791,100 @@ print('ok')
       return { success: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[model-manager] Whisper STT install failed for ${name}:`, msg);
+      console.error(`[model-manager] Parakeet TDT install failed for ${modelId}:`, msg);
+      return { success: false, error: msg };
+    }
+  }
+
+  private async installVoskModel(name: string): Promise<{ success: boolean; error?: string }> {
+    const validModel = VOSK_MODEL_CATALOG.find((m) => m.name === name);
+    if (!validModel) {
+      return {
+        success: false,
+        error: `Unknown Vosk model "${name}". Valid models: ${VOSK_MODEL_CATALOG.map((m) => m.name).join(", ")}`,
+      };
+    }
+
+    try {
+      console.log(`[model-manager] Installing Vosk STT model: ${name}`);
+
+      await fs.promises.mkdir(VOSK_MODELS_DIR, { recursive: true });
+
+      // Download and extract Vosk model from alphacephei
+      const cmd = `python3 -c "
+import urllib.request, zipfile, io, os
+model_dir = '${VOSK_MODELS_DIR}/${name}'
+if os.path.isdir(model_dir):
+    print('already installed')
+else:
+    url = 'https://alphacephei.com/vosk/models/${name}.zip'
+    print(f'Downloading from {url}...')
+    with urllib.request.urlopen(url) as resp:
+        data = resp.read()
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        zf.extractall('${VOSK_MODELS_DIR}')
+    print('ok')
+"`;
+      await runCommand(cmd);
+
+      console.log(`[model-manager] Vosk STT model ${name} installed successfully`);
+
+      const existing = this.config.installedModels.stt.find((m) => m.name === name);
+      if (!existing) {
+        this.config.installedModels.stt.push({
+          name,
+          size: validModel.size,
+          provider: "vosk",
+          installedAt: new Date().toISOString(),
+        });
+      }
+      await this.saveConfig();
+      return { success: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[model-manager] Vosk STT install failed for ${name}:`, msg);
       return { success: false, error: msg };
     }
   }
 
   async deleteSTTModel(name: string): Promise<{ success: boolean; error?: string }> {
     const isGranite = name.includes("granite");
+    const isParakeet = name.includes("parakeet");
+    const isVosk = name.includes("vosk");
 
     try {
       let deleted = false;
 
-      if (isGranite) {
+      if (isParakeet) {
+        // Clear HuggingFace cache for Parakeet model
+        try {
+          const cmd = `python3 -c "
+from huggingface_hub import scan_cache_dir
+cache = scan_cache_dir()
+for repo in cache.repos:
+    if 'parakeet' in repo.repo_id.lower():
+        for revision in repo.revisions:
+            print(f'Deleting {repo.repo_id}')
+            revision.delete()
+print('ok')
+"`;
+          await runCommand(cmd);
+          deleted = true;
+          console.log(`[model-manager] Deleted Parakeet STT model cache: ${name}`);
+        } catch {
+          // May not be installed via HuggingFace
+        }
+      } else if (isVosk) {
+        // Delete Vosk model directory
+        try {
+          const modelPath = path.join(VOSK_MODELS_DIR, name);
+          await fs.promises.rm(modelPath, { recursive: true, force: true });
+          console.log(`[model-manager] Deleted Vosk STT model directory: ${modelPath}`);
+          deleted = true;
+        } catch {
+          // Directory may not exist
+        }
+      } else if (isGranite) {
         // For Granite, clear the HuggingFace transformers cache for this model
         try {
           const cmd = `python3 -c "
@@ -806,17 +917,6 @@ print('ok')
         } catch {
           // Directory may not exist
         }
-      } else {
-        // Whisper model deletion
-        const entries = await fs.promises.readdir(WHISPER_MODELS_DIR, { withFileTypes: true });
-        for (const entry of entries) {
-          if (entry.isDirectory() && (entry.name === name || entry.name.includes(name))) {
-            const modelPath = path.join(WHISPER_MODELS_DIR, entry.name);
-            await fs.promises.rm(modelPath, { recursive: true, force: true });
-            console.log(`[model-manager] Deleted Whisper STT model directory: ${modelPath}`);
-            deleted = true;
-          }
-        }
       }
 
       if (!deleted) {
@@ -843,53 +943,30 @@ print('ok')
 
   async activateSTT(
     name: string,
-    provider?: "granite" | "whisper" | "deepgram"
+    provider?: STTProviderName
   ): Promise<{ success: boolean; error?: string }> {
-    const isGranite = provider === "granite" || name.includes("granite");
+    // Auto-detect provider from name
+    const resolvedProvider = provider
+      || (name.includes("parakeet") ? "parakeet" as const
+        : name.includes("vosk") ? "vosk" as const
+        : name.includes("granite") ? "granite" as const
+        : "parakeet" as const);
 
-    if (isGranite) {
-      // Check if Granite model is available (in catalog or installed)
-      const inCatalog = GRANITE_MODEL_CATALOG.some((m) => m.name === name);
-      const inInstalled = this.config.installedModels.stt.some(
-        (m) => m.name === name && m.provider === "granite"
-      );
+    // Check if model is in catalog or installed
+    const allCatalogs = [...PARAKEET_MODEL_CATALOG, ...VOSK_MODEL_CATALOG, ...GRANITE_MODEL_CATALOG];
+    const inCatalog = allCatalogs.some((m) => m.name === name);
+    const inInstalled = this.config.installedModels.stt.some((m) => m.name === name);
 
-      if (!inCatalog && !inInstalled) {
-        return {
-          success: false,
-          error: `Granite STT model "${name}" is not recognized. Available: ${GRANITE_MODEL_CATALOG.map((m) => m.name).join(", ")}`,
-        };
-      }
-
-      this.config.activeSTT = { provider: "granite", model: name };
-      await this.saveConfig();
-      console.log(`[model-manager] Active STT set to Granite: ${name}`);
-      return { success: true };
-    }
-
-    // Whisper activation
-    let found = false;
-    try {
-      const entries = await fs.promises.readdir(WHISPER_MODELS_DIR, { withFileTypes: true });
-      found = entries.some(
-        (e) => e.isDirectory() && (e.name === name || e.name.includes(name))
-      );
-    } catch {
-      // Directory doesn't exist
-    }
-
-    const inCatalog = WHISPER_MODEL_CATALOG.some((m) => m.name === name);
-
-    if (!found && !inCatalog) {
+    if (!inCatalog && !inInstalled) {
       return {
         success: false,
-        error: `STT model "${name}" is not installed and not a recognized Whisper model.`,
+        error: `STT model "${name}" is not recognized. Available: ${allCatalogs.map((m) => m.name).join(", ")}`,
       };
     }
 
-    this.config.activeSTT = { provider: "whisper", model: name };
+    this.config.activeSTT = { provider: resolvedProvider, model: name };
     await this.saveConfig();
-    console.log(`[model-manager] Active STT set to Whisper: ${name}`);
+    console.log(`[model-manager] Active STT set to ${resolvedProvider}: ${name}`);
     return { success: true };
   }
 
@@ -1225,20 +1302,34 @@ print('ok')
     type: "llm" | "stt" | "tts"
   ): Promise<HuggingFaceSearchResult[]> {
     if (type === "stt") {
-      // Return Deepgram + Whisper model lists (Deepgram first as recommended for voice agents)
+      // Return Parakeet + Vosk + Deepgram + Granite model lists
+      const parakeetResults = PARAKEET_MODEL_CATALOG.map((m) => ({
+        id: m.name,
+        name: m.name.split("/").pop()!,
+        downloads: 0,
+        likes: 0,
+        description: `[PARAKEET] ${m.description} (${m.size})`,
+      }));
+      const voskResults = VOSK_MODEL_CATALOG.map((m) => ({
+        id: m.name,
+        name: m.name,
+        downloads: 0,
+        likes: 0,
+        description: `[VOSK] ${m.description} (${m.size})`,
+      }));
       const deepgramResults = [
         { id: "deepgram/flux-general-en", name: "flux-general-en", downloads: 0, likes: 0, description: "[DEEPGRAM] Conversational STT with native end-of-turn detection (recommended for voice agents)" },
         { id: "deepgram/nova-3-general", name: "nova-3-general", downloads: 0, likes: 0, description: "[DEEPGRAM] Latest general-purpose model, highest accuracy" },
         { id: "deepgram/nova-2-general", name: "nova-2-general", downloads: 0, likes: 0, description: "[DEEPGRAM] Previous generation, stable" },
       ];
-      const whisperResults = WHISPER_MODEL_CATALOG.map((m) => ({
-        id: `openai/whisper-${m.name}`,
-        name: m.name,
+      const graniteResults = GRANITE_MODEL_CATALOG.map((m) => ({
+        id: m.name,
+        name: m.name.split("/").pop()!,
         downloads: 0,
         likes: 0,
-        description: `[WHISPER] ${m.description} (${m.size})`,
+        description: `[GRANITE] ${m.description} (${m.size})`,
       }));
-      return [...deepgramResults, ...whisperResults];
+      return [...parakeetResults, ...voskResults, ...deepgramResults, ...graniteResults];
     }
 
     try {

@@ -48,7 +48,9 @@ class CostTracker {
   private static readonly PRICING = {
     stt: {
       deepgram: parseFloat(process.env.COST_STT_DEEPGRAM || "0.0059"),
-      whisper: parseFloat(process.env.COST_STT_WHISPER || "0"),
+      parakeet: 0,
+      vosk: 0,
+      granite: 0,
     } as Record<string, number>,
     llm: {
       "gpt-4o": { input: 0.0025, output: 0.01 },
@@ -231,6 +233,7 @@ export interface CallSessionConfig {
   model: { provider: string; model: string; temperature?: number; maxTokens?: number; baseUrl?: string };
   voice: { provider: string; voiceId: string; model?: string; stability?: number };
   transcriber: { provider: string; model?: string; language?: string; keywords?: string[] };
+  fallbackTranscriber?: { provider: string; model?: string; language?: string; keywords?: string[] };
   tools: ToolDefinition[];
   endCallPhrases: string[];
   maxDuration: number;
@@ -280,6 +283,7 @@ export class CallSession extends EventEmitter {
   private startedAt: Date | null = null;
   private audioChunkCount = 0;
   private consecutiveSTTErrors = 0;
+  private sttFallbackAttempted = false;
 
   // Speaking plan state
   private speechStartedAt: number | null = null;
@@ -332,8 +336,13 @@ export class CallSession extends EventEmitter {
       this.consecutiveSTTErrors++;
       console.error(`[session:${this.config.callId}] STT error (${this.consecutiveSTTErrors}/3):`, err.message);
       if (this.consecutiveSTTErrors >= 3) {
-        console.error(`[session:${this.config.callId}] 3 consecutive STT errors, ending call`);
-        this.endCall("stt-failure");
+        // Attempt fallback to secondary STT provider before ending call
+        if (!this.sttFallbackAttempted && this.config.fallbackTranscriber) {
+          this.switchToFallbackSTT();
+        } else {
+          console.error(`[session:${this.config.callId}] STT errors exhausted (no fallback available), ending call`);
+          this.endCall("stt-failure");
+        }
       }
     });
 
@@ -428,6 +437,63 @@ export class CallSession extends EventEmitter {
     if (this.stt) {
       this.stt.send(pcm);
     }
+  }
+
+  /** Switch to fallback STT provider mid-call when primary fails */
+  private switchToFallbackSTT(): void {
+    if (!this.config.fallbackTranscriber || this.sttFallbackAttempted) return;
+    this.sttFallbackAttempted = true;
+
+    const fallbackConfig = this.config.fallbackTranscriber;
+    console.warn(
+      `[session:${this.config.callId}] Switching to fallback STT: ${fallbackConfig.provider}/${fallbackConfig.model || "default"}`
+    );
+
+    // Close current STT
+    if (this.stt) {
+      this.stt.close();
+    }
+
+    // Reset error counter
+    this.consecutiveSTTErrors = 0;
+
+    // Create new STT provider from fallback config
+    this.stt = createSTTProvider(fallbackConfig);
+
+    // Re-attach event handlers
+    this.stt.on("transcript", (data: { text: string; isFinal: boolean }) => {
+      this.handleTranscript(data.text, data.isFinal);
+    });
+
+    this.stt.on("speech_started", () => {
+      this.handleSpeechStarted();
+    });
+
+    this.stt.on("utterance_end", () => {
+      this.handleUtteranceEnd();
+    });
+
+    this.stt.on("error", (err: Error) => {
+      this.consecutiveSTTErrors++;
+      console.error(`[session:${this.config.callId}] Fallback STT error (${this.consecutiveSTTErrors}/3):`, err.message);
+      if (this.consecutiveSTTErrors >= 3) {
+        console.error(`[session:${this.config.callId}] Fallback STT also failed, ending call`);
+        this.endCall("stt-failure");
+      }
+    });
+
+    // Start the fallback STT
+    this.stt.start().catch((err) => {
+      console.error(`[session:${this.config.callId}] Failed to start fallback STT:`, err.message);
+      this.endCall("stt-failure");
+    });
+
+    // Update cost tracker provider
+    this.costTracker = new CostTracker({
+      stt: fallbackConfig.provider,
+      llm: this.config.model.model,
+      tts: this.config.voice.provider,
+    });
   }
 
   private handleSpeechStarted(): void {
