@@ -368,6 +368,11 @@ export class CallSession extends EventEmitter {
       }
       this.playingFirstMessage = true;
       this.speak(firstMsg);
+      // Don't rely on TTS completion callback to clear playingFirstMessage —
+      // TTS synthesis finishes in ~1s but audio plays for 10-15s on the phone.
+      // Estimate playback: ~60ms per character is a rough TTS duration heuristic.
+      const estimatedPlaybackMs = Math.max(firstMsg.length * 60, 5000);
+      setTimeout(() => { this.playingFirstMessage = false; }, estimatedPlaybackMs);
       this.conversationHistory.push({ role: "assistant", content: firstMsg });
       this.fullTranscript.push({ role: "AI", content: firstMsg });
     } else {
@@ -642,7 +647,6 @@ export class CallSession extends EventEmitter {
       },
       () => {
         this.isSpeaking = false;
-        this.playingFirstMessage = false;
         if (this.state !== "ended") {
           this.state = "waiting_for_speech";
           this.resetSilenceTimer();
@@ -651,7 +655,6 @@ export class CallSession extends EventEmitter {
       (err: Error) => {
         console.error(`[session:${this.config.callId}] TTS error:`, err.message);
         this.isSpeaking = false;
-        this.playingFirstMessage = false;
         if (this.state !== "ended") {
           this.state = "waiting_for_speech";
           this.resetSilenceTimer();
