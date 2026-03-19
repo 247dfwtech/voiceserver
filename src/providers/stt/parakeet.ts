@@ -273,9 +273,10 @@ export class ParakeetSTT extends EventEmitter implements STTProvider {
     const silenceMs = config.endOfTurnTimeoutMs ?? 1000;
     this.silenceThresholdFrames = Math.round(silenceMs / 20);
 
-    this.speechThreshold = 500;
+    // Lower threshold for Twilio phone audio (mulaw→PCM16k has lower amplitude)
+    this.speechThreshold = 200;
     if (config.confidenceThreshold && config.confidenceThreshold > 0.4) {
-      this.speechThreshold = 500 + (config.confidenceThreshold - 0.4) * 1000;
+      this.speechThreshold = 200 + (config.confidenceThreshold - 0.4) * 500;
     }
   }
 
@@ -286,17 +287,29 @@ export class ParakeetSTT extends EventEmitter implements STTProvider {
     });
   }
 
+  private audioChunkCount = 0;
+  private maxRmsSeen = 0;
+
   send(audio: Buffer): void {
     if (this.closed) return;
 
     this.audioBuffer.push(audio);
+    this.audioChunkCount++;
 
     // Simple VAD: detect speech/silence transitions
     const rms = this.calculateRMS(audio);
+    if (rms > this.maxRmsSeen) this.maxRmsSeen = rms;
+
+    // Log every 50 chunks (~1s) for debugging
+    if (this.audioChunkCount % 50 === 0) {
+      const bufferDurationMs = this.audioBuffer.length * 20;
+      console.log(`[stt/parakeet] VAD: chunk=${this.audioChunkCount} rms=${rms.toFixed(0)} maxRms=${this.maxRmsSeen.toFixed(0)} threshold=${this.speechThreshold} speech=${this.speechDetected} silence=${this.silenceFrames} buffer=${bufferDurationMs}ms`);
+    }
 
     if (rms > this.speechThreshold) {
       if (!this.speechDetected) {
         this.speechDetected = true;
+        console.log(`[stt/parakeet] Speech started (rms=${rms.toFixed(0)}, threshold=${this.speechThreshold})`);
         this.emit("speech_started");
       }
       this.silenceFrames = 0;
@@ -304,6 +317,8 @@ export class ParakeetSTT extends EventEmitter implements STTProvider {
       this.silenceFrames++;
 
       if (this.silenceFrames >= this.silenceThresholdFrames) {
+        const bufferDurationMs = this.audioBuffer.length * 20;
+        console.log(`[stt/parakeet] Silence detected, processing ${bufferDurationMs}ms of audio (${this.audioBuffer.length} chunks)`);
         this.processBufferedAudio();
         this.silenceFrames = 0;
         this.speechDetected = false;
@@ -329,9 +344,16 @@ export class ParakeetSTT extends EventEmitter implements STTProvider {
 
     const pcmData = Buffer.concat(this.audioBuffer);
     this.audioBuffer = [];
+    const durationMs = (pcmData.length / 2 / 16000) * 1000; // 16-bit mono 16kHz
+
+    console.log(`[stt/parakeet] Transcribing ${durationMs.toFixed(0)}ms of PCM audio (${pcmData.length} bytes)`);
 
     try {
+      const t0 = Date.now();
       const transcript = await this.transcribeWithParakeet(pcmData);
+      const latencyMs = Date.now() - t0;
+      console.log(`[stt/parakeet] Result: "${transcript}" (${latencyMs}ms, ${durationMs.toFixed(0)}ms audio)`);
+
       if (transcript.trim()) {
         this.emit("transcript", {
           text: transcript.trim(),
@@ -339,8 +361,11 @@ export class ParakeetSTT extends EventEmitter implements STTProvider {
           confidence: 0.95,
         });
         this.emit("utterance_end");
+      } else {
+        console.warn(`[stt/parakeet] Empty transcription for ${durationMs.toFixed(0)}ms audio — speech may not be detected`);
       }
     } catch (err) {
+      console.error(`[stt/parakeet] Transcription error:`, err instanceof Error ? err.message : String(err));
       this.emit("error", err instanceof Error ? err : new Error(String(err)));
     } finally {
       this.isProcessing = false;
