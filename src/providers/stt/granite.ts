@@ -263,8 +263,8 @@ export class GraniteSTT extends EventEmitter implements STTProvider {
   private closed = false;
 
   private modelId: string;
-  private speechThreshold = 500;
-  private silenceThresholdFrames = 25; // 25 * 20ms = 500ms of silence
+  private speechThreshold = 200; // Lower for Twilio phone audio (mulaw→PCM16k has lower RMS)
+  private silenceThresholdFrames = 50; // 50 * 20ms = 1000ms of silence
 
   constructor(config: STTConfig) {
     super();
@@ -282,17 +282,20 @@ export class GraniteSTT extends EventEmitter implements STTProvider {
   send(audio: Buffer): void {
     if (this.closed) return;
 
-    this.audioBuffer.push(audio);
-
     const rms = this.calculateRMS(audio);
 
     if (rms > this.speechThreshold) {
       if (!this.speechDetected) {
         this.speechDetected = true;
+        // Only start buffering when speech detected — discard pre-speech silence
+        this.audioBuffer = [];
         this.emit("speech_started");
       }
       this.silenceFrames = 0;
+      this.audioBuffer.push(audio);
     } else if (this.speechDetected) {
+      // Buffer trailing silence (helps model with word boundaries)
+      this.audioBuffer.push(audio);
       this.silenceFrames++;
 
       if (this.silenceFrames >= this.silenceThresholdFrames) {
@@ -301,6 +304,7 @@ export class GraniteSTT extends EventEmitter implements STTProvider {
         this.speechDetected = false;
       }
     }
+    // Pre-speech silence is discarded — not buffered
   }
 
   async finish(): Promise<void> {
