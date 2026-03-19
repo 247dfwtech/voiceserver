@@ -568,6 +568,13 @@ export class CallSession extends EventEmitter {
         }
       },
       onToolCall: (toolCall: LLMToolCall) => {
+        // Flush any remaining text to TTS before handling the tool call
+        // This ensures "I'll transfer you now" is spoken before ff_transfer fires
+        const remaining = fullResponse.trim();
+        if (remaining) {
+          fullResponse = "";
+          this.speak(remaining);
+        }
         this.handleToolCall(toolCall);
       },
       onDone: (text: string) => {
@@ -683,6 +690,7 @@ export class CallSession extends EventEmitter {
     });
 
     this.emit("tool_call", { toolCall, result });
+    this.fullTranscript.push({ role: "Tool", content: `[${toolCall.function.name}] ${result.action || "executed"}` });
 
     if (result.action === "endCall") {
       await this.waitForTTSFinish();
