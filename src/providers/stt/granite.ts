@@ -25,9 +25,17 @@ import type { STTProvider, STTConfig } from "./interface";
 let graniteProcess: ChildProcess | null = null;
 let graniteReady = false;
 let graniteReadyPromise: Promise<void> | null = null;
-let pendingResolve: ((text: string) => void) | null = null;
-let pendingReject: ((err: Error) => void) | null = null;
 let stdoutBuffer = "";
+
+// FIFO queue for serialized transcription requests (Granite processes one at a time)
+interface QueueEntry {
+  resolve: (text: string) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  audioPath: string;
+}
+const transcriptionQueue: QueueEntry[] = [];
+let activeEntry: QueueEntry | null = null;
 
 const DEFAULT_MODEL = "ibm-granite/granite-4.0-1b-speech";
 
@@ -136,22 +144,24 @@ function ensureGraniteProcess(modelId: string): Promise<void> {
     // Parse stdout lines — each line is a transcription response or ERROR:
     graniteProcess.stdout!.on("data", (data: Buffer) => {
       stdoutBuffer += data.toString();
-      const newline = stdoutBuffer.indexOf("\n");
-      if (newline !== -1) {
+      let newline: number;
+      while ((newline = stdoutBuffer.indexOf("\n")) !== -1) {
         const line = stdoutBuffer.slice(0, newline).trim();
         stdoutBuffer = stdoutBuffer.slice(newline + 1);
 
-        if (pendingResolve) {
-          const cb = pendingResolve;
-          const cbErr = pendingReject;
-          pendingResolve = null;
-          pendingReject = null;
+        if (activeEntry) {
+          const entry = activeEntry;
+          activeEntry = null;
+          clearTimeout(entry.timer);
 
           if (line.startsWith("ERROR:")) {
-            cbErr?.(new Error(line.slice(6).trim()));
+            entry.reject(new Error(line.slice(6).trim()));
           } else {
-            cb(line);
+            entry.resolve(line);
           }
+
+          // Process next queued request
+          processNextInQueue();
         }
       }
     });
@@ -181,9 +191,7 @@ function ensureGraniteProcess(modelId: string): Promise<void> {
       graniteReady = false;
       graniteReadyPromise = null;
       graniteProcess = null;
-      pendingReject?.(err);
-      pendingResolve = null;
-      pendingReject = null;
+      drainQueueWithError(err);
       if (!resolved) reject(err);
     });
 
@@ -192,11 +200,7 @@ function ensureGraniteProcess(modelId: string): Promise<void> {
       graniteReady = false;
       graniteProcess = null;
       graniteReadyPromise = null;
-      if (pendingReject) {
-        pendingReject(new Error(`Granite process exited (code ${code})`));
-        pendingResolve = null;
-        pendingReject = null;
-      }
+      drainQueueWithError(new Error(`Granite process exited (code ${code})`));
       if (!resolved) reject(new Error(`Granite process exited (code ${code}): ${stderrBuf.slice(-500)}`));
     });
 
@@ -215,6 +219,29 @@ function ensureGraniteProcess(modelId: string): Promise<void> {
   return graniteReadyPromise;
 }
 
+/** Send the next queued request to the Python subprocess stdin */
+function processNextInQueue(): void {
+  if (activeEntry || transcriptionQueue.length === 0) return;
+  if (!graniteProcess || !graniteProcess.stdin) return;
+
+  activeEntry = transcriptionQueue.shift()!;
+  graniteProcess.stdin.write(activeEntry.audioPath + "\n");
+}
+
+/** Reject all queued + active entries (used on process crash/exit) */
+function drainQueueWithError(err: Error): void {
+  if (activeEntry) {
+    clearTimeout(activeEntry.timer);
+    activeEntry.reject(err);
+    activeEntry = null;
+  }
+  while (transcriptionQueue.length > 0) {
+    const entry = transcriptionQueue.shift()!;
+    clearTimeout(entry.timer);
+    entry.reject(err);
+  }
+}
+
 async function transcribeFile(audioPath: string, modelId: string): Promise<string> {
   await ensureGraniteProcess(modelId);
 
@@ -224,33 +251,27 @@ async function transcribeFile(audioPath: string, modelId: string): Promise<strin
       return;
     }
 
-    if (pendingResolve) {
-      reject(new Error("Granite is already processing a request"));
-      return;
+    const entry: QueueEntry = {
+      resolve,
+      reject,
+      audioPath,
+      timer: setTimeout(() => {
+        const idx = transcriptionQueue.indexOf(entry);
+        if (idx !== -1) {
+          transcriptionQueue.splice(idx, 1);
+        } else if (activeEntry === entry) {
+          activeEntry = null;
+          processNextInQueue();
+        }
+        reject(new Error("Granite transcription timed out after 15s"));
+      }, 15_000),
+    };
+
+    transcriptionQueue.push(entry);
+
+    if (!activeEntry) {
+      processNextInQueue();
     }
-
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      pendingResolve = null;
-      pendingReject = null;
-      reject(new Error("Granite transcription timed out after 30s"));
-    }, 30_000);
-
-    pendingResolve = (text) => {
-      if (!timedOut) {
-        clearTimeout(timer);
-        resolve(text);
-      }
-    };
-    pendingReject = (err) => {
-      if (!timedOut) {
-        clearTimeout(timer);
-        reject(err);
-      }
-    };
-
-    graniteProcess.stdin.write(audioPath + "\n");
   });
 }
 
