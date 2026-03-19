@@ -389,7 +389,14 @@ export class CallSession extends EventEmitter {
       // TTS synthesis finishes in ~1s but audio plays for 10-15s on the phone.
       // Estimate playback: ~60ms per character is a rough TTS duration heuristic.
       const estimatedPlaybackMs = Math.max(firstMsg.length * 60, 5000);
-      setTimeout(() => {
+      setTimeout(async () => {
+        // Flush STT internal state BEFORE clearing the flag — streaming providers
+        // (Vosk) may emit stale transcripts from audio heard during first message.
+        // Those transcripts will be discarded by handleTranscript since playingFirstMessage
+        // is still true during the flush.
+        if (this.stt) {
+          try { await this.stt.finish(); } catch {}
+        }
         this.playingFirstMessage = false;
         // Discard any sub-threshold words that were said during first message
         this.currentTranscript = "";
@@ -425,7 +432,7 @@ export class CallSession extends EventEmitter {
       return;
     }
 
-    // Default path: convert to PCM 16kHz for Whisper and other local STT
+    // Default path: convert to PCM 16kHz for local STT
     const pcm = mulawToPcm16k(mulaw);
 
     // Feed to voicemail detector if active
