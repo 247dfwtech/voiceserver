@@ -1,6 +1,6 @@
 # VoiceServer — Claude Handoff Document
 
-**Last updated:** 2026-03-18 (rev 11)
+**Last updated:** 2026-03-19 (rev 17)
 **GitHub:** https://github.com/247dfwtech/voiceserver
 **Local path:** /Users/adriansanchez/Desktop/voiceserver
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
@@ -41,12 +41,50 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 ## What's Not Working / Known Issues
 
 - **Cloudflared tunnel URLs are ephemeral** — Quick tunnels generate random `trycloudflare.com` URLs. If tunnel processes restart, URLs change and Railway env vars need manual updating. Need Cloudflare named tunnel.
+- **Deepgram WebSocket drops every ~5 seconds** — FIXED (rev 13). Root cause: KeepAlive sent as text data frames interleaved with binary audio caused Deepgram's audio processor to choke. Fix: switched to `ws.ping()` control frames.
 - **Whisper hallucinations on 8kHz phone audio** — Whisper `small.en` produces severe hallucinations on Twilio phone audio (mulaw 8kHz resampled to 16kHz): "Thanks for watching!", "$100,000,000,000,000,000", "I'll get them ready" when user said something completely different. **Deepgram Flux is strongly recommended for production phone calls.** Whisper may work better with `medium.en` or `turbo` but untested.
 - **PM2 doesn't auto-reload .env on file change** — If you add/change API keys in `.env`, you must run `pm2 restart voiceserver --update-env`. The `dotenv/config` import only reads `.env` at process startup.
 
 ---
 
-## What Was Just Completed (Session 10 — March 18, 2026)
+## What Was Just Completed (Session 12 — March 18, 2026)
+
+### MILESTONE: Full Voice Pipeline Perfect — Transfer with Spoken Message
+
+**Historic milestone:** Complete end-to-end call confirmed perfect. Deepgram Flux transcribes → LLM responds → Kokoro speaks transfer message → caller hears full message → Twilio transfers. Tool invocations visible in transcript.
+
+1. **Fixed Deepgram WebSocket dropping every ~5 seconds** — Root cause: `ws.send(JSON.stringify({type: "KeepAlive"}))` sent text data frames interleaved with binary audio. Deepgram docs warn this "will cause audio processing to choke." Fix: switched to `ws.ping()` WebSocket control frames (RFC-6455). Connection now stays stable.
+2. **Configurable Deepgram Flux end-of-turn settings** — `eot_threshold` (was hardcoded 0.7, now configurable, default 0.75) and `eot_timeout_ms` (was hardcoded 5000, now configurable, default 1800).
+3. **Confidence threshold filtering** — Filters low-confidence EndOfTurn transcripts before emitting.
+4. **Whisper VAD configurable** — `endOfTurnTimeoutMs` → silence frames, `confidenceThreshold` → RMS threshold.
+5. **startSpeakingPlan** — `waitSeconds` (default 0.6s) delay after utterance_end before LLM. Timer resets on more speech.
+6. **stopSpeakingPlan** — Barge-in requires `numWords` (default 3) AND `voiceSeconds` (default 0.5s). Prevents "yes" interrupting mid-sentence.
+7. **TTS-before-tool (3 fixes):**
+   - Transfer/endCall wait for TTS to finish before executing
+   - LLM response text flushed to TTS before tool call fires (was stuck in buffer)
+   - `waitForTTSFinish` tracks actual audio duration and waits for Twilio playback
+8. **Natural first message barge-in** — `playingFirstMessage` flag active for estimated audio playback duration (~60ms/char). During greeting: short acknowledgements (< numWords threshold) are discarded entirely, not accumulated. If user says 4+ words, assistant stops greeting and responds. Sub-threshold words cleared when greeting finishes. **Confirmed working in live test calls** — user spoke two words during greeting, both discarded, assistant only responded to post-greeting speech.
+9. **Tool calls in transcript** — `fullTranscript.push({role: "Tool", content: "[ff_transfer] transfer"})` so call logs show when tools fired.
+10. **STT provider in end-of-call report** — `sttProvider` and `sttModel` now sent to vapiclone so call logs show which transcriber was used.
+11. **Configurable cost rates** — CostTracker reads from env vars (`COST_STT_DEEPGRAM`, `COST_TRANSPORT_TWILIO`, etc.) with sensible defaults. Set via vapiclone Settings sync. Kokoro/Whisper/Ollama hardcoded at $0 (self-hosted).
+12. **distil-large-v3 model downloaded** — Pre-downloaded on GPU for testing. 6x faster than large-v3, similar accuracy, 756MB. Select in assistant Transcriber tab.
+13. **NVIDIA Canary + Parakeet** — Added as provider options in vapiclone UI dropdown (not yet implemented server-side, placeholders for future).
+
+---
+
+## Session 11 — March 18, 2026
+
+### MILESTONE: Call Transfer Working End-to-End
+
+**Full pipeline confirmed:** Deepgram Flux transcribes → LLM invokes `ff_transfer` → Twilio transfers call to fallback number. Live test call successfully transferred to +16824413056.
+
+1. **Fixed audio format for Deepgram** — Was converting Twilio's mulaw 8kHz to PCM 16kHz before sending to Deepgram, but telling Deepgram `encoding=mulaw`. Now sends raw mulaw bytes with correct `encoding=mulaw&sample_rate=8000`. Deepgram handles conversion internally.
+2. **Kokoro TTS pre-warm on server startup** — Added startup pre-warm that synthesizes a short test phrase during server boot. First call no longer has 6-second cold start — Kokoro model is already loaded in GPU VRAM.
+3. **Tools tab in vapiclone UI** — Added 7th tab to assistant editor for attaching tools. Critical discovery: tools MUST be attached to the assistant via `toolIds` — mentioning them in the system prompt is not sufficient for the LLM to invoke them.
+
+---
+
+## Session 10 — March 18, 2026
 
 ### Deepgram Model Validation + STT Debugging
 
@@ -232,7 +270,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 - **Cloudflared URLs change on restart** — Check `pm2 logs tunnel-ipc --lines 5 --nostream` for new URL. Update Railway env vars.
 - **Vast.ai "200 ports" is misleading** — Only 6 Docker-mapped ports accessible externally. 8765/8766 NOT accessible. Always use cloudflared tunnels.
 - **IPC auth headers** — IPC endpoints require `x-ipc-secret: <IPC_SECRET>` header. Current: `vs-ipc-2026`.
-- **Audio format** — Twilio sends mu-law 8kHz mono. Voice server converts to PCM 16-bit 16kHz for STT. Kokoro outputs 24kHz, resampled to 16kHz, then to mu-law 8kHz for Twilio.
+- **Audio format** — Twilio sends mu-law 8kHz mono. For Deepgram: raw mulaw bytes sent directly with `encoding=mulaw&sample_rate=8000` (Deepgram handles conversion). For Whisper: converted to PCM 16-bit 16kHz. Kokoro outputs 24kHz, resampled to 16kHz, then to mu-law 8kHz for Twilio.
 - **Ollama needs OLLAMA_ORIGINS=*** — Without this, returns 403 to cloudflared tunnel requests.
 - **HF_HOME stale file handle** — When copying Vast.ai instance, `/etc/environment` has stale HF_HOME path. Fix: `sed -i 's|HF_HOME=.*|HF_HOME="/root/.cache/huggingface"|g' /etc/environment`.
 - **Voicemail detection false positives** — The audio-based detector (not Twilio AMD) uses `continuousSpeechFramesThreshold: 60` (1.2s of continuous speech). This is aggressive for phone calls. Recommend disabling for initial testing.
@@ -396,8 +434,8 @@ Twilio → Caller hears AI response
 ## Next Steps (In Order)
 
 1. **Set up Cloudflare named tunnel** — Permanent URLs that survive restarts. Currently tunnel URLs change on every PM2 restart.
-2. **Tune voicemail detection thresholds** — Now at 150 frames (3s). Test with voicemail detection enabled.
-3. **Full UI redesign** — Bushido Pros branding across vapiclone and dialer4clone (separate session).
+3. **Tune voicemail detection thresholds** — Now at 150 frames (3s). Test with voicemail detection enabled.
+4. **Full UI redesign** — Bushido Pros branding across vapiclone and dialer4clone (separate session).
 
 ---
 

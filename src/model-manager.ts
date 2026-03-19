@@ -1,12 +1,13 @@
 /**
- * Model Manager -- Manages LLM (Ollama), STT (Parakeet/Granite/Vosk), and TTS (Kokoro/Piper) models.
+ * Model Manager -- Manages LLM (Ollama), STT (Granite/Vosk/Deepgram), and TTS (Kokoro/Piper) models.
  *
- * Default STT: NVIDIA Parakeet TDT 0.6B v2 (6.32% WER, best self-hosted English accuracy)
- * Fallback STT: Vosk (CPU-only, lightweight, 8kHz native — auto-fallback when GPU STT fails)
+ * Default STT: Vosk (CPU-only, lightweight, works everywhere)
+ * GPU STT: IBM Granite 4.0 1B Speech (self-hosted, keyword biasing)
  * Cloud STT: Deepgram Flux (paid, native end-of-turn detection)
- * Legacy STT: IBM Granite 4.0 1B Speech (still supported but not default)
  *
- * NOTE: Whisper has been removed — it hallucinates on 8kHz Twilio phone audio.
+ * NOTE: Whisper and Parakeet were removed.
+ *   Whisper hallucinates on 8kHz Twilio phone audio.
+ *   Parakeet TDT requires NeMo which needs a newer CUDA driver than Vast.ai provides.
  *
  * Default TTS: Kokoro-82M (#1 TTS Arena, near-human quality, Apache 2.0)
  * Fallback TTS: Piper (ultra-lightweight CPU option)
@@ -22,7 +23,6 @@ import { exec } from "child_process";
 // ---- Configuration ----
 
 const DATA_DIR = process.env.DATA_DIR || "/data";
-const PARAKEET_MODELS_DIR = process.env.PARAKEET_MODELS_DIR || "/models/parakeet";
 const VOSK_MODELS_DIR = process.env.VOSK_MODELS_DIR || "/models/vosk";
 const GRANITE_MODELS_DIR = process.env.GRANITE_MODELS_DIR || "/models/granite";
 const PIPER_MODELS_DIR = process.env.PIPER_MODELS_DIR || "/models/piper";
@@ -39,7 +39,7 @@ export interface InstalledModel {
   installedAt: string;
 }
 
-export type STTProviderName = "parakeet" | "vosk" | "granite" | "deepgram";
+export type STTProviderName = "vosk" | "granite" | "deepgram";
 
 export interface ModelConfig {
   activeLLM: { provider: "ollama"; model: string } | null;
@@ -67,18 +67,7 @@ export interface HuggingFaceSearchResult {
   description: string;
 }
 
-// ---- Parakeet TDT model catalog (default STT) ----
-
-const PARAKEET_MODEL_CATALOG: STTModelInfo[] = [
-  {
-    name: "nvidia/parakeet-tdt-0.6b-v2",
-    size: "~1.2GB",
-    description: "6.32% WER, best self-hosted English accuracy, TDT architecture (DEFAULT)",
-    provider: "parakeet",
-  },
-];
-
-// ---- Vosk model catalog (CPU fallback STT) ----
+// ---- Vosk model catalog (CPU STT) ----
 
 const VOSK_MODEL_CATALOG: STTModelInfo[] = [
   {
@@ -195,7 +184,7 @@ export class ModelManager {
   private defaultConfig(): ModelConfig {
     return {
       activeLLM: { provider: "ollama", model: ModelManager.DEFAULT_LLM },
-      activeSTT: { provider: "parakeet", model: "nvidia/parakeet-tdt-0.6b-v2" },
+      activeSTT: { provider: "vosk", model: "vosk-model-en-us-0.22" },
       activeTTS: { provider: "kokoro", voice: "af_heart" },
       installedModels: {
         llm: [],
@@ -404,7 +393,6 @@ export class ModelManager {
       },
       available: {
         stt: [
-          ...PARAKEET_MODEL_CATALOG,
           ...VOSK_MODEL_CATALOG,
           ...GRANITE_MODEL_CATALOG,
         ],
@@ -605,24 +593,6 @@ export class ModelManager {
     const activeSTT = this.config.activeSTT;
     const installed: Array<InstalledModel & { active: boolean }> = [];
 
-    // Check for installed Parakeet models via NeMo / HuggingFace cache
-    try {
-      const { stdout } = await runCommand(
-        `python3 -c "import nemo.collections.asr as nemo_asr; nemo_asr.models.ASRModel.from_pretrained('nvidia/parakeet-tdt-0.6b-v2', return_config=True); print('ok')" 2>/dev/null`
-      );
-      if (stdout.includes("ok")) {
-        installed.push({
-          name: "nvidia/parakeet-tdt-0.6b-v2",
-          size: "~1.2GB",
-          provider: "parakeet",
-          installedAt: "",
-          active: activeSTT?.provider === "parakeet" && activeSTT?.model === "nvidia/parakeet-tdt-0.6b-v2",
-        });
-      }
-    } catch {
-      // Parakeet not installed
-    }
-
     // Check for installed Vosk models
     try {
       const voskEntries = await fs.promises.readdir(VOSK_MODELS_DIR, { withFileTypes: true });
@@ -696,7 +666,6 @@ export class ModelManager {
 
   getSTTCatalog(): STTModelInfo[] {
     return [
-      ...PARAKEET_MODEL_CATALOG,
       ...VOSK_MODEL_CATALOG,
       ...GRANITE_MODEL_CATALOG,
     ];
@@ -708,20 +677,16 @@ export class ModelManager {
   ): Promise<{ success: boolean; error?: string }> {
     // Auto-detect provider from model name
     const isGranite = provider === "granite" || name.includes("granite");
-    const isParakeet = provider === "parakeet" || name.includes("parakeet");
     const isVosk = provider === "vosk" || name.includes("vosk");
 
-    if (isParakeet) {
-      return this.installParakeetModel(name);
-    }
     if (isVosk) {
       return this.installVoskModel(name);
     }
     if (isGranite) {
       return this.installGraniteModel(name);
     }
-    // Default to Parakeet
-    return this.installParakeetModel(name);
+    // Default to Vosk
+    return this.installVoskModel(name);
   }
 
   private async installGraniteModel(name: string): Promise<{ success: boolean; error?: string }> {
@@ -757,41 +722,6 @@ print('ok')
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[model-manager] Granite STT install failed for ${modelId}:`, msg);
-      return { success: false, error: msg };
-    }
-  }
-
-  private async installParakeetModel(name: string): Promise<{ success: boolean; error?: string }> {
-    const modelId = name.includes("/") ? name : "nvidia/parakeet-tdt-0.6b-v2";
-
-    try {
-      console.log(`[model-manager] Installing Parakeet TDT STT model: ${modelId}`);
-
-      // Download model via NVIDIA NeMo (auto-caches in HuggingFace cache)
-      const cmd = `python3 -c "
-import nemo.collections.asr as nemo_asr
-print('Downloading Parakeet TDT model...')
-model = nemo_asr.models.ASRModel.from_pretrained('${modelId}')
-print('ok')
-"`;
-      await runCommand(cmd);
-
-      console.log(`[model-manager] Parakeet TDT model ${modelId} installed successfully`);
-
-      const existing = this.config.installedModels.stt.find((m) => m.name === modelId);
-      if (!existing) {
-        this.config.installedModels.stt.push({
-          name: modelId,
-          size: "~1.2GB",
-          provider: "parakeet",
-          installedAt: new Date().toISOString(),
-        });
-      }
-      await this.saveConfig();
-      return { success: true };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[model-manager] Parakeet TDT install failed for ${modelId}:`, msg);
       return { success: false, error: msg };
     }
   }
@@ -849,32 +779,12 @@ else:
 
   async deleteSTTModel(name: string): Promise<{ success: boolean; error?: string }> {
     const isGranite = name.includes("granite");
-    const isParakeet = name.includes("parakeet");
     const isVosk = name.includes("vosk");
 
     try {
       let deleted = false;
 
-      if (isParakeet) {
-        // Clear HuggingFace cache for Parakeet model
-        try {
-          const cmd = `python3 -c "
-from huggingface_hub import scan_cache_dir
-cache = scan_cache_dir()
-for repo in cache.repos:
-    if 'parakeet' in repo.repo_id.lower():
-        for revision in repo.revisions:
-            print(f'Deleting {repo.repo_id}')
-            revision.delete()
-print('ok')
-"`;
-          await runCommand(cmd);
-          deleted = true;
-          console.log(`[model-manager] Deleted Parakeet STT model cache: ${name}`);
-        } catch {
-          // May not be installed via HuggingFace
-        }
-      } else if (isVosk) {
+      if (isVosk) {
         // Delete Vosk model directory
         try {
           const modelPath = path.join(VOSK_MODELS_DIR, name);
@@ -947,13 +857,12 @@ print('ok')
   ): Promise<{ success: boolean; error?: string }> {
     // Auto-detect provider from name
     const resolvedProvider = provider
-      || (name.includes("parakeet") ? "parakeet" as const
-        : name.includes("vosk") ? "vosk" as const
+      || (name.includes("vosk") ? "vosk" as const
         : name.includes("granite") ? "granite" as const
-        : "parakeet" as const);
+        : "vosk" as const);
 
     // Check if model is in catalog or installed
-    const allCatalogs = [...PARAKEET_MODEL_CATALOG, ...VOSK_MODEL_CATALOG, ...GRANITE_MODEL_CATALOG];
+    const allCatalogs = [...VOSK_MODEL_CATALOG, ...GRANITE_MODEL_CATALOG];
     const inCatalog = allCatalogs.some((m) => m.name === name);
     const inInstalled = this.config.installedModels.stt.some((m) => m.name === name);
 
@@ -1302,14 +1211,7 @@ print('ok')
     type: "llm" | "stt" | "tts"
   ): Promise<HuggingFaceSearchResult[]> {
     if (type === "stt") {
-      // Return Parakeet + Vosk + Deepgram + Granite model lists
-      const parakeetResults = PARAKEET_MODEL_CATALOG.map((m) => ({
-        id: m.name,
-        name: m.name.split("/").pop()!,
-        downloads: 0,
-        likes: 0,
-        description: `[PARAKEET] ${m.description} (${m.size})`,
-      }));
+      // Return Vosk + Deepgram + Granite model lists
       const voskResults = VOSK_MODEL_CATALOG.map((m) => ({
         id: m.name,
         name: m.name,
@@ -1329,7 +1231,7 @@ print('ok')
         likes: 0,
         description: `[GRANITE] ${m.description} (${m.size})`,
       }));
-      return [...parakeetResults, ...voskResults, ...deepgramResults, ...graniteResults];
+      return [...voskResults, ...deepgramResults, ...graniteResults];
     }
 
     try {

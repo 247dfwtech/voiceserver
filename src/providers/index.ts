@@ -1,7 +1,6 @@
 import type { STTConfig, STTProvider } from "./stt/interface";
 import type { TTSConfig, TTSProvider } from "./tts/interface";
 import type { LLMConfig, LLMProvider } from "./llm/interface";
-import { ParakeetSTT } from "./stt/parakeet";
 import { VoskSTT } from "./stt/vosk";
 import { DeepgramSTT, DEEPGRAM_MODELS } from "./stt/deepgram";
 import { GraniteSTT } from "./stt/granite";
@@ -15,15 +14,17 @@ import { modelManager } from "../model-manager";
 /**
  * Provider factory functions.
  *
- * Free-first defaults:
- *   STT: Parakeet TDT 0.6b v2 (6.32% WER, best self-hosted English accuracy)
- *        Deepgram Flux as paid cloud option with native end-of-turn detection
- *        Vosk as CPU-only fallback (no GPU needed)
- *   LLM: Ollama (qwen3.5:9b default, auto-pulled on first boot)
- *   TTS: Kokoro-82M (Piper as fallback)
- * Optional paid providers are supported if API keys are present.
+ * STT providers (in order of recommendation):
+ *   Deepgram Flux — cloud, paid, native end-of-turn detection, best for voice agents
+ *   Granite 4.0 1B — self-hosted GPU, free, multimodal speech model
+ *   Vosk — self-hosted CPU, free, lightweight fallback
  *
- * NOTE: Whisper was removed — it hallucinates on 8kHz Twilio phone audio.
+ * LLM: Ollama (qwen3.5:9b default, auto-pulled on first boot)
+ * TTS: Kokoro-82M (Piper as fallback)
+ *
+ * NOTE: Whisper and Parakeet were removed.
+ *   Whisper hallucinates on 8kHz Twilio phone audio.
+ *   Parakeet TDT requires NeMo which needs a newer CUDA driver than Vast.ai provides.
  */
 
 export function createSTTProvider(config: STTConfig): STTProvider {
@@ -32,7 +33,7 @@ export function createSTTProvider(config: STTConfig): STTProvider {
     const activeSTT = modelManager.getActiveSTT();
     const activeProvider = modelManager.getActiveSTTProvider();
     if (activeSTT) {
-      config = { ...config, model: activeSTT, provider: activeProvider || "parakeet" };
+      config = { ...config, model: activeSTT, provider: activeProvider || "vosk" };
       console.log(`[providers] Using model-manager active STT: ${activeProvider}/${activeSTT}`);
     }
   }
@@ -41,8 +42,8 @@ export function createSTTProvider(config: STTConfig): STTProvider {
     case "deepgram": {
       const apiKey = process.env.DEEPGRAM_API_KEY;
       if (!apiKey) {
-        console.warn("[providers] Deepgram requested but DEEPGRAM_API_KEY not set, falling back to Parakeet");
-        return new ParakeetSTT(config);
+        console.warn("[providers] Deepgram requested but DEEPGRAM_API_KEY not set, falling back to Vosk");
+        return new VoskSTT(config);
       }
       // Validate model name — reject non-Deepgram model names sent by mistake
       const validDGModels = DEEPGRAM_MODELS.map(m => m.id);
@@ -56,20 +57,16 @@ export function createSTTProvider(config: STTConfig): STTProvider {
       console.log(`[providers] Using Deepgram STT (model=${config.model})`);
       return new DeepgramSTT(config, apiKey);
     }
-    case "parakeet":
-    case "nvidia-parakeet":
-      console.log(`[providers] Using Parakeet TDT STT (model=${config.model || "nvidia/parakeet-tdt-0.6b-v2"})`);
-      return new ParakeetSTT(config);
-    case "vosk":
-      console.log(`[providers] Using Vosk STT (CPU fallback, model=${config.model || "vosk-model-small-en-us-0.15"})`);
-      return new VoskSTT(config);
     case "granite":
       console.log(`[providers] Using Granite STT (model=${config.model || "ibm-granite/granite-4.0-1b-speech"})`);
       return new GraniteSTT(config);
+    case "vosk":
+      console.log(`[providers] Using Vosk STT (model=${config.model || "vosk-model-small-en-us-0.15"})`);
+      return new VoskSTT(config);
     default:
-      // Default to Parakeet TDT (free, local GPU, best self-hosted accuracy)
-      console.log("[providers] Defaulting to Parakeet TDT STT");
-      return new ParakeetSTT(config);
+      // Default to Vosk (free, CPU, works everywhere)
+      console.log(`[providers] Defaulting to Vosk STT`);
+      return new VoskSTT(config);
   }
 }
 
