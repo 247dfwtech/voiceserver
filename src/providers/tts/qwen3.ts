@@ -20,15 +20,9 @@ const QWEN3_VOICES_DIR = process.env.QWEN3_VOICES_DIR || "/data/qwen3-voices";
 const QWEN3_SAMPLE_RATE = 24000;
 const PIPELINE_SAMPLE_RATE = 16000;
 
-// Preset voices available in the CustomVoice model
-export const QWEN3_PRESET_VOICES = [
-  { id: "Vivian", name: "Vivian", gender: "female", language: "en", description: "English female" },
-  { id: "Ryan", name: "Ryan", gender: "male", language: "en", description: "English male" },
-  { id: "Serena", name: "Serena", gender: "female", language: "en", description: "English female, warm" },
-  { id: "Dylan", name: "Dylan", gender: "male", language: "en", description: "English male, casual" },
-  { id: "Eric", name: "Eric", gender: "male", language: "en", description: "English male, professional" },
-  { id: "Aiden", name: "Aiden", gender: "male", language: "en", description: "English male, youthful" },
-];
+// Preset voices (Base model doesn't support presets — these are for reference only).
+// Voice cloning is the primary use case for Qwen3-TTS; preset voices should use Kokoro.
+export const QWEN3_PRESET_VOICES: { id: string; name: string; gender: string; language: string; description: string }[] = [];
 
 export const QWEN3_LANGUAGES = [
   { code: "en", name: "English" },
@@ -42,6 +36,20 @@ export const QWEN3_LANGUAGES = [
   { code: "pt", name: "Portuguese" },
   { code: "nl", name: "Dutch" },
 ];
+
+// ---- Language code mapping (dashboard stores ISO codes, API needs full names) ----
+
+const LANG_CODE_TO_NAME: Record<string, string> = {
+  en: "english", zh: "chinese", ja: "japanese", ko: "korean",
+  fr: "french", de: "german", es: "spanish", it: "italian",
+  pt: "portuguese", nl: "dutch", ru: "russian",
+};
+
+function resolveLanguage(lang: string): string {
+  if (!lang) return "auto";
+  const lower = lang.toLowerCase();
+  return LANG_CODE_TO_NAME[lower] || lower;
+}
 
 // ---- Resampler ----
 
@@ -131,8 +139,9 @@ export class Qwen3VoiceManager {
 
     await fs.promises.mkdir(profileDir, { recursive: true });
 
-    // Write reference audio
-    await fs.promises.writeFile(path.join(profileDir, "reference.wav"), audioBuffer);
+    // Convert uploaded audio to proper WAV (browser may send M4A, WebM, OGG, etc.)
+    const wavBuffer = await this.convertToWav(audioBuffer, profileDir);
+    await fs.promises.writeFile(path.join(profileDir, "reference.wav"), wavBuffer);
 
     // Write metadata
     const meta = {
@@ -208,14 +217,49 @@ export class Qwen3VoiceManager {
     return path.join(this.profilesDir, voiceId, "reference.wav");
   }
 
-  /** Get the API voice parameter for a given voiceId */
-  getApiVoiceName(voiceId: string): string {
-    // Cloned voices use "clone:<profile_name>" format
-    if (voiceId.startsWith("qwen3_")) {
-      return `clone:${voiceId}`;
+  /** Get metadata for a cloned voice (ref_text, language) */
+  async getVoiceMeta(voiceId: string): Promise<{ ref_text?: string; language?: string } | null> {
+    try {
+      const metaPath = path.join(this.profilesDir, voiceId, "meta.json");
+      const raw = await fs.promises.readFile(metaPath, "utf-8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
     }
-    // Preset voices use the name directly
-    return voiceId;
+  }
+
+  /** Check if a voiceId is a cloned voice (vs preset) */
+  isClonedVoice(voiceId: string): boolean {
+    return voiceId.startsWith("qwen3_");
+  }
+
+  /** Convert any audio format to 24kHz mono WAV using ffmpeg */
+  private async convertToWav(input: Buffer, workDir: string): Promise<Buffer> {
+    const { execFile } = await import("child_process");
+    const { promisify } = await import("util");
+    const execFileAsync = promisify(execFile);
+
+    const inputPath = path.join(workDir, "input_raw");
+    const outputPath = path.join(workDir, "reference.wav");
+
+    await fs.promises.writeFile(inputPath, input);
+
+    try {
+      await execFileAsync("ffmpeg", [
+        "-y", "-i", inputPath,
+        "-ar", "24000", "-ac", "1", "-sample_fmt", "s16",
+        "-f", "wav", outputPath,
+      ], { timeout: 30000 });
+
+      const wavData = await fs.promises.readFile(outputPath);
+      // Clean up temp input file
+      await fs.promises.unlink(inputPath).catch(() => {});
+      return wavData;
+    } catch (err) {
+      await fs.promises.unlink(inputPath).catch(() => {});
+      console.warn("[tts/qwen3] ffmpeg conversion failed, saving raw audio:", err instanceof Error ? err.message : err);
+      return input;
+    }
   }
 }
 
@@ -240,20 +284,46 @@ export class Qwen3TTS implements TTSProvider {
     if (!text.trim()) return Buffer.alloc(0);
 
     const voiceId = voiceOverride || this.voiceId;
-    const apiVoice = qwen3VoiceManager.getApiVoiceName(voiceId);
+    const isCloned = qwen3VoiceManager.isClonedVoice(voiceId);
 
-    const response = await fetch(`${QWEN3_API_URL}/v1/audio/speech`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "qwen3-tts",
-        input: text,
-        voice: apiVoice,
-        speed: this.speed,
-        response_format: "pcm",
-      }),
-      signal: AbortSignal.timeout(90_000),
-    });
+    let response: Response;
+
+    if (isCloned) {
+      // Cloned voice: use /v1/audio/voice-clone with reference audio + text
+      const refPath = qwen3VoiceManager.getReferencePath(voiceId);
+      const meta = await qwen3VoiceManager.getVoiceMeta(voiceId);
+
+      const refAudio = await import("fs").then(f => f.promises.readFile(refPath));
+      const refAudioB64 = refAudio.toString("base64");
+
+      response = await fetch(`${QWEN3_API_URL}/v1/audio/voice-clone`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input: text,
+          ref_audio: refAudioB64,
+          ref_text: meta?.ref_text || "",
+          language: resolveLanguage(meta?.language || "en"),
+          response_format: "pcm",
+          speed: this.speed,
+        }),
+        signal: AbortSignal.timeout(90_000),
+      });
+    } else {
+      // Preset voice: use standard /v1/audio/speech
+      response = await fetch(`${QWEN3_API_URL}/v1/audio/speech`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3-tts",
+          input: text,
+          voice: voiceId,
+          speed: this.speed,
+          response_format: "pcm",
+        }),
+        signal: AbortSignal.timeout(90_000),
+      });
+    }
 
     if (!response.ok) {
       const errBody = await response.text().catch(() => "");
@@ -265,7 +335,7 @@ export class Qwen3TTS implements TTSProvider {
     if (pcmRaw.length === 0) return Buffer.alloc(0);
 
     const pcm16k = _resampleTo16k(pcmRaw, QWEN3_SAMPLE_RATE);
-    console.log(`[tts/qwen3] Synthesized voice=${apiVoice} chars=${text.length} pcm16k=${pcm16k.length}bytes`);
+    console.log(`[tts/qwen3] Synthesized voice=${voiceId} cloned=${isCloned} chars=${text.length} pcm16k=${pcm16k.length}bytes`);
     onChunk?.(pcm16k);
     return pcm16k;
   }
@@ -282,23 +352,46 @@ export class Qwen3TTS implements TTSProvider {
     (async () => {
       try {
         const voiceId = this.voiceId;
-        const apiVoice = qwen3VoiceManager.getApiVoiceName(voiceId);
+        const isCloned = qwen3VoiceManager.isClonedVoice(voiceId);
 
-        const response = await fetch(`${QWEN3_API_URL}/v1/audio/speech`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "qwen3-tts",
-            input: text,
-            voice: apiVoice,
-            speed: this.speed,
-            response_format: "pcm",
-          }),
-          signal: controller.signal,
-        });
+        let response: Response;
+
+        if (isCloned) {
+          const refPath = qwen3VoiceManager.getReferencePath(voiceId);
+          const meta = await qwen3VoiceManager.getVoiceMeta(voiceId);
+          const refAudio = await import("fs").then(f => f.promises.readFile(refPath));
+
+          response = await fetch(`${QWEN3_API_URL}/v1/audio/voice-clone`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              input: text,
+              ref_audio: refAudio.toString("base64"),
+              ref_text: meta?.ref_text || "",
+              language: resolveLanguage(meta?.language || "en"),
+              response_format: "pcm",
+              speed: this.speed,
+            }),
+            signal: controller.signal,
+          });
+        } else {
+          response = await fetch(`${QWEN3_API_URL}/v1/audio/speech`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "qwen3-tts",
+              input: text,
+              voice: voiceId,
+              speed: this.speed,
+              response_format: "pcm",
+            }),
+            signal: controller.signal,
+          });
+        }
 
         if (!response.ok || !response.body) {
-          throw new Error(`Qwen3-TTS stream error ${response.status}`);
+          const errBody = await response.text().catch(() => "");
+          throw new Error(`Qwen3-TTS stream error ${response.status}: ${errBody.substring(0, 200)}`);
         }
 
         const reader = (response.body as any).getReader() as ReadableStreamDefaultReader<Uint8Array>;

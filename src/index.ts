@@ -1589,14 +1589,34 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           if (sampleProvider === "kokoro" || !sampleProvider || sampleProvider === "piper") {
             const tts = await getOrCreateKokoroSingleton(sampleVoice);
             audioBuffer = await tts.synthesize(sampleText, undefined, sampleVoice);
-            sampleRate = 16000; // synthesize returns 16kHz after resampling
+            sampleRate = 16000;
 
-            // If synthesis returned empty audio (e.g. voice pack 404 from HuggingFace),
-            // reset the singleton so the next request starts a fresh Python process.
             if (audioBuffer.length === 0) {
               kokoroTTSSingleton = null;
               res.writeHead(500, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ error: "TTS synthesis returned empty audio. Voice pack may still be downloading — try again in 10s." }));
+              return;
+            }
+          } else if (sampleProvider === "qwen3" || sampleProvider === "qwen3-tts") {
+            const { Qwen3TTS } = await import("./providers/tts/qwen3");
+            const tts = new Qwen3TTS({ provider: "qwen3", voiceId: sampleVoice });
+            audioBuffer = await tts.synthesize(sampleText);
+            sampleRate = 16000;
+
+            if (audioBuffer.length === 0) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Qwen3-TTS returned empty audio. Check that the service is running and the voice exists." }));
+              return;
+            }
+          } else if (sampleProvider === "chatterbox" || sampleProvider === "chatterbox-turbo") {
+            const { ChatterboxTurboTTS } = await import("./providers/tts/chatterbox");
+            const tts = new ChatterboxTurboTTS({ provider: "chatterbox", voiceId: sampleVoice });
+            audioBuffer = await tts.synthesize(sampleText);
+            sampleRate = 16000;
+
+            if (audioBuffer.length === 0) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Chatterbox TTS returned empty audio." }));
               return;
             }
           } else {
