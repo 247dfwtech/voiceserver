@@ -356,10 +356,13 @@ async function notifyCallEnded(
   },
   config: CallSessionConfig
 ): Promise<void> {
-  // Run post-call analysis if configured
+  // Run post-call analysis only on answered calls with real conversation
   let analysis: { summary?: string; successEvaluation?: string; analysisCost?: number; analysisProvider?: string; analysisModel?: string } = {};
   const analysisConfig = config.analysisConfig;
-  if (analysisConfig) {
+  const SKIP_ANALYSIS_REASONS = new Set(["voicemail", "stt-failure", "no-answer", "busy", "failed", "machine-detected"]);
+  const hasRealConversation = endData.transcript && endData.transcript.split("\n").filter((l: string) => l.trim()).length >= 2;
+
+  if (analysisConfig && !SKIP_ANALYSIS_REASONS.has(endData.endedReason) && hasRealConversation) {
     try {
       analysis = await runPostCallAnalysis(endData.transcript, analysisConfig);
       // Add analysis cost to the cost breakdown
@@ -370,6 +373,8 @@ async function notifyCallEnded(
     } catch (err) {
       console.error(`[voice-server] Analysis failed for ${callId}:`, err);
     }
+  } else if (analysisConfig) {
+    console.log(`[voice-server] Skipping analysis for ${callId}: reason=${endData.endedReason}, transcriptLines=${endData.transcript?.split("\n").filter((l: string) => l.trim()).length || 0}`);
   }
 
   // Send end-of-call report to VapiClone
