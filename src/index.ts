@@ -19,7 +19,8 @@ import { CallSession, type CallSessionConfig, type CostBreakdown } from "./voice
 import { runPostCallAnalysis } from "./voice-pipeline/analysis-runner";
 import { transferCallWithDial } from "./voice-pipeline/call-transfer";
 import { modelManager } from "./model-manager";
-import { warmupKokoro } from "./providers/tts/kokoro";
+import { warmupKokoro, checkKokoroHealth } from "./providers/tts/kokoro";
+import { checkQwen3Health } from "./providers/tts/qwen3";
 import { voiceCloneManager } from "./providers/tts/kokoclone";
 import { chatterboxVoiceManager } from "./providers/tts/chatterbox";
 import { metricsBuffer, startMetricsCollection, stopMetricsCollection, setSessionCountProvider, collectSnapshot } from "./gpu-monitor";
@@ -79,12 +80,12 @@ setInterval(() => {
   }
 }, 30_000);
 
-// Singleton KokoroTTS instance — keeps the Python process alive between /tts/test calls
-// so the model doesn't need to reload on every preview request (cold start is 60-90s)
+// Singleton KokoroTTS instance for /tts/test preview calls.
+// Now stateless (HTTP client), so this is just a convenience to avoid re-constructing.
 let kokoroTTSSingleton: import("./providers/tts/kokoro").KokoroTTS | null = null;
 async function getOrCreateKokoroSingleton(voiceId: string): Promise<import("./providers/tts/kokoro").KokoroTTS> {
   const { KokoroTTS } = await import("./providers/tts/kokoro");
-  if (!kokoroTTSSingleton) {
+  if (!kokoroTTSSingleton || (kokoroTTSSingleton as any).voiceId !== voiceId) {
     kokoroTTSSingleton = new KokoroTTS({ provider: "kokoro", voiceId, speed: 1.0 });
   }
   return kokoroTTSSingleton;
@@ -110,13 +111,35 @@ console.log(`[voice-server] -----------------------------------------------`);
 
 // Initialize model manager (loads config, creates data dir, auto-pulls default LLM)
 modelManager.initialize().then(() => {
-  console.log("[voice-server] Model manager ready (default LLM: qwen3.5:9b)");
+  console.log(`[voice-server] Model manager ready (default LLM: ${process.env.DEFAULT_LLM || "llama3.2:3b"})`);
 }).catch((err) => {
   console.error("[voice-server] Model manager initialization failed:", err);
 });
 
 // Pre-warm Kokoro TTS so first call doesn't wait 6+ seconds for model load
 warmupKokoro();
+
+// Pre-warm LLM so first call doesn't wait for model load into GPU VRAM
+(async () => {
+  try {
+    const ollamaUrl = (process.env.OLLAMA_URL || "http://localhost:11434/v1").replace(/\/v1\/?$/, "");
+    const defaultLLM = process.env.DEFAULT_LLM || "llama3.2:3b";
+    console.log(`[voice-server] Pre-warming LLM: ${defaultLLM}...`);
+    const res = await fetch(`${ollamaUrl}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: defaultLLM, prompt: "hi", stream: false }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (res.ok) {
+      console.log(`[voice-server] LLM ${defaultLLM} warmed up and loaded into GPU VRAM`);
+    } else {
+      console.warn(`[voice-server] LLM warmup returned HTTP ${res.status}`);
+    }
+  } catch (err) {
+    console.warn(`[voice-server] LLM warmup failed (non-fatal):`, err instanceof Error ? err.message : err);
+  }
+})();
 
 // Start GPU/CPU/memory metrics collection (30s interval, 3-day ring buffer)
 setSessionCountProvider(() => sessions.size);
@@ -444,8 +467,12 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     const mem = process.memoryUsage();
     const latest = metricsBuffer.getLatest();
 
-    // Check Ollama connectivity asynchronously
-    checkOllama().then((ollamaStatus) => {
+    // Check Ollama and TTS service health concurrently
+    Promise.all([
+      checkOllama().catch(() => ({ ok: false, error: "check failed" })),
+      checkKokoroHealth().catch(() => false),
+      checkQwen3Health().catch(() => false),
+    ]).then(([ollamaStatus, kokoroOk, qwen3Ok]) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
@@ -462,26 +489,10 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           cpu: latest?.cpu || null,
           systemMemory: latest?.mem || null,
           ollama: ollamaStatus,
-        })
-      );
-    }).catch((err) => {
-      console.warn(`[ipc] Health check Ollama probe failed:`, err instanceof Error ? err.message : err);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          ok: !isShuttingDown,
-          sessions: sessions.size,
-          maxSessions: MAX_SESSIONS,
-          totalCallsHandled,
-          uptime: Math.round((Date.now() - startedAt) / 1000),
-          memory: {
-            rss: Math.round(mem.rss / 1024 / 1024),
-            heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
+          tts: {
+            kokoro: { ok: kokoroOk, url: process.env.KOKORO_API_URL || "http://localhost:8880" },
+            qwen3: { ok: qwen3Ok, url: process.env.QWEN3_API_URL || "http://localhost:8881" },
           },
-          gpu: latest?.gpu || null,
-          cpu: latest?.cpu || null,
-          systemMemory: latest?.mem || null,
-          ollama: { ok: false, error: "check failed" },
         })
       );
     });
@@ -517,26 +528,6 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ snapshots, count: snapshots.length, rangeMs: ms }));
-    return;
-  }
-
-  // GET /models -- list available Ollama models (enhanced with model-manager)
-  if (req.method === "GET" && url.pathname === "/models") {
-    modelManager
-      .getFullStatus()
-      .then((status) => {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(status));
-      })
-      .catch((err) => {
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: "Failed to get model status",
-            details: err instanceof Error ? err.message : String(err),
-          })
-        );
-      });
     return;
   }
 
@@ -579,6 +570,26 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
       res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
     }
+  }
+
+  // GET /models -- list available Ollama models (enhanced with model-manager)
+  if (req.method === "GET" && url.pathname === "/models") {
+    modelManager
+      .getFullStatus()
+      .then((status) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(status));
+      })
+      .catch((err) => {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "Failed to get model status",
+            details: err instanceof Error ? err.message : String(err),
+          })
+        );
+      });
+    return;
   }
 
   // ---- Model Management Endpoints ----
@@ -915,6 +926,8 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     default_llm: { envKey: "DEFAULT_LLM", sensitive: false },
     whisper_model: { envKey: "WHISPER_MODEL", sensitive: false },
     kokoro_voice: { envKey: "KOKORO_VOICE", sensitive: false },
+    ollama_flash_attention: { envKey: "OLLAMA_FLASH_ATTENTION", sensitive: false },
+    ollama_num_parallel: { envKey: "OLLAMA_NUM_PARALLEL", sensitive: false },
   };
 
   // GET /settings -- List current settings (sensitive values masked)
@@ -980,6 +993,24 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           } catch (err) {
             console.warn(`[settings] Failed to persist to .env file:`, err instanceof Error ? err.message : err);
             // Not fatal — in-memory env is already updated
+          }
+
+          // Restart Ollama PM2 process if ollama-specific settings changed
+          const ollamaKeys = ["ollama_flash_attention", "ollama_num_parallel"];
+          const ollamaChanged = applied.some((k) => ollamaKeys.includes(k));
+          if (ollamaChanged) {
+            try {
+              const { exec: execCb } = await import("child_process");
+              execCb("pm2 restart ollama --update-env", (err, stdout, stderr) => {
+                if (err) {
+                  console.warn(`[settings] Failed to restart Ollama PM2:`, err.message);
+                } else {
+                  console.log(`[settings] Restarted Ollama PM2 process to apply new env vars`);
+                }
+              });
+            } catch (err) {
+              console.warn(`[settings] pm2 restart ollama failed:`, err);
+            }
           }
         }
 
@@ -1379,10 +1410,141 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
+  // ---- Qwen3-TTS Voice Cloning Endpoints ----
+
+  // GET /qwen3/status -- Check Qwen3-TTS container health + list voices
+  if (req.method === "GET" && url.pathname === "/qwen3/status") {
+    import("./providers/tts/qwen3").then(async ({ checkQwen3Health, qwen3VoiceManager }) => {
+      const healthy = await checkQwen3Health();
+      const voices = await qwen3VoiceManager.listVoices();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ installed: healthy, healthy, voices, count: voices.length }));
+    }).catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+    });
+    return;
+  }
+
+  // GET /qwen3/voices -- List all Qwen3 cloned voices
+  if (req.method === "GET" && url.pathname === "/qwen3/voices") {
+    import("./providers/tts/qwen3").then(async ({ qwen3VoiceManager }) => {
+      const voices = await qwen3VoiceManager.listVoices();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ voices }));
+    }).catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+    });
+    return;
+  }
+
+  // POST /qwen3/create -- Upload reference audio and create a Qwen3 cloned voice
+  if (req.method === "POST" && url.pathname === "/qwen3/create") {
+    readBody(req, 10_000_000)
+      .then(async (body) => {
+        const { name, audio, filename, language, transcript } = JSON.parse(body);
+
+        if (!name || !audio) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing 'name' and 'audio' (base64) in request body" }));
+          return;
+        }
+
+        const audioBuffer = Buffer.from(audio, "base64");
+
+        if (audioBuffer.length < 1000) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Audio file too small. Need 5-20 seconds of clear speech." }));
+          return;
+        }
+
+        if (audioBuffer.length > 10_000_000) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Audio file too large (max 10MB). Use a 5-20 second clip." }));
+          return;
+        }
+
+        const { qwen3VoiceManager } = await import("./providers/tts/qwen3");
+        const voice = await qwen3VoiceManager.createVoice(
+          name,
+          audioBuffer,
+          language || "en",
+          transcript
+        );
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, voice }));
+      })
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
+    return;
+  }
+
+  // DELETE /qwen3/voices/:id -- Delete a Qwen3 voice
+  if (req.method === "DELETE" && url.pathname.startsWith("/qwen3/voices/")) {
+    const voiceId = decodeURIComponent(url.pathname.slice("/qwen3/voices/".length));
+    if (!voiceId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing voice ID in URL" }));
+      return;
+    }
+
+    import("./providers/tts/qwen3").then(async ({ qwen3VoiceManager }) => {
+      const deleted = await qwen3VoiceManager.deleteVoice(voiceId);
+      if (deleted) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, deleted: voiceId }));
+      } else {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Failed to delete voice ${voiceId}` }));
+      }
+    }).catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+    });
+    return;
+  }
+
+  // POST /qwen3/test -- Test synthesis with a Qwen3 voice
+  if (req.method === "POST" && url.pathname === "/qwen3/test") {
+    readBody(req, MAX_IPC_BODY_BYTES)
+      .then(async (body) => {
+        const { voiceId, text } = JSON.parse(body);
+
+        if (!voiceId || !text) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing 'voiceId' and 'text' in request body" }));
+          return;
+        }
+
+        try {
+          const { Qwen3TTS } = await import("./providers/tts/qwen3");
+          const tts = new Qwen3TTS({ provider: "qwen3", voiceId });
+          const audio = await tts.synthesize(text);
+
+          const wavBuffer = pcmToWav(audio, 16000, 1, 16);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            ok: true,
+            audio: wavBuffer.toString("base64"),
+            mimeType: "audio/wav",
+            sampleRate: 16000,
+            durationMs: Math.round((audio.length / 2) / 16000 * 1000),
+          }));
+        } catch (err) {
+          console.error("[voice-server] Qwen3 test error:", err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+        }
+      })
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
+    return;
+  }
+
   // GET /logs -- Return recent log lines for real-time debugging from vapiclone UI
   if (req.method === "GET" && url.pathname === "/logs") {
     import("fs").then(async (fs) => {
-      const lines = parseInt(url.searchParams.get("lines") || "100", 10);
+      const lines = Math.min(parseInt(url.searchParams.get("lines") || "100", 10), 2000);
       const type = url.searchParams.get("type") || "all"; // "out", "error", or "all"
       try {
         const readLastLines = (filePath: string, n: number): string[] => {

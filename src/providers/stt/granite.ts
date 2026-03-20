@@ -46,7 +46,12 @@ function getModelId(config: STTConfig): string {
   return configModel || DEFAULT_MODEL;
 }
 
+function sanitizePythonString(s: string): string {
+  return s.replace(/[^a-zA-Z0-9.\-_\/]/g, "");
+}
+
 function buildPythonScript(modelId: string): string {
+  const safeModelId = sanitizePythonString(modelId);
   return `
 import sys
 
@@ -58,7 +63,7 @@ import torch
 import torchaudio
 from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 
-model_id = "${modelId}"
+model_id = "${safeModelId}"
 use_cuda = torch.cuda.is_available()
 device_str = "cuda" if use_cuda else "cpu"
 # Granite docs specify bfloat16, not float16

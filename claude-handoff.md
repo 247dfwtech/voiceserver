@@ -1,11 +1,11 @@
-# VoiceServer — Claude Handoff Document
+# VoiceServer V2 — Claude Handoff Document
 
-**Last updated:** 2026-03-19 (rev 17)
-**GitHub:** https://github.com/247dfwtech/voiceserver
-**Local path:** /Users/adriansanchez/Desktop/voiceserver
+**Last updated:** 2026-03-19 (rev 18 — V2 upgrade)
+**GitHub:** https://github.com/247dfwtech/voiceserver (V2 not pushed yet)
+**Local path:** /Users/adriansanchez/Desktop/voiceserverV2
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
 **SSH:** `ssh -p 45194 root@70.29.210.33`
-**Server path:** /opt/voiceserver/
+**Server path:** /opt/voiceserverV2/
 
 ---
 
@@ -47,7 +47,68 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 
 ---
 
-## What Was Just Completed (Session 12 — March 18, 2026)
+## What Was Just Completed (Session 14 — March 19, 2026)
+
+### Debugging & Fixes — STT, LLM, Tunnels, Call Pipeline
+
+1. **Sherpa-ONNX abandoned** — 20M model too inaccurate for mulaw phone audio. Removed from server (model + pip package). Code stays as placeholder in provider factory (routes to Vosk).
+2. **Vosk tested** — works on clean audio but fails on real phone audio (mulaw artifacts). Not production-viable.
+3. **Deepgram confirmed as production STT** — see CRITICAL section below.
+4. **stt.finish() bug fixed** — was destroying user transcripts at first message end. Removed the finish() call.
+5. **Silence timer bug fixed** — was firing during first message playback. Added playingFirstMessage guard.
+6. **Ollama OLLAMA_ORIGINS=* fix** — PM2 entry recreated to use start-ollama.sh script (not bare command). Fixes 403 on tunnel requests.
+7. **Tunnel PM2 entries fixed** — were pointing to deleted V1 path `/opt/voiceserver/`. Recreated with V2 paths.
+8. **qwen3.5:9b references purged** — removed hardcoded fallbacks from test-chat route and analysis-runner.ts.
+9. **LLM warmup on boot** — llama3.2:3b loaded into GPU VRAM at startup.
+
+---
+
+## CRITICAL: Deepgram Flux STT — Proven Working Config (DO NOT CHANGE)
+
+These settings were proven in V1 Sessions 8-12. If testing other STT options, NEVER alter these:
+
+### The 4 Rules
+1. **acceptsMulaw: true** — raw Twilio mulaw → Deepgram directly, NO PCM conversion
+2. **ws.ping() for keepalive** — NOT `ws.send(JSON.stringify({type: "KeepAlive"}))` (causes audio choke)
+3. **v2 endpoint** — `wss://api.deepgram.com/v2/listen` with `flux-general-en`
+4. **DEEPGRAM_API_KEY in process.env** — must restart PM2 with `--update-env` after .env changes
+
+### Protected Files (do not modify for other STT experiments)
+- `src/providers/stt/deepgram.ts` — ws.ping() keepalive, acceptsMulaw, event mapping
+- `src/providers/stt/interface.ts` — acceptsMulaw flag definition
+- `call-session.ts` lines 423-432 — acceptsMulaw audio routing bypass
+
+### Connection URL
+```
+wss://api.deepgram.com/v2/listen?model=flux-general-en&encoding=mulaw&sample_rate=8000&eot_threshold=0.75&eot_timeout_ms=1800
+```
+
+### Event Mapping
+| Deepgram Event | STT Event | Action |
+|---|---|---|
+| StartOfTurn | speech_started | Barge-in if speaking |
+| Update | transcript (isFinal: false) | Interim text |
+| EndOfTurn | transcript (isFinal: true) + utterance_end | → LLM processing |
+
+### Known Gotchas
+- `stt.finish()` sends Deepgram `Finalize` which splits active utterances — NEVER call during live speech
+- Text KeepAlive frames interleaved with binary audio cause Deepgram to choke — always use ws.ping()
+- Assistant must have provider: "deepgram" and model: "flux-general-en" saved in VapiClone
+
+---
+
+## Session 13 — March 19, 2026
+
+### V2 Infrastructure Upgrade
+- V2 folders, node_modules, GPU server prep, Ollama NUM_PARALLEL=8 + FLASH_ATTENTION=1
+- 8 concurrent LLM requests in 4.8s (stress tested)
+- VapiClone Settings page (server config card), assistant page (STT/LLM dropdowns)
+- Security hardening, LLM warmup, model manager updates
+- Deployed to /opt/voiceserverV2/ and Railway
+
+---
+
+## Session 12 — March 18, 2026
 
 ### MILESTONE: Full Voice Pipeline Perfect — Transfer with Spoken Message
 
@@ -231,18 +292,19 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 
 ---
 
-## Active Model Configuration
+## Active Model Configuration (V2)
 
 | Component | Model | VRAM | Status |
 |-----------|-------|------|--------|
-| **STT** | Whisper `small.en` | ~500MB | ✅ Active (persistent subprocess, default) |
-| **STT** | Deepgram Flux `flux-general-en` | 0 (cloud) | ✅ Available (needs `DEEPGRAM_API_KEY`) |
-| **LLM** | qwen3.5:9b | ~5-6GB | ✅ Active (Ollama) |
-| **TTS** | Kokoro-82M | ~500MB | ✅ Active (persistent subprocess) |
-| **TTS (cloning)** | Chatterbox Turbo | ~4.2GB | ✅ Available (persistent subprocess, idle timeout) |
-| TTS (cloning) | KokoClone | ~200MB | ✅ Available (one-off subprocess per synthesis) |
-| STT (deprecated) | IBM Granite 4.0 1B Speech | ~2GB | ❌ Removed from factory (code exists, not loaded) |
-| **Total VRAM during call** | | **~7GB** (up to ~11GB with Chatterbox) | Within 24GB RTX 4090 |
+| **STT** | Deepgram Flux `flux-general-en` | 0 (cloud) | ✅ PRODUCTION DEFAULT (needs `DEEPGRAM_API_KEY`) |
+| **STT** | Vosk `en-us-0.22` | 0 (CPU) | ⚠️ Installed but inaccurate on phone audio |
+| **STT** | Sherpa-ONNX | — | ❌ REMOVED from server (too small for phone audio) |
+| **LLM** | llama3.2:3b | ~2GB + KV cache | ✅ Active (Ollama, NUM_PARALLEL=8, FLASH_ATTENTION=1) |
+| **LLM** | qwen3:1.7b | ~1.4GB | ✅ Installed (switchable) |
+| **TTS** | Kokoro-82M | ~500MB | ✅ Active (persistent subprocess, 96x realtime) |
+| **TTS (cloning)** | KokoClone | ~200MB | ✅ Ready (kokoro-onnx + kanade-tokenizer) |
+| **TTS (cloning)** | Chatterbox Turbo | ~4.2GB | ❌ NOT installed (needs conda env) |
+| **Total VRAM during call** | | **~10GB** | 14GB headroom on 24GB RTX 4090 |
 
 ---
 
@@ -286,7 +348,8 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 | `src/index.ts` | Main entry — WebSocket (8765) + IPC HTTP (8766), session management, `/logs`, `/health/gpu`, `/metrics/history` endpoints |
 | `src/gpu-monitor.ts` | **GPU/CPU/Memory metrics** — nvidia-smi integration, ring buffer (3-day, 30s interval), snapshot collection |
 | `src/model-manager.ts` | Model lifecycle — install/activate/remove. Default STT: whisper/small.en |
-| `src/providers/stt/whisper.ts` | **Whisper STT — persistent Python subprocess**, module-level singleton, FIFO queue, keyword biasing |
+| `src/providers/stt/sherpa.ts` | **Sherpa-ONNX STT — persistent Python subprocess**, streaming, CPU-only, DEFAULT |
+| `src/providers/stt/whisper.ts` | Whisper STT — persistent Python subprocess, FIFO queue, keyword biasing (hallucinates on phone audio) |
 | `src/providers/stt/deepgram.ts` | **Deepgram Flux STT** — turn-based WebSocket streaming, native end-of-turn, keyterms |
 | `src/providers/stt/granite.ts` | Granite STT — deprecated, not loaded by provider factory |
 | `src/providers/tts/kokoro.ts` | **Kokoro-82M TTS — module-level singleton**, shared across all calls, binary PCM protocol |
@@ -302,7 +365,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 | `scripts/setup-gpu-server.sh` | **One-click bare metal setup** — installs all deps, pre-downloads models, configures PM2 |
 | `.github/workflows/deploy.yml` | GitHub Actions — SSH deploy to Vast.ai: syncs API keys (Twilio, Deepgram, etc.), pulls, builds, restarts PM2. Logs deployed commit hash. |
 
-### Current .env on Vast.ai (`/opt/voiceserver/.env`)
+### Current .env on Vast.ai (`/opt/voiceserverV2/.env`)
 
 ```env
 WS_PORT=8765
@@ -313,7 +376,7 @@ CLONED_VOICES_DIR=/data/cloned-voices
 CHATTERBOX_VOICES_DIR=/data/chatterbox-voices
 CONDA_PATH=/root/miniconda3/bin/conda
 OLLAMA_URL=http://localhost:11434/v1
-DEFAULT_LLM=qwen3.5:9b
+DEFAULT_LLM=llama3.2:3b
 NODE_ENV=production
 HF_HOME=/root/.cache/huggingface
 VAPICLONE_API_URL=https://vapiclone-production.up.railway.app
@@ -396,15 +459,15 @@ Twilio (phone call audio)
 [Audio Conversion] → PCM 16-bit 16kHz
     |
     v
-[STT: Whisper small.en persistent subprocess]
-  - Python process lives across all calls
-  - Sends JSON {"path", "keywords"} via stdin
-  - Gets transcript line via stdout
-  - Keywords bias recognition toward domain terms
+[STT: Sherpa-ONNX streaming (CPU, persistent subprocess)]
+  - Zipformer 20M English model
+  - Streams base64 PCM chunks via JSON stdin
+  - Gets real-time partial + final transcripts via stdout
+  - Native endpoint detection (no manual VAD)
     |
     v  text transcript
     |
-[LLM: Ollama qwen3.5:9b]
+[LLM: Ollama llama3.2:3b (NUM_PARALLEL=8, FLASH_ATTENTION=1)]
   - system prompt + conversation history + tools
   - 2000-token minimum for thinking models
   - Tool calling (transfer, end_call, webhooks)
@@ -445,9 +508,9 @@ Twilio → Caller hears AI response
 |---|---|
 | Runtime | Node.js 22+ (TypeScript) |
 | WebSocket | ws 8.18 |
-| STT | **Whisper small.en** (persistent subprocess, default), **Deepgram Flux** (cloud, native end-of-turn, paid) |
+| STT | **Sherpa-ONNX Zipformer** (persistent subprocess, CPU, default), **Deepgram Flux** (cloud, paid), Vosk (fallback) |
 | TTS | **Kokoro-82M** (module-level singleton, default), **Chatterbox Turbo** (voice cloning, conda env), KokoClone (voice cloning), Piper (fallback), ElevenLabs (paid) |
-| LLM | **Ollama + qwen3.5:9b** (default), OpenAI/DeepSeek (paid) |
+| LLM | **Ollama + llama3.2:3b** (default, NUM_PARALLEL=8), qwen3:1.7b (backup), OpenAI/DeepSeek (paid) |
 | GPU | NVIDIA RTX 4090 (24GB VRAM) on Vast.ai |
 | Process Manager | PM2 (auto-restart, boot persistence) |
 | Tunneling | Cloudflared quick tunnels (ephemeral URLs) |

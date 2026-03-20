@@ -1,6 +1,7 @@
 import type { STTConfig, STTProvider } from "./stt/interface";
 import type { TTSConfig, TTSProvider } from "./tts/interface";
 import type { LLMConfig, LLMProvider } from "./llm/interface";
+import { SherpaSTT } from "./stt/sherpa";
 import { VoskSTT } from "./stt/vosk";
 import { DeepgramSTT, DEEPGRAM_MODELS } from "./stt/deepgram";
 import { GraniteSTT } from "./stt/granite";
@@ -9,22 +10,22 @@ import { PiperTTS } from "./tts/piper";
 import { KokoroTTS } from "./tts/kokoro";
 import { KokoCloneTTS } from "./tts/kokoclone";
 import { ChatterboxTurboTTS } from "./tts/chatterbox";
+import { Qwen3TTS } from "./tts/qwen3";
+import { checkKokoroHealth } from "./tts/kokoro";
+import { checkQwen3Health } from "./tts/qwen3";
 import { modelManager } from "../model-manager";
 
 /**
- * Provider factory functions.
+ * Provider factory functions — V2 optimized for 10+ concurrent calls.
  *
  * STT providers (in order of recommendation):
- *   Deepgram Flux — cloud, paid, native end-of-turn detection, best for voice agents
- *   Granite 4.0 1B — self-hosted GPU, free, multimodal speech model
- *   Vosk — self-hosted CPU, free, lightweight fallback
+ *   Sherpa-ONNX — self-hosted CPU, streaming, native concurrency, best self-hosted accuracy
+ *   Deepgram Flux — cloud, paid, native end-of-turn detection
+ *   Vosk — self-hosted CPU, lightweight fallback
+ *   Granite 4.0 1B — self-hosted GPU, multimodal (limited concurrency)
  *
- * LLM: Ollama (qwen3.5:9b default, auto-pulled on first boot)
+ * LLM: Ollama with FLASH_ATTENTION + NUM_PARALLEL=8 (llama3.2:3b default)
  * TTS: Kokoro-82M (Piper as fallback)
- *
- * NOTE: Whisper and Parakeet were removed.
- *   Whisper hallucinates on 8kHz Twilio phone audio.
- *   Parakeet TDT requires NeMo which needs a newer CUDA driver than Vast.ai provides.
  */
 
 export function createSTTProvider(config: STTConfig): STTProvider {
@@ -43,9 +44,8 @@ export function createSTTProvider(config: STTConfig): STTProvider {
       const apiKey = process.env.DEEPGRAM_API_KEY;
       if (!apiKey) {
         console.warn("[providers] Deepgram requested but DEEPGRAM_API_KEY not set, falling back to Vosk");
-        return new VoskSTT(config);
+        return new VoskSTT({ ...config, model: config.model || "vosk-model-en-us-0.22" });
       }
-      // Validate model name — reject non-Deepgram model names sent by mistake
       const validDGModels = DEEPGRAM_MODELS.map(m => m.id);
       if (config.model && !validDGModels.includes(config.model)) {
         console.warn(`[providers] Invalid Deepgram model "${config.model}", defaulting to flux-general-en`);
@@ -57,19 +57,33 @@ export function createSTTProvider(config: STTConfig): STTProvider {
       console.log(`[providers] Using Deepgram STT (model=${config.model})`);
       return new DeepgramSTT(config, apiKey);
     }
+    case "sherpa":
+    case "sherpa-onnx":
+      // Sherpa-ONNX 20M model is too inaccurate for phone audio (mulaw 8kHz).
+      // Fall through to Vosk which handles telephony audio well.
+      console.log(`[providers] Sherpa-ONNX requested but too inaccurate for phone audio, using Vosk instead`);
+      return new VoskSTT({ ...config, model: "vosk-model-en-us-0.22" });
+    case "vosk":
+      console.log(`[providers] Using Vosk STT (model=${config.model || "vosk-model-en-us-0.22"})`);
+      return new VoskSTT({ ...config, model: config.model || "vosk-model-en-us-0.22" });
     case "granite":
       console.log(`[providers] Using Granite STT (model=${config.model || "ibm-granite/granite-4.0-1b-speech"})`);
       return new GraniteSTT(config);
-    case "vosk":
-      console.log(`[providers] Using Vosk STT (model=${config.model || "vosk-model-small-en-us-0.15"})`);
-      return new VoskSTT(config);
     default:
-      // Default to Vosk (free, CPU, works everywhere)
-      console.log(`[providers] Defaulting to Vosk STT`);
-      return new VoskSTT(config);
+      // Default to Vosk large model (accurate on phone audio, CPU-only, proven in V1)
+      console.log(`[providers] Defaulting to Vosk STT (large model)`);
+      return new VoskSTT({ ...config, model: "vosk-model-en-us-0.22" });
   }
 }
 
+/**
+ * Create a TTS provider with fallback awareness.
+ * For HTTP-based providers (kokoro, qwen3), the health check happens at synthesis time --
+ * if the service is down, the HTTP request will fail and the error propagates to call-session
+ * which handles it gracefully (logs error, signals onDone so session doesn't hang).
+ *
+ * Fallback chain: qwen3 -> kokoro -> piper (CPU, always available)
+ */
 export function createTTSProvider(config: TTSConfig): TTSProvider {
   // Use active TTS from model-manager as default if not specified in config
   if (!config.voiceId && !config.provider) {
@@ -106,6 +120,9 @@ export function createTTSProvider(config: TTSConfig): TTSProvider {
     case "chatterbox":
     case "chatterbox-turbo":
       return new ChatterboxTurboTTS(config);
+    case "qwen3":
+    case "qwen3-tts":
+      return new Qwen3TTS(config);
     case "piper":
       return new PiperTTS(config);
     default:

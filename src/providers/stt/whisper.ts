@@ -35,7 +35,14 @@ interface QueueEntry {
 const transcriptionQueue: QueueEntry[] = [];
 let activeEntry: QueueEntry | null = null;
 
+function sanitizePythonString(s: string): string {
+  // Only allow alphanumeric, dots, hyphens, underscores, slashes (for HF model IDs)
+  return s.replace(/[^a-zA-Z0-9.\-_\/]/g, "");
+}
+
 function buildWhisperScript(modelSize: string, language: string): string {
+  const safeModel = sanitizePythonString(modelSize);
+  const safeLang = sanitizePythonString(language);
   return `
 import sys, json
 
@@ -45,8 +52,8 @@ sys.stdout = sys.stderr
 
 from faster_whisper import WhisperModel
 
-model_size = "${modelSize}"
-language = "${language}"
+model_size = "${safeModel}"
+language = "${safeLang}"
 
 print(f"WHISPER_LOADING model={model_size}", flush=True)
 
@@ -292,8 +299,18 @@ export class WhisperSTT extends EventEmitter implements STTProvider {
     });
   }
 
+  // Max audio buffer: 10MB (~5 minutes of 16kHz 16-bit mono audio)
+  private static readonly MAX_AUDIO_BUFFER_BYTES = 10 * 1024 * 1024;
+
   send(audio: Buffer): void {
     if (this.closed) return;
+
+    // Prevent unbounded buffer growth (DoS protection)
+    const currentSize = this.audioBuffer.reduce((sum, b) => sum + b.length, 0);
+    if (currentSize > WhisperSTT.MAX_AUDIO_BUFFER_BYTES) {
+      console.warn("[stt/whisper] Audio buffer exceeded 10MB limit, flushing old audio");
+      this.audioBuffer = this.audioBuffer.slice(-Math.floor(this.audioBuffer.length / 2));
+    }
 
     this.audioBuffer.push(audio);
 

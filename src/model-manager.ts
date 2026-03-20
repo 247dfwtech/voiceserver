@@ -1,13 +1,12 @@
 /**
- * Model Manager -- Manages LLM (Ollama), STT (Granite/Vosk/Deepgram), and TTS (Kokoro/Piper) models.
+ * Model Manager -- Manages LLM (Ollama), STT (Sherpa-ONNX/Vosk/Granite/Deepgram), and TTS (Kokoro/Piper) models.
  *
- * Default STT: Vosk (CPU-only, lightweight, works everywhere)
+ * V2: Optimized for 10+ concurrent calls.
+ * Default STT: Sherpa-ONNX (CPU streaming, native concurrency up to 500 connections)
+ * Fallback STT: Vosk (CPU-only, lightweight)
  * GPU STT: IBM Granite 4.0 1B Speech (self-hosted, keyword biasing)
  * Cloud STT: Deepgram Flux (paid, native end-of-turn detection)
- *
- * NOTE: Whisper and Parakeet were removed.
- *   Whisper hallucinates on 8kHz Twilio phone audio.
- *   Parakeet TDT requires NeMo which needs a newer CUDA driver than Vast.ai provides.
+ * Default LLM: llama3.2:3b (ultra-fast, 2GB VRAM, 0.7s first-speech)
  *
  * Default TTS: Kokoro-82M (#1 TTS Arena, near-human quality, Apache 2.0)
  * Fallback TTS: Piper (ultra-lightweight CPU option)
@@ -39,16 +38,16 @@ export interface InstalledModel {
   installedAt: string;
 }
 
-export type STTProviderName = "vosk" | "granite" | "deepgram";
+export type STTProviderName = "sherpa" | "vosk" | "granite" | "deepgram";
 
 export interface ModelConfig {
   activeLLM: { provider: "ollama"; model: string } | null;
   activeSTT: { provider: STTProviderName; model: string } | null;
-  activeTTS: { provider: "kokoro" | "piper" | "chatterbox"; voice: string } | null;
+  activeTTS: { provider: "kokoro" | "piper" | "chatterbox" | "qwen3"; voice: string } | null;
   installedModels: {
     llm: Array<{ name: string; size: string; provider: "ollama"; installedAt: string }>;
     stt: Array<{ name: string; size: string; provider: STTProviderName; installedAt: string }>;
-    tts: Array<{ name: string; size: string; provider: "kokoro" | "piper" | "chatterbox"; installedAt: string }>;
+    tts: Array<{ name: string; size: string; provider: "kokoro" | "piper" | "chatterbox" | "qwen3"; installedAt: string }>;
   };
 }
 
@@ -66,6 +65,17 @@ export interface HuggingFaceSearchResult {
   likes: number;
   description: string;
 }
+
+// ---- Sherpa-ONNX model catalog (CPU STT, streaming, best concurrency) ----
+
+const SHERPA_MODEL_CATALOG: STTModelInfo[] = [
+  {
+    name: "sherpa-onnx-streaming-zipformer-en-20M",
+    size: "~20MB",
+    description: "Zipformer 20M English, CPU streaming, native concurrency (DEFAULT)",
+    provider: "sherpa",
+  },
+];
 
 // ---- Vosk model catalog (CPU STT) ----
 
@@ -179,7 +189,7 @@ export class ModelManager {
   }
 
   // Default LLM to auto-pull on first boot if no LLM is configured
-  private static readonly DEFAULT_LLM = "qwen3.5:9b";
+  private static readonly DEFAULT_LLM = "llama3.2:3b";
 
   private defaultConfig(): ModelConfig {
     return {
@@ -366,11 +376,11 @@ export class ModelManager {
       tts: TTSVoiceInfo[];
     };
   }> {
-    // Sync with Ollama to get the real list
+    // Sync with Ollama and STT filesystem to get the real lists
     await this.syncLLMModels();
+    const installedSTT = await this.listSTTModels();
 
     const activeLLMName = this.config.activeLLM?.model ?? null;
-    const activeSTTName = this.config.activeSTT?.model ?? null;
     const activeTTSName = this.config.activeTTS?.voice ?? null;
 
     return {
@@ -382,10 +392,7 @@ export class ModelManager {
           ...m,
           active: m.name === activeLLMName,
         })),
-        stt: this.config.installedModels.stt.map((m) => ({
-          ...m,
-          active: m.name === activeSTTName,
-        })),
+        stt: installedSTT,
         tts: this.config.installedModels.tts.map((m) => ({
           ...m,
           active: m.name === activeTTSName,
@@ -393,6 +400,7 @@ export class ModelManager {
       },
       available: {
         stt: [
+          ...SHERPA_MODEL_CATALOG,
           ...VOSK_MODEL_CATALOG,
           ...GRANITE_MODEL_CATALOG,
         ],
@@ -587,11 +595,33 @@ export class ModelManager {
     return { success: true };
   }
 
-  // ---- STT Management (Granite + Whisper) ----
+  // ---- STT Management (Sherpa-ONNX + Vosk + Granite) ----
 
   async listSTTModels(): Promise<Array<InstalledModel & { active: boolean }>> {
     const activeSTT = this.config.activeSTT;
     const installed: Array<InstalledModel & { active: boolean }> = [];
+
+    // Check for installed Sherpa-ONNX models
+    const SHERPA_MODELS_DIR = process.env.SHERPA_MODELS_DIR || "/models/sherpa-onnx";
+    try {
+      const sherpaEntries = await fs.promises.readdir(SHERPA_MODELS_DIR, { withFileTypes: true });
+      for (const entry of sherpaEntries) {
+        if (entry.isDirectory() && entry.name.includes("sherpa")) {
+          // Match catalog by partial name (directory may have date suffix like -2023-02-17)
+          const catalogEntry = SHERPA_MODEL_CATALOG.find((c) => entry.name.startsWith(c.name));
+          const displayName = catalogEntry?.name || entry.name;
+          installed.push({
+            name: displayName,
+            size: catalogEntry?.size || "~20MB",
+            provider: "sherpa",
+            installedAt: "",
+            active: activeSTT?.provider === "sherpa",
+          });
+        }
+      }
+    } catch {
+      // Sherpa directory may not exist yet
+    }
 
     // Check for installed Vosk models
     try {
@@ -666,6 +696,7 @@ export class ModelManager {
 
   getSTTCatalog(): STTModelInfo[] {
     return [
+      ...SHERPA_MODEL_CATALOG,
       ...VOSK_MODEL_CATALOG,
       ...GRANITE_MODEL_CATALOG,
     ];
@@ -676,9 +707,14 @@ export class ModelManager {
     provider?: STTProviderName
   ): Promise<{ success: boolean; error?: string }> {
     // Auto-detect provider from model name
+    const isSherpa = provider === "sherpa" || name.includes("sherpa");
     const isGranite = provider === "granite" || name.includes("granite");
     const isVosk = provider === "vosk" || name.includes("vosk");
 
+    if (isSherpa) {
+      // Sherpa-ONNX models are pre-installed on the GPU server — just activate
+      return { success: true };
+    }
     if (isVosk) {
       return this.installVoskModel(name);
     }
@@ -857,12 +893,13 @@ print('ok')
   ): Promise<{ success: boolean; error?: string }> {
     // Auto-detect provider from name
     const resolvedProvider = provider
-      || (name.includes("vosk") ? "vosk" as const
+      || (name.includes("sherpa") ? "sherpa" as const
+        : name.includes("vosk") ? "vosk" as const
         : name.includes("granite") ? "granite" as const
-        : "vosk" as const);
+        : "sherpa" as const);
 
     // Check if model is in catalog or installed
-    const allCatalogs = [...VOSK_MODEL_CATALOG, ...GRANITE_MODEL_CATALOG];
+    const allCatalogs = [...SHERPA_MODEL_CATALOG, ...VOSK_MODEL_CATALOG, ...GRANITE_MODEL_CATALOG];
     const inCatalog = allCatalogs.some((m) => m.name === name);
     const inInstalled = this.config.installedModels.stt.some((m) => m.name === name);
 

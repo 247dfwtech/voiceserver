@@ -62,6 +62,7 @@ class CostTracker {
       piper: 0.0,
       kokoro: 0.0,
       chatterbox: 0.0,
+      qwen3: 0.0,
     } as Record<string, number>,
     transport: { twilio: parseFloat(process.env.COST_TRANSPORT_TWILIO || "0.014") },
   };
@@ -389,17 +390,17 @@ export class CallSession extends EventEmitter {
       // TTS synthesis finishes in ~1s but audio plays for 10-15s on the phone.
       // Estimate playback: ~60ms per character is a rough TTS duration heuristic.
       const estimatedPlaybackMs = Math.max(firstMsg.length * 60, 5000);
-      setTimeout(async () => {
-        // Flush STT internal state BEFORE clearing the flag — streaming providers
-        // (Vosk) may emit stale transcripts from audio heard during first message.
-        // Those transcripts will be discarded by handleTranscript since playingFirstMessage
-        // is still true during the flush.
-        if (this.stt) {
-          try { await this.stt.finish(); } catch {}
-        }
+      setTimeout(() => {
+        // Don't call stt.finish() here — it sends Deepgram "Finalize" which
+        // forces a transcript boundary, splitting the user's sentence in half.
+        // The first half gets discarded (playingFirstMessage still true) and only
+        // the tail end comes through. Deepgram handles echo/silence natively.
+        //
+        // For Vosk/local STT: any accumulated noise transcripts during first message
+        // are simply cleared by resetting currentTranscript below.
         this.playingFirstMessage = false;
-        // Discard any sub-threshold words that were said during first message
         this.currentTranscript = "";
+        console.log(`[session:${this.config.callId}] First message playback window ended (${estimatedPlaybackMs}ms)`);
       }, estimatedPlaybackMs);
       this.conversationHistory.push({ role: "assistant", content: firstMsg });
       this.fullTranscript.push({ role: "AI", content: firstMsg });
@@ -409,13 +410,52 @@ export class CallSession extends EventEmitter {
     }
   }
 
+  // Debug: capture first 5s of PCM audio to WAV for analysis
+  private debugAudioChunks: Buffer[] = [];
+  private debugAudioSaved = false;
+
   /** Feed raw Twilio mu-law base64 audio into the pipeline */
   handleAudio(base64Audio: string): void {
-    if (this.state === "ended") return;
+    if (this.state === "ended" || this.state === "initializing") return;
 
     const mulaw = decodeBase64Audio(base64Audio);
 
     this.audioChunkCount++;
+
+    // Debug: capture audio at 15-20s mark (750-1000 chunks) — after first message, when user speaks
+    const CAPTURE_START = 750;  // 15 seconds in
+    const CAPTURE_END = 1000;   // 20 seconds in
+    if (!this.debugAudioSaved && this.audioChunkCount >= CAPTURE_START && this.audioChunkCount <= CAPTURE_END) {
+      this.debugAudioChunks.push(mulawToPcm16k(mulaw));
+      // Also save raw mulaw for comparison
+      if (this.audioChunkCount === CAPTURE_START) {
+        console.log(`[session:${this.config.callId}] DEBUG: Starting audio capture at chunk ${CAPTURE_START} (${CAPTURE_START*20/1000}s into call)`);
+        console.log(`[session:${this.config.callId}] DEBUG: mulaw chunk size=${mulaw.length}, mulaw bytes=[${Array.from(mulaw.slice(0,20)).join(',')}]`);
+      }
+      if (this.audioChunkCount === CAPTURE_END) {
+        this.debugAudioSaved = true;
+        const allPcm = Buffer.concat(this.debugAudioChunks);
+        // Write WAV header + PCM data
+        const wavHeader = Buffer.alloc(44);
+        wavHeader.write("RIFF", 0);
+        wavHeader.writeUInt32LE(36 + allPcm.length, 4);
+        wavHeader.write("WAVE", 8);
+        wavHeader.write("fmt ", 12);
+        wavHeader.writeUInt32LE(16, 16); // chunk size
+        wavHeader.writeUInt16LE(1, 20); // PCM
+        wavHeader.writeUInt16LE(1, 22); // mono
+        wavHeader.writeUInt32LE(16000, 24); // sample rate
+        wavHeader.writeUInt32LE(32000, 28); // byte rate
+        wavHeader.writeUInt16LE(2, 32); // block align
+        wavHeader.writeUInt16LE(16, 34); // bits per sample
+        wavHeader.write("data", 36);
+        wavHeader.writeUInt32LE(allPcm.length, 40);
+        const wav = Buffer.concat([wavHeader, allPcm]);
+        require("fs").writeFileSync(`/tmp/debug_call_audio_${this.config.callId.slice(0,8)}.wav`, wav);
+        console.log(`[session:${this.config.callId}] DEBUG: Saved 5s audio to /tmp/debug_call_audio_${this.config.callId.slice(0,8)}.wav (${allPcm.length} bytes PCM, ${allPcm.length/32000}s)`);
+        this.debugAudioChunks = [];
+      }
+    }
 
     // Track STT cost: each chunk is 20ms of audio
     this.costTracker.addSTTUsage(0.02);
@@ -854,8 +894,11 @@ export class CallSession extends EventEmitter {
   private resetSilenceTimer(): void {
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
     this.silenceTimer = setTimeout(() => {
-      if (this.state !== "ended" && this.state !== "speaking") {
+      if (this.state !== "ended" && this.state !== "speaking" && !this.playingFirstMessage) {
         this.endCall("silence-timed-out");
+      } else if (this.playingFirstMessage) {
+        // First message still playing — restart silence timer, don't end call
+        this.resetSilenceTimer();
       }
     }, this.config.silenceTimeout * 1000);
   }
