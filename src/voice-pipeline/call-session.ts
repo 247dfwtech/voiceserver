@@ -30,6 +30,7 @@ export interface CostBreakdown {
   llm: number;
   tts: number;
   transport: number;
+  analysis: number;
   total: number;
 }
 
@@ -111,6 +112,7 @@ class CostTracker {
       llm: Math.round(llmCost * 10000) / 10000,
       tts: Math.round(ttsCost * 10000) / 10000,
       transport: Math.round(transportCost * 10000) / 10000,
+      analysis: 0, // Set post-call by notifyCallEnded
       total: Math.round(total * 10000) / 10000,
     };
   }
@@ -123,6 +125,7 @@ class VoicemailDetector {
   private analysisWindowSeconds: number;
   private speechThreshold: number;
   private continuousSpeechFramesThreshold: number;
+  private initialDelayFrames: number;
   private audioFrames: number[] = [];
   private speechFrameCount = 0;
   private silenceFrameCount = 0;
@@ -132,11 +135,17 @@ class VoicemailDetector {
   private resolved = false;
   private result: VMDetectionResult = "unknown";
   private resolveCallback: ((result: VMDetectionResult) => void) | null = null;
+  private attemptsRemaining: number;
 
-  constructor(config: { analysisWindowSeconds?: number; speechThreshold?: number; continuousSpeechFramesThreshold?: number; twilioAmdResult?: string } = {}) {
+  constructor(config: { analysisWindowSeconds?: number; speechThreshold?: number; continuousSpeechFramesThreshold?: number; twilioAmdResult?: string; initialDelaySeconds?: number; maxRetries?: number; provider?: string } = {}) {
     this.analysisWindowSeconds = config.analysisWindowSeconds ?? 5;
     this.speechThreshold = config.speechThreshold ?? 300;
     this.continuousSpeechFramesThreshold = config.continuousSpeechFramesThreshold ?? 150; // 150 * 20ms = 3s of unbroken speech
+    this.initialDelayFrames = Math.round(((config.initialDelaySeconds ?? 1) * 1000) / 20); // convert seconds to 20ms frames
+    this.attemptsRemaining = config.maxRetries ?? 3;
+
+    // Skip audio analysis if provider is "twilio" only
+    const useAudio = config.provider !== "twilio";
 
     if (config.twilioAmdResult) {
       const amd = config.twilioAmdResult.toLowerCase();
@@ -148,6 +157,11 @@ class VoicemailDetector {
         this.resolved = true;
       }
     }
+
+    // If provider is twilio-only and no AMD result yet, we'll wait for it to be forced later
+    if (!useAudio && !this.resolved) {
+      // Will rely on forceResult() being called from status callback
+    }
   }
 
   analyzeFrame(pcmAudio: Buffer): void {
@@ -156,6 +170,9 @@ class VoicemailDetector {
     const rms = calculateRMS(pcmAudio);
     this.audioFrames.push(rms);
     this.totalFrames++;
+
+    // Skip analysis during initial delay
+    if (this.totalFrames < this.initialDelayFrames) return;
 
     const isSpeech = rms > this.speechThreshold;
 
@@ -241,6 +258,13 @@ export interface CallSessionConfig {
   silenceTimeout: number;
   voicemailMessage?: string;
   voicemailDetectionEnabled?: boolean;
+  voicemailDetectionConfig?: {
+    provider?: string; // "twilio" | "audio" | "both"
+    initialDelaySeconds?: number;
+    analysisWindowSeconds?: number;
+    maxRetries?: number;
+    maxVoicemailWaitSeconds?: number;
+  };
   customerNumber: string;
   customerName?: string;
   variableValues?: Record<string, string>;
@@ -292,6 +316,7 @@ export class CallSession extends EventEmitter {
   private utteranceDelayTimer: ReturnType<typeof setTimeout> | null = null;
   private playingFirstMessage = false; // true while first message TTS is playing — ignore user speech
   private pendingAudioDurationMs = 0; // tracks audio duration queued but not yet played by Twilio
+  private lastBargeInAt: number | null = null; // timestamp of last barge-in for backoff
 
   constructor(config: CallSessionConfig) {
     super();
@@ -357,8 +382,13 @@ export class CallSession extends EventEmitter {
 
     // Initialize voicemail detection if enabled
     if (this.config.voicemailDetectionEnabled) {
+      const vmConfig = this.config.voicemailDetectionConfig || {};
       this.voicemailDetector = new VoicemailDetector({
         twilioAmdResult: this.config.twilioAmdResult,
+        analysisWindowSeconds: vmConfig.analysisWindowSeconds,
+        initialDelaySeconds: vmConfig.initialDelaySeconds,
+        maxRetries: vmConfig.maxRetries,
+        provider: vmConfig.provider,
       });
 
       if (this.voicemailDetector.isResolved() && this.voicemailDetector.getCurrentResult() === "voicemail") {
@@ -659,6 +689,21 @@ export class CallSession extends EventEmitter {
     this.conversationHistory.push({ role: "user", content: userText });
 
     this.emit("user_speech", userText);
+
+    // Apply backoff delay after a barge-in before assistant responds
+    const backoffSeconds = this.config.stopSpeakingPlan?.backoffSeconds ?? 0;
+    if (backoffSeconds > 0 && this.lastBargeInAt) {
+      const elapsed = (Date.now() - this.lastBargeInAt) / 1000;
+      const remaining = backoffSeconds - elapsed;
+      if (remaining > 0) {
+        console.log(`[session:${this.config.callId}] Backoff: waiting ${remaining.toFixed(1)}s after barge-in before responding`);
+        setTimeout(() => {
+          if (this.state !== "ended") this.processWithLLM();
+        }, remaining * 1000);
+        return;
+      }
+    }
+
     this.processWithLLM();
   }
 
@@ -819,6 +864,7 @@ export class CallSession extends EventEmitter {
     }
     this.isSpeaking = false;
     this.pendingAudioDurationMs = 0;
+    this.lastBargeInAt = Date.now();
     this.emit("clear_audio");
   }
 

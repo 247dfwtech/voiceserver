@@ -357,11 +357,16 @@ async function notifyCallEnded(
   config: CallSessionConfig
 ): Promise<void> {
   // Run post-call analysis if configured
-  let analysis: { summary?: string; successEvaluation?: string } = {};
+  let analysis: { summary?: string; successEvaluation?: string; analysisCost?: number; analysisProvider?: string; analysisModel?: string } = {};
   const analysisConfig = config.analysisConfig;
   if (analysisConfig) {
     try {
       analysis = await runPostCallAnalysis(endData.transcript, analysisConfig);
+      // Add analysis cost to the cost breakdown
+      if (analysis.analysisCost && analysis.analysisCost > 0) {
+        endData.cost.analysis = analysis.analysisCost;
+        endData.cost.total = Math.round((endData.cost.total + analysis.analysisCost) * 10000) / 10000;
+      }
     } catch (err) {
       console.error(`[voice-server] Analysis failed for ${callId}:`, err);
     }
@@ -921,6 +926,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     openai_api_key: { envKey: "OPENAI_API_KEY", sensitive: true },
     elevenlabs_api_key: { envKey: "ELEVENLABS_API_KEY", sensitive: true },
     deepseek_api_key: { envKey: "DEEPSEEK_API_KEY", sensitive: true },
+    openrouter_api_key: { envKey: "OPENROUTER_API_KEY", sensitive: true },
     twilio_account_sid: { envKey: "TWILIO_ACCOUNT_SID", sensitive: true },
     twilio_auth_token: { envKey: "TWILIO_AUTH_TOKEN", sensitive: true },
     default_llm: { envKey: "DEFAULT_LLM", sensitive: false },
