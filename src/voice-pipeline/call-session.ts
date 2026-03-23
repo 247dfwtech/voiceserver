@@ -718,9 +718,9 @@ export class CallSession extends EventEmitter {
   private handleTranscript(text: string, isFinal: boolean): void {
     if (this.state === "ended") return;
 
-    // While voicemail detection is pending, ignore ALL transcripts
-    // The greeting audio would otherwise be processed by the LLM and trigger actions
-    if (this.voicemailDetector && !this.voicemailDetector.isResolved()) {
+    // Suppress transcripts while voicemail detection is pending OR after voicemail confirmed.
+    // Without this, the greeting audio gets transcribed and the LLM responds to it.
+    if (this.voicemailDetector && (!this.voicemailDetector.isResolved() || this.voicemailDetector.getCurrentResult() === "voicemail")) {
       return;
     }
 
@@ -1183,7 +1183,7 @@ export class CallSession extends EventEmitter {
     this.emit("clear_audio");
   }
 
-  private waitForTTSFinish(timeoutMs: number = 30000): Promise<void> {
+  private waitForTTSFinish(timeoutMs: number = 30000, maxPlaybackMs: number = 10000): Promise<void> {
     // Wait for TTS synthesis to complete, then wait for Twilio to play the audio.
     // pendingAudioDurationMs tracks how much audio was queued — we wait that long
     // after synthesis finishes so the caller actually hears the message.
@@ -1191,7 +1191,7 @@ export class CallSession extends EventEmitter {
     return new Promise((resolve) => {
       if (!this.isSpeaking) {
         // TTS just finished or hasn't started — wait for any pending audio to play
-        const waitMs = Math.min(this.pendingAudioDurationMs, 10000);
+        const waitMs = Math.min(this.pendingAudioDurationMs, maxPlaybackMs);
         this.pendingAudioDurationMs = 0;
         setTimeout(resolve, waitMs > 0 ? waitMs : 500);
         return;
@@ -1202,7 +1202,7 @@ export class CallSession extends EventEmitter {
           clearTimeout(timeout);
           // Synthesis done — now wait for Twilio to play the audio
           const audioMs = this.pendingAudioDurationMs - startPending;
-          const waitMs = Math.min(Math.max(audioMs, 1000), 10000);
+          const waitMs = Math.min(Math.max(audioMs, 1000), maxPlaybackMs);
           this.pendingAudioDurationMs = 0;
           setTimeout(resolve, waitMs);
         }
@@ -1283,7 +1283,8 @@ export class CallSession extends EventEmitter {
         // speak() sets isSpeaking=false when synthesis completes (~0.08s for Kokoro),
         // but Twilio needs the full playback duration to play the audio. waitForTTSFinish
         // tracks pendingAudioDurationMs and waits that long after synthesis ends.
-        await this.waitForTTSFinish(15000);
+        // Voicemail messages can be long — allow up to 30s of playback (vs 10s default for conversation).
+        await this.waitForTTSFinish(45000, 30000);
         console.log(`[session:${this.config.callId}] Voicemail message playback complete`);
 
         // endCall guards against double-call internally
