@@ -1281,10 +1281,12 @@ export class CallSession extends EventEmitter {
 
         // Wait for TTS synthesis to finish AND for the audio to actually play on the phone.
         // speak() sets isSpeaking=false when synthesis completes (~0.08s for Kokoro),
-        // but Twilio needs the full playback duration to play the audio. waitForTTSFinish
-        // tracks pendingAudioDurationMs and waits that long after synthesis ends.
-        // Voicemail messages can be long — allow up to 30s of playback (vs 10s default for conversation).
-        await this.waitForTTSFinish(45000, 30000);
+        // but Twilio needs the full playback duration. pendingAudioDurationMs tracks the
+        // exact audio length — no artificial cap so any message length works.
+        // 2s buffer added for network latency between voiceserver and Twilio/SignalWire.
+        await this.waitForTTSFinish(60000, 60000);
+        // Extra 2s buffer for network/jitter — audio may still be in transit
+        await new Promise(r => setTimeout(r, 2000));
         console.log(`[session:${this.config.callId}] Voicemail message playback complete`);
 
         // endCall guards against double-call internally
