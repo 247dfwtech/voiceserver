@@ -1274,25 +1274,21 @@ export class CallSession extends EventEmitter {
 
     if (this.config.voicemailMessage) {
       // Short 500ms pause after beep detected before speaking (DetectMessageEnd already waited for beep)
-      setTimeout(() => {
+      setTimeout(async () => {
         if (this.state === "ended") return;
         console.log(`[session:${this.config.callId}] Delivering voicemail message`);
         this.speak(this.config.voicemailMessage!);
         this.fullTranscript.push({ role: "AI", content: `[Voicemail] ${this.config.voicemailMessage}` });
 
-        const checkDone = setInterval(() => {
-          if (!this.isSpeaking && this.state !== "ended") {
-            clearInterval(checkDone);
-            this.endCall("voicemail");
-          }
-        }, 500);
+        // Wait for TTS synthesis to finish AND for the audio to actually play on the phone.
+        // speak() sets isSpeaking=false when synthesis completes (~0.08s for Kokoro),
+        // but Twilio needs the full playback duration to play the audio. waitForTTSFinish
+        // tracks pendingAudioDurationMs and waits that long after synthesis ends.
+        await this.waitForTTSFinish(15000);
+        console.log(`[session:${this.config.callId}] Voicemail message playback complete`);
 
-        setTimeout(() => {
-          clearInterval(checkDone);
-          if (this.state !== "ended") {
-            this.endCall("voicemail");
-          }
-        }, 15000);
+        // endCall guards against double-call internally
+        this.endCall("voicemail");
       }, 500);
     } else {
       this.endCall("voicemail");
