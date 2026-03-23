@@ -844,13 +844,13 @@ export class CallSession extends EventEmitter {
         // Find the tool definition
         const tool = this.config.tools.find(t => t.name === tp.toolName || t.type === tp.toolName);
         if (tool) {
-          // Synthesize a tool call
+          // Synthesize a tool call — wait for TTS to finish so caller hears the phrase
           const toolCall: LLMToolCall = {
             id: `trigger-${Date.now()}`,
             type: "function",
             function: { name: tool.name || tp.toolName, arguments: "{}" },
           };
-          this.handleToolCall(toolCall);
+          this.waitForTTSFinish().then(() => this.handleToolCall(toolCall));
         } else if (tp.toolName === "end_call" || tp.toolName === "endCall") {
           // Built-in end call
           this.waitForTTSFinish().then(() => this.endCall("assistant-ended-call"));
@@ -905,6 +905,7 @@ export class CallSession extends EventEmitter {
 
     // In trigger-phrases mode, don't send tools to the LLM
     const useTriggerPhrases = this.config.toolMode === "trigger-phrases";
+    let deferredToolCall: LLMToolCall | null = null;
     console.log(`[session:${this.config.callId}] LLM dispatch: toolMode=${this.config.toolMode || "not-set"}, tools=${this.config.tools.length}, triggerPhrases=${(this.config.triggerPhrases || []).length}, useTriggerPhrases=${useTriggerPhrases}`);
 
     const llmTools: LLMToolDefinition[] = useTriggerPhrases ? [] : this.config.tools
@@ -991,8 +992,13 @@ export class CallSession extends EventEmitter {
         if (remaining) {
           fullResponse = "";
           this.speak(remaining);
+          this.handleToolCall(toolCall);
+        } else {
+          // LLM produced tool call with NO text — defer execution
+          // Will retry for spoken text in onDone, then execute
+          console.log(`[session:${this.config.callId}] LLM tool call with no text — deferring: ${toolCall.function.name}`);
+          deferredToolCall = toolCall;
         }
-        this.handleToolCall(toolCall);
       },
       onDone: (text: string) => {
         releaseOllamaSlot();
@@ -1038,6 +1044,47 @@ export class CallSession extends EventEmitter {
               }
               this.state = "waiting_for_speech";
               this.resetSilenceTimer();
+            },
+          });
+          return;
+        }
+
+        // If LLM produced only a tool call with no text in tools mode,
+        // retry to get spoken text, then execute the deferred tool
+        if (!useTriggerPhrases && deferredToolCall && !remaining) {
+          console.log(`[session:${this.config.callId}] LLM produced only tool call, no text — retrying for speech before executing ${deferredToolCall.function.name}`);
+          const savedToolCall = deferredToolCall;
+          const cleanMessages = this.conversationHistory.filter(
+            (m: any) => m.role !== "tool" && !m.tool_calls && !m.tool_call_id
+          );
+          cleanMessages.push({
+            role: "system",
+            content: "Respond naturally to the customer. Do not attempt to call any functions or tools. Just speak your response out loud.",
+          });
+          this.llm!.streamCompletion({
+            messages: cleanMessages,
+            onToken: (token: string) => {
+              fullResponse += token;
+              if (this.shouldStartTTS(fullResponse)) {
+                const sentence = this.extractCompleteSentence(fullResponse);
+                if (sentence) {
+                  fullResponse = fullResponse.slice(sentence.length).trimStart();
+                  this.speak(sentence);
+                }
+              }
+            },
+            onToolCall: () => { /* Ignore tool calls on retry */ },
+            onDone: (retryText: string) => {
+              const retryRemaining = (fullResponse || retryText).trim();
+              if (retryRemaining && !this.isSpeaking) {
+                this.speak(retryRemaining);
+              }
+              if (retryText) {
+                this.conversationHistory.push({ role: "assistant", content: retryText });
+                this.fullTranscript.push({ role: "AI", content: retryText });
+              }
+              // NOW execute the deferred tool (after text has been queued for TTS)
+              this.handleToolCall(savedToolCall);
             },
           });
           return;
