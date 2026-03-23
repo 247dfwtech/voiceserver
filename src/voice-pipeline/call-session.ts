@@ -389,6 +389,7 @@ export class CallSession extends EventEmitter {
   private currentTTSCancel: (() => void) | null = null;
   private currentLLMCancel: (() => void) | null = null;
   private isSpeaking = false;
+  private deliveringVoicemail = false;
 
   private costTracker: CostTracker;
   public voicemailDetector: VoicemailDetector | null = null;
@@ -1253,6 +1254,7 @@ export class CallSession extends EventEmitter {
   }
 
   private resetSilenceTimer(): void {
+    if (this.deliveringVoicemail) return;
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
     this.silenceTimer = setTimeout(() => {
       if (this.state !== "ended" && this.state !== "speaking" && !this.playingFirstMessage) {
@@ -1270,6 +1272,10 @@ export class CallSession extends EventEmitter {
 
     // Cancel any ongoing speech (first message playing over greeting)
     this.cancelSpeaking();
+
+    // Disable silence timer — voicemail playback can be 30s+ and must not be interrupted
+    this.deliveringVoicemail = true;
+    if (this.silenceTimer) clearTimeout(this.silenceTimer);
 
     if (this.config.voicemailMessage) {
       // Short 500ms pause after beep detected before speaking (DetectMessageEnd already waited for beep)
