@@ -166,7 +166,7 @@ wss.on("connection", (ws: WebSocket) => {
           break;
 
         case "start": {
-          streamSid = msg.streamSid;
+          streamSid = msg.streamSid || msg.start?.streamSid || null;
           callId = msg.start?.customParameters?.callId || null;
 
           if (!callId) {
@@ -182,6 +182,10 @@ wss.on("connection", (ws: WebSocket) => {
             );
             ws.close(1013, "Max concurrent calls reached");
             return;
+          }
+
+          if (!streamSid) {
+            console.warn(`[voice-server] WARNING: No streamSid in start event — outbound audio will not work!`);
           }
 
           console.log(
