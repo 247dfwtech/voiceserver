@@ -410,6 +410,8 @@ async function notifyCallEnded(
           cost: endData.cost,
           sttProvider: config.transcriber?.provider || "unknown",
           sttModel: config.transcriber?.model || "unknown",
+          llmProvider: config.model?.provider || "ollama",
+          llmModel: config.model?.model || "unknown",
           analysis,
           overflow: endData.overflow,
           customer: {
