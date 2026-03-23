@@ -276,7 +276,7 @@ for line in sys.stdin:
         ref_audio = ref_cache[ref_path]
 
         # Synthesize base audio with Kokoro (24kHz output)
-        base_voice = req.get("baseVoice", "af_heart")
+        base_voice = req.get("baseVoice", "am_onyx")
         samples, sr = kokoro.create(text, voice=base_voice, speed=speed, lang="en-us")
 
         # Resample to 16kHz for Kanade
@@ -413,7 +413,7 @@ export class KokoCloneTTS implements TTSProvider {
     this.config = config;
     this.voiceId = config.voiceId || "";
     this.speed = config.speed || 1.0;
-    this.baseVoice = config.baseVoice || "af_heart";
+    this.baseVoice = config.baseVoice || "am_onyx";
     this.voiceCloneManager = new VoiceCloneManager();
   }
 
