@@ -45,7 +45,7 @@ export const KOKORO_VOICES = [
   { id: "bm_lewis", name: "Lewis", gender: "male", accent: "british", description: "British, casual" },
 ];
 
-const DEFAULT_VOICE = "af_heart";
+const DEFAULT_VOICE = "am_onyx";
 const KOKORO_SAMPLE_RATE = 24000; // Kokoro-FastAPI outputs at 24kHz
 const PIPELINE_SAMPLE_RATE = 16000; // Voice pipeline expects 16kHz
 const KOKORO_API_URL = process.env.KOKORO_API_URL || "http://localhost:8880";

@@ -1661,6 +1661,136 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
+  // ---- Fish Speech S2 voice management endpoints ----
+
+  // GET /fish-speech/status -- Check Fish Speech health + list voices
+  if (req.method === "GET" && url.pathname === "/fish-speech/status") {
+    import("./providers/tts/fish-speech").then(async ({ checkFishSpeechHealth, fishSpeechVoiceManager }) => {
+      const healthy = await checkFishSpeechHealth();
+      const voices = await fishSpeechVoiceManager.listVoices();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ installed: healthy, healthy, voices, count: voices.length }));
+    }).catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+    });
+    return;
+  }
+
+  // GET /fish-speech/voices -- List all Fish Speech cloned voices
+  if (req.method === "GET" && url.pathname === "/fish-speech/voices") {
+    import("./providers/tts/fish-speech").then(async ({ fishSpeechVoiceManager }) => {
+      const voices = await fishSpeechVoiceManager.listVoices();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ voices }));
+    }).catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+    });
+    return;
+  }
+
+  // POST /fish-speech/create -- Upload reference audio and create a Fish Speech cloned voice
+  if (req.method === "POST" && url.pathname === "/fish-speech/create") {
+    readBody(req, 10_000_000)
+      .then(async (body) => {
+        const { name, audio, filename, transcript } = JSON.parse(body);
+
+        if (!name || !audio) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing 'name' and 'audio' (base64) in request body" }));
+          return;
+        }
+
+        const audioBuffer = Buffer.from(audio, "base64");
+
+        if (audioBuffer.length < 1000) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Audio file too small. Need 15-30 seconds of clear speech for best results." }));
+          return;
+        }
+
+        if (audioBuffer.length > 10_000_000) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Audio file too large (max 10MB). Use a 15-30 second clip." }));
+          return;
+        }
+
+        const { fishSpeechVoiceManager } = await import("./providers/tts/fish-speech");
+        const voice = await fishSpeechVoiceManager.createVoice(
+          name,
+          audioBuffer,
+          transcript
+        );
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, voice }));
+      })
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
+    return;
+  }
+
+  // DELETE /fish-speech/voices/:id -- Delete a Fish Speech voice
+  if (req.method === "DELETE" && url.pathname.startsWith("/fish-speech/voices/")) {
+    const voiceId = decodeURIComponent(url.pathname.slice("/fish-speech/voices/".length));
+    if (!voiceId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing voice ID in URL" }));
+      return;
+    }
+
+    import("./providers/tts/fish-speech").then(async ({ fishSpeechVoiceManager }) => {
+      const deleted = await fishSpeechVoiceManager.deleteVoice(voiceId);
+      if (deleted) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, deleted: voiceId }));
+      } else {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Failed to delete voice ${voiceId}` }));
+      }
+    }).catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+    });
+    return;
+  }
+
+  // POST /fish-speech/test -- Test synthesis with a Fish Speech voice
+  if (req.method === "POST" && url.pathname === "/fish-speech/test") {
+    readBody(req, MAX_IPC_BODY_BYTES)
+      .then(async (body) => {
+        const { voiceId, text } = JSON.parse(body);
+
+        if (!text) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing 'text' in request body" }));
+          return;
+        }
+
+        try {
+          const { FishSpeechTTS } = await import("./providers/tts/fish-speech");
+          const tts = new FishSpeechTTS({ provider: "fish-speech", voiceId: voiceId || "" });
+          const audio = await tts.synthesize(text);
+
+          const wavBuffer = pcmToWav(audio, 16000, 1, 16);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            ok: true,
+            audio: wavBuffer.toString("base64"),
+            mimeType: "audio/wav",
+            sampleRate: 16000,
+            durationMs: Math.round((audio.length / 2) / 16000 * 1000),
+          }));
+        } catch (err) {
+          console.error("[voice-server] Fish Speech test error:", err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+        }
+      })
+      .catch((err) => ipcError(res, err, `${req.method} ${url.pathname}`));
+    return;
+  }
+
   // GET /logs -- Return recent log lines for real-time debugging from vapiclone UI
   if (req.method === "GET" && url.pathname === "/logs") {
     import("fs").then(async (fs) => {

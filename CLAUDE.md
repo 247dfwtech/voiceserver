@@ -8,19 +8,20 @@ Handles real-time STT → LLM → TTS for concurrent AI phone calls.
 - **Runtime**: Node.js + TypeScript, managed by PM2 on GPU server
 - **Deploy**: `scp` files to GPU, `npx tsc` to compile, `pm2 restart voiceserver`
 - **GPU**: `ssh -o StrictHostKeyChecking=no -p 45194 root@66.245.227.160` (IP is dynamic — check Vast.ai console)
-- **Ports**: 8765 (IPC HTTP via port 8766), 8766 (WebSocket for Twilio media streams)
+- **Ports**: 8765 (WebSocket for Twilio/SignalWire media streams), 8766 (IPC HTTP)
 - **RAM**: 63GB total — Ollama NUM_PARALLEL=10 uses ~38GB KV cache. Max safe: 12 for llama3.2:3b.
 - **Tunnels**: Cloudflare quick tunnels (random URLs on restart). IPC/WS/Ollama URLs configured in vapiclone Settings page (DB-backed).
 
 ## Key Files
 
-- `src/voice-pipeline/call-session.ts` — Core call session: STT ↔ LLM ↔ TTS orchestration, barge-in, voicemail detection, silence timer, cost tracking (CostBreakdown includes stt/llm/tts/transport/analysis)
+- `src/voice-pipeline/call-session.ts` — Core call session: STT ↔ LLM ↔ TTS orchestration, barge-in, voicemail detection, silence timer, cost tracking. CallSessionConfig includes `provider` ("twilio"|"signalwire") field.
 - `src/voice-pipeline/analysis-runner.ts` — Post-call analysis: summary + success evaluation via configurable LLM provider. Only runs on answered calls with real conversation.
 - `src/providers/tts/` — TTS providers: `kokoro.ts` (HTTP to port 8880), `qwen3.ts` (HTTP to port 8881, voice cloning), `piper.ts` (CPU fallback)
-- `src/providers/stt/` — STT providers: `deepgram.ts` (cloud), `vosk.ts` (CPU fallback), `granite.ts`
+- `src/providers/stt/` — STT providers: `deepgram.ts` (cloud, production), `vosk.ts` (CPU fallback), `granite.ts`
 - `src/providers/llm/` — LLM providers: `ollama.ts` (local GPU), `openai.ts`, `deepseek.ts`
 - `src/providers/index.ts` — Provider factory (instantiates STT/LLM/TTS by name)
-- `src/index.ts` — HTTP/WebSocket server, IPC endpoints (/register-call, /settings, /health, /tts/test, /qwen3/*, /services, /amd-result/:callId)
+- `src/voice-pipeline/call-transfer.ts` — Provider-aware call transfer: `getProviderClient()` selects Twilio or SignalWire client based on `config.provider`. Supports Dial, Conference, and DTMF.
+- `src/index.ts` — HTTP/WebSocket server, IPC endpoints (/register-call, /settings, /health, /tts/test, /qwen3/*, /services, /amd-result/:callId). Passes `config.provider` to transfer handlers.
 - `src/gpu-monitor.ts` — GPU/system monitoring: per-process resources (PSS-based RAM, not RSS to avoid overcounting), disk, network, history snapshots
 - `src/model-manager.ts` — Tracks active models and TTS services
 
@@ -40,7 +41,7 @@ Handles real-time STT → LLM → TTS for concurrent AI phone calls.
 - `/services` — PM2 service statuses (GET), start/stop services (POST /services/:name/start|stop)
 - `/amd-result/:callId` — Receives AMD result forwarded from vapiclone, resolves voicemail detection
 - `/register-call` — Register pending call config
-- `/settings` — GET/PUT server settings (.env)
+- `/settings` — GET/PUT server settings (.env). Includes SW_PROJECT_ID, SW_AUTH_TOKEN, SW_SPACE_URL for SignalWire.
 - `/metrics/history` — 3-day historical snapshots
 
 ## Voicemail Detection (IN PROGRESS — Not fully working yet)

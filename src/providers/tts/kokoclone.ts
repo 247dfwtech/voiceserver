@@ -267,11 +267,17 @@ for line in sys.stdin:
             ref_audio, ref_sr = torchaudio.load(ref_path)
             if ref_sr != 16000:
                 ref_audio = torchaudio.functional.resample(ref_audio, ref_sr, 16000)
-            ref_cache[ref_path] = ref_audio.mean(dim=0)
+            ref_mono = ref_audio.mean(dim=0)
+            # Normalize volume for consistent voice conversion quality
+            peak = ref_mono.abs().max()
+            if peak > 0:
+                ref_mono = ref_mono / peak * 0.95
+            ref_cache[ref_path] = ref_mono
         ref_audio = ref_cache[ref_path]
 
         # Synthesize base audio with Kokoro (24kHz output)
-        samples, sr = kokoro.create(text, voice="af_heart", speed=speed, lang="en-us")
+        base_voice = req.get("baseVoice", "af_heart")
+        samples, sr = kokoro.create(text, voice=base_voice, speed=speed, lang="en-us")
 
         # Resample to 16kHz for Kanade
         source_audio = torch.from_numpy(samples).float()
@@ -400,12 +406,14 @@ export class KokoCloneTTS implements TTSProvider {
   private config: TTSConfig;
   private voiceId: string;
   private speed: number;
+  private baseVoice: string;
   private voiceCloneManager: VoiceCloneManager;
 
   constructor(config: TTSConfig) {
     this.config = config;
     this.voiceId = config.voiceId || "";
     this.speed = config.speed || 1.0;
+    this.baseVoice = config.baseVoice || "af_heart";
     this.voiceCloneManager = new VoiceCloneManager();
   }
 
@@ -439,7 +447,7 @@ export class KokoCloneTTS implements TTSProvider {
       daemon.pending.push(entry);
 
       // Send request to daemon
-      const req = JSON.stringify({ text, refPath, speed: this.speed }) + "\n";
+      const req = JSON.stringify({ text, refPath, speed: this.speed, baseVoice: this.baseVoice }) + "\n";
       daemon.proc.stdin!.write(req);
 
       // Per-request timeout

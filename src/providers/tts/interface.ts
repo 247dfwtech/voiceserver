@@ -4,6 +4,7 @@ export interface TTSConfig {
   model?: string;
   speed?: number;
   stability?: number;
+  baseVoice?: string; // KokoClone: which Kokoro voice to use as synthesis base (default: af_heart)
 }
 
 export interface TTSProvider {

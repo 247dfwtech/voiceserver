@@ -11,8 +11,10 @@ import { KokoroTTS } from "./tts/kokoro";
 import { KokoCloneTTS } from "./tts/kokoclone";
 import { ChatterboxTurboTTS } from "./tts/chatterbox";
 import { Qwen3TTS } from "./tts/qwen3";
+import { FishSpeechTTS } from "./tts/fish-speech";
 import { checkKokoroHealth } from "./tts/kokoro";
 import { checkQwen3Health } from "./tts/qwen3";
+import { checkFishSpeechHealth } from "./tts/fish-speech";
 import { modelManager } from "../model-manager";
 
 /**
@@ -123,6 +125,9 @@ export function createTTSProvider(config: TTSConfig): TTSProvider {
     case "qwen3":
     case "qwen3-tts":
       return new Qwen3TTS(config);
+    case "fish-speech":
+    case "fish":
+      return new FishSpeechTTS(config);
     case "piper":
       return new PiperTTS(config);
     default:
