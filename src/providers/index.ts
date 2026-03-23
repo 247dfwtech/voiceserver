@@ -145,12 +145,20 @@ export function createLLMProvider(config: LLMConfig): LLMProvider {
     openai: process.env.OPENAI_API_KEY || "",
     deepseek: process.env.DEEPSEEK_API_KEY || "",
     "deep-seek": process.env.DEEPSEEK_API_KEY || "",
+    cerebras: process.env.CEREBRAS_API_KEY || "",
+    groq: process.env.GROQ_API_KEY || "",
+    deepinfra: process.env.DEEPINFRA_API_KEY || "",
+    openrouter: process.env.OPENROUTER_API_KEY || "",
     ollama: "ollama", // Ollama doesn't require an API key
   };
 
   const baseUrlMap: Record<string, string> = {
     deepseek: process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1",
     "deep-seek": process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1",
+    cerebras: "https://api.cerebras.ai/v1",
+    groq: "https://api.groq.com/openai/v1",
+    deepinfra: "https://api.deepinfra.com/v1/openai",
+    openrouter: "https://openrouter.ai/api/v1",
     ollama: process.env.OLLAMA_URL || "http://localhost:11434/v1",
   };
 

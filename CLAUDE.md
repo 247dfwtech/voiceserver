@@ -7,36 +7,73 @@ Handles real-time STT → LLM → TTS for concurrent AI phone calls.
 
 - **Runtime**: Node.js + TypeScript, managed by PM2 on GPU server
 - **Deploy**: `scp` files to GPU, `npx tsc` to compile, `pm2 restart voiceserver`
-- **GPU**: `ssh -p 45194 root@70.29.210.33`, code at `/opt/voiceserverV2/`
-- **Ports**: 8765 (IPC HTTP), 8766 (WebSocket for Twilio media streams)
+- **GPU**: `ssh -o StrictHostKeyChecking=no -p 45194 root@66.245.227.160` (IP is dynamic — check Vast.ai console)
+- **Ports**: 8765 (IPC HTTP via port 8766), 8766 (WebSocket for Twilio media streams)
+- **RAM**: 63GB total — Ollama NUM_PARALLEL=10 uses ~38GB KV cache. Max safe: 12 for llama3.2:3b.
+- **Tunnels**: Cloudflare quick tunnels (random URLs on restart). IPC/WS/Ollama URLs configured in vapiclone Settings page (DB-backed).
 
-## Key Directories
+## Key Files
 
-- `src/voice-pipeline/call-session.ts` — Core call session: STT ↔ LLM ↔ TTS orchestration, barge-in, voicemail detection, silence timer, cost tracking
+- `src/voice-pipeline/call-session.ts` — Core call session: STT ↔ LLM ↔ TTS orchestration, barge-in, voicemail detection, silence timer, cost tracking (CostBreakdown includes stt/llm/tts/transport/analysis)
+- `src/voice-pipeline/analysis-runner.ts` — Post-call analysis: summary + success evaluation via configurable LLM provider. Only runs on answered calls with real conversation.
 - `src/providers/tts/` — TTS providers: `kokoro.ts` (HTTP to port 8880), `qwen3.ts` (HTTP to port 8881, voice cloning), `piper.ts` (CPU fallback)
 - `src/providers/stt/` — STT providers: `deepgram.ts` (cloud), `vosk.ts` (CPU fallback), `granite.ts`
 - `src/providers/llm/` — LLM providers: `ollama.ts` (local GPU), `openai.ts`, `deepseek.ts`
 - `src/providers/index.ts` — Provider factory (instantiates STT/LLM/TTS by name)
-- `src/index.ts` — HTTP/WebSocket server, IPC endpoints (/register-call, /settings, /health, /tts/test, /qwen3/*)
+- `src/index.ts` — HTTP/WebSocket server, IPC endpoints (/register-call, /settings, /health, /tts/test, /qwen3/*, /services, /amd-result/:callId)
+- `src/gpu-monitor.ts` — GPU/system monitoring: per-process resources (PSS-based RAM, not RSS to avoid overcounting), disk, network, history snapshots
 - `src/model-manager.ts` — Tracks active models and TTS services
 
-## External Services on Same GPU
+## PM2 Services on GPU
 
-- **Ollama** (port 11434) — LLM inference, config via `/opt/voiceserverV2/start-ollama.sh` which reads `.env`
-- **Kokoro-FastAPI** (port 8880) — Primary TTS, `/opt/start-kokoro-fastapi.sh`
-- **Qwen3-TTS** (port 8881) — Voice cloning TTS, `/opt/start-qwen3-tts.sh`, model `Qwen/Qwen3-TTS-12Hz-0.6B-Base`
+- **voiceserver** — Node.js voice pipeline
+- **ollama** — LLM inference (port 11434), started via `start-ollama.sh` which reads `.env`
+- **kokoro-fastapi** — Primary TTS (port 8880), ~1.8GB VRAM
+- **qwen3-tts** — Voice cloning TTS (port 8881), ~1.5GB VRAM
+- **tunnel-ipc** / **tunnel-ws** / **tunnel-ollama** — Cloudflare quick tunnels
+- All managed via `ecosystem.config.cjs`, start/stop controllable from vapiclone Settings page
 
-## Settings
+## IPC Endpoints
 
-Settings come from two sources:
-1. `.env` file at `/opt/voiceserverV2/.env` (persisted across restarts)
-2. `PUT /settings` from vapiclone dashboard (updates `.env` + `process.env` in real-time)
+- `/health` — GPU stats, per-process resources, service health, sessions, disk, network
+- `/sessions` — Active call list with states
+- `/services` — PM2 service statuses (GET), start/stop services (POST /services/:name/start|stop)
+- `/amd-result/:callId` — Receives AMD result forwarded from vapiclone, resolves voicemail detection
+- `/register-call` — Register pending call config
+- `/settings` — GET/PUT server settings (.env)
+- `/metrics/history` — 3-day historical snapshots
 
-Ollama-specific settings (NUM_PARALLEL, FLASH_ATTENTION) trigger `pm2 restart ollama` when changed.
+## Voicemail Detection (IN PROGRESS — Not fully working yet)
 
-## Per-Call Config
+### Current Implementation
+- Uses Twilio AMD `DetectMessageEnd` mode (switched from `Enable` — see history below)
+- `asyncAmd: true` so calls connect immediately while AMD runs in background
+- AMD result forwarded: Twilio → vapiclone `/api/webhooks/twilio/status` → voiceserver `/amd-result/:callId`
+- VoicemailDetector class in call-session.ts with audio-based fallback detection
+- First message HELD while detection pending (AI stays silent)
+- ALL STT transcripts suppressed while detection pending (prevents LLM from acting on greeting audio)
+- On voicemail: cancels speech, 500ms pause, speaks voicemailMessage, ends call
 
-Each call receives its full assistant config via `POST /register-call` from vapiclone. The voiceserver is stateless — no assistant config is cached. Settings include: model, voice, transcriber, behavior (maxDuration, silenceTimeout, endCallPhrases), speaking plans, voicemail detection, tools, analysis config.
+### What We've Tried (History)
+1. **Original**: `machineDetection: "Enable"` → AMD fires `machine_start` immediately → AI spoke over greeting. FAILED.
+2. **Added beep-wait**: On `machine_start`, entered beep-wait mode listening for 800ms silence. But AMD result wasn't reaching voiceserver (status webhook didn't forward it). FAILED.
+3. **Added AMD forwarding**: vapiclone status webhook now forwards `AnsweredBy` to voiceserver `/amd-result/:callId`. But first message still played over greeting. FAILED.
+4. **Held first message**: Added logic to hold first message until detection resolves, deliver on "human", skip on "voicemail". But `return` statement skipped silence timer setup → call hung in silence forever. FAILED.
+5. **Fixed initialization**: Removed `return`, kept silence timer running. But STT transcribed voicemail greeting → LLM processed it → triggered ff_transfer tool. FAILED.
+6. **Switched to DetectMessageEnd**: Changed from `Enable` to `DetectMessageEnd` so Twilio waits for greeting+beep before callback. Added `asyncAmd: true`. Reduced delay to 500ms. CURRENT.
+7. **Suppressed transcripts**: Added guards in handleTranscript() and handleUtteranceEnd() to ignore ALL input while voicemail detection is pending. CURRENT.
+
+### Known Issues
+- AMD callback from `DetectMessageEnd` may not be arriving (needs verification with next test call)
+- `forceAmdResult("machine_start")` enters beep-wait mode; `machine_end_beep` resolves immediately
+- Audio-based fallback: detects 3s continuous speech → enters beep-wait → resolves after 800ms silence
+
+## Post-Call Analysis
+
+- Runs after call ends in `notifyCallEnded()` in index.ts
+- Skipped for unanswered calls: voicemail, no-answer, busy, failed, machine-detected, stt-failure
+- Supported providers: local (Ollama), deepseek, openrouter, cerebras, groq, deepinfra
+- Cost tracked per-call via token usage, included in CostBreakdown.analysis
 
 ## Build
 
@@ -45,6 +82,13 @@ Each call receives its full assistant config via `POST /register-call` from vapi
 export PATH=/opt/nvm/versions/node/v24.12.0/bin:$PATH
 cd /opt/voiceserverV2
 npx tsc --noEmit  # type-check
-npx tsc           # compile
+npx tsc           # compile (ignore src/call-session.ts errors — stale file)
 pm2 restart voiceserver
 ```
+
+## Known Issues
+
+- Stale `src/call-session.ts` file on GPU causes tsc errors (moved to `src/voice-pipeline/call-session.ts`). Doesn't block compilation.
+- Qwen3-TTS restarts frequently in pm2 — model loading issues with Base model
+- Vast.ai instance IP is dynamic — changes on reboot. Tunnel URLs also change. Must update in vapiclone Settings.
+- GPU RAM monitoring: uses PSS not RSS to avoid overcounting shared memory. Ollama runner child process (~38GB) is the main consumer.

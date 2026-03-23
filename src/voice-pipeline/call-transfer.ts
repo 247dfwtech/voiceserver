@@ -1,16 +1,44 @@
 import twilio from "twilio";
 
 // Lazy-initialized Twilio client
-let _client: ReturnType<typeof twilio> | null = null;
+let _twilioClient: ReturnType<typeof twilio> | null = null;
+// Lazy-initialized SignalWire client (Twilio-compatible)
+let _signalWireClient: any | null = null;
 
 function getTwilioClient(): ReturnType<typeof twilio> {
-  if (!_client) {
+  if (!_twilioClient) {
     const sid = process.env.TWILIO_ACCOUNT_SID;
     const token = process.env.TWILIO_AUTH_TOKEN;
     if (!sid || !token) throw new Error("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN required for call transfer");
-    _client = twilio(sid, token);
+    _twilioClient = twilio(sid, token);
   }
-  return _client;
+  return _twilioClient;
+}
+
+function getSignalWireClient(): any {
+  if (!_signalWireClient) {
+    const projectId = process.env.SW_PROJECT_ID;
+    const authToken = process.env.SW_AUTH_TOKEN;
+    const spaceUrl = process.env.SW_SPACE_URL;
+    if (!projectId || !authToken || !spaceUrl) {
+      throw new Error("SW_PROJECT_ID, SW_AUTH_TOKEN, and SW_SPACE_URL required for SignalWire call transfer");
+    }
+    const { RestClient } = require("@signalwire/compatibility-api");
+    _signalWireClient = new RestClient(projectId, authToken, { signalwireSpaceUrl: spaceUrl });
+  }
+  return _signalWireClient;
+}
+
+/** Get the correct provider client based on provider string */
+function getProviderClient(provider?: string): any {
+  if (provider === "signalwire") return getSignalWireClient();
+  return getTwilioClient();
+}
+
+/** Clear cached clients (called when settings are updated) */
+export function clearTransferClients(): void {
+  _twilioClient = null;
+  _signalWireClient = null;
 }
 
 interface TransferOptions {
@@ -19,6 +47,7 @@ interface TransferOptions {
   publicUrl: string;
   callerNumber: string;
   timeout?: number;
+  provider?: "twilio" | "signalwire";
 }
 
 /** XML-escape a string to prevent TwiML injection */
@@ -46,12 +75,12 @@ function isValidDTMF(digits: string): boolean {
 }
 
 /**
- * Transfer an active call using Twilio's <Dial> verb.
- * The original leg hears hold music while the transfer connects.
- * If the transfer fails, the caller is reconnected to the media stream.
+ * Transfer an active call using <Dial> verb.
+ * Works with both Twilio and SignalWire (LaML is identical to TwiML).
  */
 export async function transferCallWithDial(opts: TransferOptions): Promise<{ success: boolean; error?: string }> {
-  const client = getTwilioClient();
+  const client = getProviderClient(opts.provider);
+  const webhookPrefix = opts.provider === "signalwire" ? "signalwire" : "twilio";
 
   // Validate destination to prevent TwiML injection
   if (!isValidDestination(opts.destination)) {
@@ -63,7 +92,7 @@ export async function transferCallWithDial(opts: TransferOptions): Promise<{ suc
   try {
     await client.calls(opts.callSid).update({
       twiml: `<Response>
-        <Dial callerId="${escapeXml(opts.callerNumber)}" timeout="${timeout}" action="${escapeXml(opts.publicUrl)}/api/webhooks/twilio/transfer-status">
+        <Dial callerId="${escapeXml(opts.callerNumber)}" timeout="${timeout}" action="${escapeXml(opts.publicUrl)}/api/webhooks/${webhookPrefix}/transfer-status">
           <Number>${escapeXml(opts.destination)}</Number>
         </Dial>
       </Response>`,
@@ -72,16 +101,17 @@ export async function transferCallWithDial(opts: TransferOptions): Promise<{ suc
     return { success: true };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[call-transfer] Dial transfer failed:`, message);
+    console.error(`[call-transfer] Dial transfer failed (${opts.provider || "twilio"}):`, message);
     return { success: false, error: message };
   }
 }
 
 /**
  * Transfer using conference bridge approach.
+ * Works with both Twilio and SignalWire.
  */
 export async function transferCallWithConference(opts: TransferOptions): Promise<{ success: boolean; conferenceSid?: string; error?: string }> {
-  const client = getTwilioClient();
+  const client = getProviderClient(opts.provider);
 
   if (!isValidDestination(opts.destination)) {
     return { success: false, error: `Invalid destination format` };
@@ -112,20 +142,21 @@ export async function transferCallWithConference(opts: TransferOptions): Promise
     return { success: true, conferenceSid: outboundLeg.sid };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[call-transfer] Conference transfer failed:`, message);
+    console.error(`[call-transfer] Conference transfer failed (${opts.provider || "twilio"}):`, message);
     return { success: false, error: message };
   }
 }
 
 /**
  * Send DTMF tones on an active call (for IVR navigation).
+ * Works with both Twilio and SignalWire.
  */
-export async function sendDTMF(callSid: string, digits: string): Promise<void> {
+export async function sendDTMF(callSid: string, digits: string, provider?: string): Promise<void> {
   if (!isValidDTMF(digits)) {
     throw new Error(`Invalid DTMF digits: only 0-9, *, #, w allowed`);
   }
 
-  const client = getTwilioClient();
+  const client = getProviderClient(provider);
   await client.calls(callSid).update({
     twiml: `<Response><Play digits="${escapeXml(digits)}"/></Response>`,
   });

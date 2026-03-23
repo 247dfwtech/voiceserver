@@ -6,7 +6,7 @@ interface AnalysisConfig {
   successEvaluationEnabled?: boolean;
   successEvaluationPrompt?: string;
   successEvaluationRubric?: string;
-  provider?: string; // "local" | "deepseek" | "openrouter"
+  provider?: string; // "local" | "deepseek" | "openrouter" | "cerebras" | "groq" | "deepinfra"
   model?: string;
 }
 
@@ -24,6 +24,12 @@ const ANALYSIS_PRICING: Record<string, { input: number; output: number }> = {
   "deepseek-reasoner": { input: 0.00055, output: 0.0022 },
   "meta-llama/llama-3.1-8b-instruct:free": { input: 0, output: 0 },
   "gpt-4o-mini": { input: 0.00015, output: 0.0006 },
+  // Cerebras (free tier)
+  "llama-3.3-70b": { input: 0, output: 0 },
+  // Groq
+  "llama-3.1-8b-instant": { input: 0.00005, output: 0.00008 },
+  // DeepInfra
+  "meta-llama/Meta-Llama-3.1-8B-Instruct": { input: 0.00003, output: 0.00005 },
 };
 
 /**
@@ -62,6 +68,51 @@ function createAnalysisClient(provider: string, model?: string): { client: OpenA
           },
         }),
         model: model || "meta-llama/llama-3.1-8b-instruct:free",
+      };
+    }
+
+    case "cerebras": {
+      const apiKey = process.env.CEREBRAS_API_KEY;
+      if (!apiKey) {
+        console.warn("[analysis] Cerebras API key not configured, falling back to local");
+        return null;
+      }
+      return {
+        client: new OpenAI({
+          apiKey,
+          baseURL: "https://api.cerebras.ai/v1",
+        }),
+        model: model || "llama-3.3-70b",
+      };
+    }
+
+    case "groq": {
+      const apiKey = process.env.GROQ_API_KEY;
+      if (!apiKey) {
+        console.warn("[analysis] Groq API key not configured, falling back to local");
+        return null;
+      }
+      return {
+        client: new OpenAI({
+          apiKey,
+          baseURL: "https://api.groq.com/openai/v1",
+        }),
+        model: model || "llama-3.1-8b-instant",
+      };
+    }
+
+    case "deepinfra": {
+      const apiKey = process.env.DEEPINFRA_API_KEY;
+      if (!apiKey) {
+        console.warn("[analysis] DeepInfra API key not configured, falling back to local");
+        return null;
+      }
+      return {
+        client: new OpenAI({
+          apiKey,
+          baseURL: "https://api.deepinfra.com/v1/openai",
+        }),
+        model: model || "meta-llama/Meta-Llama-3.1-8B-Instruct",
       };
     }
 

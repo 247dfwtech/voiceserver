@@ -136,22 +136,36 @@ class VoicemailDetector {
   private result: VMDetectionResult = "unknown";
   private resolveCallback: ((result: VMDetectionResult) => void) | null = null;
   private attemptsRemaining: number;
+  private pendingMachineStart = false;
+  private amdBeepReceived = false;
+  private beepWaitTimer: ReturnType<typeof setTimeout> | null = null;
+  private silenceAfterSpeechFrames = 0;
+  private greetingEnded = false;
 
-  constructor(config: { analysisWindowSeconds?: number; speechThreshold?: number; continuousSpeechFramesThreshold?: number; twilioAmdResult?: string; initialDelaySeconds?: number; maxRetries?: number; provider?: string } = {}) {
+  private maxVoicemailWaitSeconds: number;
+
+  constructor(config: { analysisWindowSeconds?: number; speechThreshold?: number; continuousSpeechFramesThreshold?: number; twilioAmdResult?: string; initialDelaySeconds?: number; maxRetries?: number; provider?: string; maxVoicemailWaitSeconds?: number } = {}) {
     this.analysisWindowSeconds = config.analysisWindowSeconds ?? 5;
     this.speechThreshold = config.speechThreshold ?? 300;
     this.continuousSpeechFramesThreshold = config.continuousSpeechFramesThreshold ?? 150; // 150 * 20ms = 3s of unbroken speech
     this.initialDelayFrames = Math.round(((config.initialDelaySeconds ?? 1) * 1000) / 20); // convert seconds to 20ms frames
     this.attemptsRemaining = config.maxRetries ?? 3;
+    this.maxVoicemailWaitSeconds = config.maxVoicemailWaitSeconds ?? 25;
 
     // Skip audio analysis if provider is "twilio" only
     const useAudio = config.provider !== "twilio";
 
     if (config.twilioAmdResult) {
       const amd = config.twilioAmdResult.toLowerCase();
-      if (amd === "machine_start" || amd === "machine_end_beep" || amd === "machine_end_silence" || amd === "machine_end_other") {
+      if (amd === "machine_end_beep" || amd === "machine_end_silence" || amd === "machine_end_other") {
+        // Beep already happened or greeting ended — safe to speak after short delay
         this.result = "voicemail";
         this.resolved = true;
+        this.amdBeepReceived = true;
+      } else if (amd === "machine_start") {
+        // Greeting is STILL PLAYING — do NOT resolve yet. We need to wait for the beep.
+        // Mark as voicemail but don't resolve — will wait for beep detection or timeout
+        this.pendingMachineStart = true;
       } else if (amd === "human") {
         this.result = "human";
         this.resolved = true;
@@ -171,6 +185,33 @@ class VoicemailDetector {
     this.audioFrames.push(rms);
     this.totalFrames++;
 
+    // If we got machine_start from AMD, we KNOW it's voicemail but need to wait for the beep
+    if (this.pendingMachineStart) {
+      const isSpeech = rms > this.speechThreshold;
+
+      if (isSpeech) {
+        // Greeting is still playing
+        this.silenceAfterSpeechFrames = 0;
+        this.speechFrameCount++;
+      } else {
+        this.silenceAfterSpeechFrames++;
+        // After hearing speech then 40+ frames of silence (800ms) → greeting ended, beep likely passed
+        if (this.speechFrameCount > 50 && this.silenceAfterSpeechFrames > 40) {
+          this.pendingMachineStart = false;
+          this.resolve("voicemail");
+          return;
+        }
+      }
+
+      // Safety timeout: after maxVoicemailWaitSeconds (default 25s), just speak
+      const maxWaitFrames = ((this.maxVoicemailWaitSeconds ?? 25) * 1000) / 20;
+      if (this.totalFrames >= maxWaitFrames) {
+        this.pendingMachineStart = false;
+        this.resolve("voicemail");
+      }
+      return;
+    }
+
     // Skip analysis during initial delay
     if (this.totalFrames < this.initialDelayFrames) return;
 
@@ -184,7 +225,10 @@ class VoicemailDetector {
         this.maxContinuousSpeech = this.continuousSpeechRun;
       }
       if (this.continuousSpeechRun >= this.continuousSpeechFramesThreshold) {
-        this.resolve("voicemail");
+        // Don't resolve immediately — mark as detected but wait for beep/silence
+        this.pendingMachineStart = true;
+        this.speechFrameCount = 0; // reset for beep detection phase
+        this.silenceAfterSpeechFrames = 0;
         return;
       }
     } else {
@@ -229,6 +273,22 @@ class VoicemailDetector {
   isResolved(): boolean { return this.resolved; }
   getCurrentResult(): VMDetectionResult { return this.result; }
   forceResult(result: VMDetectionResult): void { this.resolve(result); }
+
+  /** Handle AMD result that arrives after construction (via /amd-result endpoint) */
+  forceAmdResult(answeredBy: string): void {
+    if (this.resolved) return;
+    const amd = answeredBy.toLowerCase();
+    if (amd === "machine_end_beep" || amd === "machine_end_silence" || amd === "machine_end_other") {
+      // Beep already passed — safe to speak
+      this.resolve("voicemail");
+    } else if (amd === "machine_start") {
+      // Greeting still playing — enter beep-wait mode, don't resolve yet
+      this.pendingMachineStart = true;
+      console.log(`[voicemail-detector] AMD machine_start received — waiting for beep/silence`);
+    } else if (amd === "human") {
+      this.resolve("human");
+    }
+  }
 }
 
 // ---- Session types ----
@@ -253,6 +313,8 @@ export interface CallSessionConfig {
   transcriber: { provider: string; model?: string; language?: string; keywords?: string[] };
   fallbackTranscriber?: { provider: string; model?: string; language?: string; keywords?: string[] };
   tools: ToolDefinition[];
+  toolMode?: string; // "tools" | "trigger-phrases"
+  triggerPhrases?: { phrase: string; toolName: string }[];
   endCallPhrases: string[];
   maxDuration: number;
   silenceTimeout: number;
@@ -274,6 +336,8 @@ export interface CallSessionConfig {
   backgroundDenoising?: boolean;
   startSpeakingPlan?: { waitSeconds?: number; smartEndpointingEnabled?: boolean };
   stopSpeakingPlan?: { numWords?: number; voiceSeconds?: number; backoffSeconds?: number };
+  provider?: "twilio" | "signalwire";
+  signalwireSpaceUrl?: string;
   twilioAmdResult?: string;
   analysisConfig?: {
     summaryEnabled?: boolean;
@@ -304,7 +368,7 @@ export class CallSession extends EventEmitter {
   private isSpeaking = false;
 
   private costTracker: CostTracker;
-  private voicemailDetector: VoicemailDetector | null = null;
+  public voicemailDetector: VoicemailDetector | null = null;
   private startedAt: Date | null = null;
   private audioChunkCount = 0;
   private consecutiveSTTErrors = 0;
@@ -388,6 +452,7 @@ export class CallSession extends EventEmitter {
         analysisWindowSeconds: vmConfig.analysisWindowSeconds,
         initialDelaySeconds: vmConfig.initialDelaySeconds,
         maxRetries: vmConfig.maxRetries,
+        maxVoicemailWaitSeconds: vmConfig.maxVoicemailWaitSeconds,
         provider: vmConfig.provider,
       });
 
@@ -405,7 +470,7 @@ export class CallSession extends EventEmitter {
       }
     }
 
-    // Handle first message
+    // Handle first message — delay if voicemail detection is still pending
     if (
       this.config.firstMessage &&
       this.config.firstMessageMode !== "assistant-waits-for-user"
@@ -414,6 +479,29 @@ export class CallSession extends EventEmitter {
       if (this.config.variableValues) {
         firstMsg = substituteVariables(firstMsg, this.config.variableValues);
       }
+
+      // If voicemail detection is active and not yet resolved, hold first message
+      if (this.voicemailDetector && !this.voicemailDetector.isResolved()) {
+        console.log(`[session:${this.config.callId}] Holding first message — voicemail detection pending`);
+        this.state = "waiting_for_speech";
+        this.resetSilenceTimer();
+        this.voicemailDetector.getResult().then((result) => {
+          if (result === "human" && this.state !== "ended") {
+            console.log(`[session:${this.config.callId}] Human confirmed — delivering first message`);
+            this.playingFirstMessage = true;
+            this.speak(firstMsg);
+            this.conversationHistory.push({ role: "assistant", content: firstMsg });
+            this.fullTranscript.push({ role: "AI", content: firstMsg });
+            const estimatedPlaybackMs = Math.max(firstMsg.length * 60, 5000);
+            setTimeout(() => {
+              this.playingFirstMessage = false;
+              this.currentTranscript = "";
+              console.log(`[session:${this.config.callId}] First message playback window ended (${estimatedPlaybackMs}ms)`);
+            }, estimatedPlaybackMs);
+          }
+          // If voicemail — handleVoicemailDetected() already handles the voicemail message
+        });
+      } else {
       this.playingFirstMessage = true;
       this.speak(firstMsg);
       // Don't rely on TTS completion callback to clear playingFirstMessage —
@@ -434,6 +522,7 @@ export class CallSession extends EventEmitter {
       }, estimatedPlaybackMs);
       this.conversationHistory.push({ role: "assistant", content: firstMsg });
       this.fullTranscript.push({ role: "AI", content: firstMsg });
+      }
     } else {
       this.state = "waiting_for_speech";
       this.resetSilenceTimer();
@@ -600,6 +689,12 @@ export class CallSession extends EventEmitter {
   private handleTranscript(text: string, isFinal: boolean): void {
     if (this.state === "ended") return;
 
+    // While voicemail detection is pending, ignore ALL transcripts
+    // The greeting audio would otherwise be processed by the LLM and trigger actions
+    if (this.voicemailDetector && !this.voicemailDetector.isResolved()) {
+      return;
+    }
+
     // Reset STT error counter on successful transcription
     this.consecutiveSTTErrors = 0;
 
@@ -656,6 +751,8 @@ export class CallSession extends EventEmitter {
 
   private handleUtteranceEnd(): void {
     if (this.state === "ended" || !this.currentTranscript.trim()) return;
+    // Suppress while voicemail detection pending
+    if (this.voicemailDetector && !this.voicemailDetector.isResolved()) return;
 
     const waitSeconds = this.config.startSpeakingPlan?.waitSeconds ?? 0;
 
@@ -707,10 +804,46 @@ export class CallSession extends EventEmitter {
     this.processWithLLM();
   }
 
+  /** Check AI response text for trigger phrases and execute matching tools */
+  private checkTriggerPhrases(text: string): void {
+    if (!this.config.triggerPhrases || this.config.triggerPhrases.length === 0) return;
+    const lower = text.toLowerCase();
+    for (const tp of this.config.triggerPhrases) {
+      if (lower.includes(tp.phrase.toLowerCase())) {
+        console.log(`[session:${this.config.callId}] Trigger phrase matched: "${tp.phrase}" → ${tp.toolName}`);
+        // Find the tool definition
+        const tool = this.config.tools.find(t => t.name === tp.toolName || t.type === tp.toolName);
+        if (tool) {
+          // Synthesize a tool call
+          const toolCall: LLMToolCall = {
+            id: `trigger-${Date.now()}`,
+            type: "function",
+            function: { name: tool.name || tp.toolName, arguments: "{}" },
+          };
+          this.handleToolCall(toolCall);
+        } else if (tp.toolName === "end_call" || tp.toolName === "endCall") {
+          // Built-in end call
+          this.waitForTTSFinish().then(() => this.endCall("assistant-ended-call"));
+        } else if (tp.toolName === "transfer" || tp.toolName === "transferCall") {
+          // Built-in transfer with fallback destination
+          this.waitForTTSFinish().then(() => {
+            this.state = "transferring";
+            this.emit("transfer", { destination: this.config.fallbackDestination });
+          });
+        }
+        return; // Only trigger the first match
+      }
+    }
+  }
+
   private processWithLLM(): void {
     if (!this.llm) return;
 
-    const llmTools: LLMToolDefinition[] = this.config.tools
+    // In trigger-phrases mode, don't send tools to the LLM
+    const useTriggerPhrases = this.config.toolMode === "trigger-phrases";
+    console.log(`[session:${this.config.callId}] LLM dispatch: toolMode=${this.config.toolMode || "not-set"}, tools=${this.config.tools.length}, triggerPhrases=${(this.config.triggerPhrases || []).length}, useTriggerPhrases=${useTriggerPhrases}`);
+
+    const llmTools: LLMToolDefinition[] = useTriggerPhrases ? [] : this.config.tools
       .filter((t) => t.functionDefinition)
       .map((t) => ({
         type: "function" as const,
@@ -721,7 +854,8 @@ export class CallSession extends EventEmitter {
         },
       }));
 
-    for (const t of this.config.tools) {
+    // Only add built-in tool definitions when NOT using trigger phrases
+    if (!useTriggerPhrases) for (const t of this.config.tools) {
       if (t.type === "endCall" && !t.functionDefinition) {
         llmTools.push({
           type: "function",
@@ -755,6 +889,7 @@ export class CallSession extends EventEmitter {
     }
 
     let fullResponse = "";
+    let ignoredToolCall = false;
 
     const { cancel } = this.llm.streamCompletion({
       messages: this.conversationHistory,
@@ -770,6 +905,12 @@ export class CallSession extends EventEmitter {
         }
       },
       onToolCall: (toolCall: LLMToolCall) => {
+        // In trigger-phrases mode, IGNORE all LLM tool calls — actions come from phrase matching only
+        if (useTriggerPhrases) {
+          console.log(`[session:${this.config.callId}] Ignoring LLM tool call in trigger-phrases mode: ${toolCall.function.name}`);
+          ignoredToolCall = true;
+          return;
+        }
         // Flush any remaining text to TTS before handling the tool call
         // This ensures "I'll transfer you now" is spoken before ff_transfer fires
         const remaining = fullResponse.trim();
@@ -781,12 +922,62 @@ export class CallSession extends EventEmitter {
       },
       onDone: (text: string) => {
         const remaining = (fullResponse || text).trim();
+
+        // If LLM produced only a tool call with no text in trigger-phrases mode,
+        // retry with a clean conversation that has NO tool references
+        if (useTriggerPhrases && ignoredToolCall && !remaining) {
+          console.log(`[session:${this.config.callId}] LLM produced only tool call, no text — retrying with clean messages`);
+          // Build clean messages without any tool-related entries
+          const cleanMessages = this.conversationHistory.filter(
+            (m: any) => m.role !== "tool" && !m.tool_calls && !m.tool_call_id
+          );
+          cleanMessages.push({
+            role: "system",
+            content: "Respond naturally to the customer. Do not attempt to call any functions or tools. Just speak.",
+          });
+          // Direct LLM call with NO tools parameter at all
+          this.llm!.streamCompletion({
+            messages: cleanMessages,
+            onToken: (token: string) => {
+              fullResponse += token;
+              if (this.shouldStartTTS(fullResponse)) {
+                const sentence = this.extractCompleteSentence(fullResponse);
+                if (sentence) {
+                  fullResponse = fullResponse.slice(sentence.length).trimStart();
+                  this.speak(sentence);
+                }
+              }
+            },
+            onToolCall: () => {
+              // Ignore any tool calls on retry
+            },
+            onDone: (retryText: string) => {
+              const retryRemaining = (fullResponse || retryText).trim();
+              if (retryRemaining && !this.isSpeaking) {
+                this.speak(retryRemaining);
+              }
+              if (retryText) {
+                this.conversationHistory.push({ role: "assistant", content: retryText });
+                this.fullTranscript.push({ role: "AI", content: retryText });
+                this.checkTriggerPhrases(retryText);
+              }
+              this.state = "waiting_for_speech";
+              this.resetSilenceTimer();
+            },
+          });
+          return;
+        }
+
         if (remaining && !this.isSpeaking) {
           this.speak(remaining);
         }
         if (text) {
           this.conversationHistory.push({ role: "assistant", content: text });
           this.fullTranscript.push({ role: "AI", content: text });
+        }
+        // In trigger-phrases mode, scan the AI's full response for trigger phrases
+        if (useTriggerPhrases && text) {
+          this.checkTriggerPhrases(text);
         }
         this.state = "waiting_for_speech";
         this.resetSilenceTimer();
@@ -950,26 +1141,34 @@ export class CallSession extends EventEmitter {
   }
 
   private handleVoicemailDetected(): void {
-    console.log(`[session:${this.config.callId}] Voicemail detected`);
+    console.log(`[session:${this.config.callId}] Voicemail detected — delivering message after short pause`);
     this.emit("voicemail_detected");
 
+    // Cancel any ongoing speech (first message playing over greeting)
+    this.cancelSpeaking();
+
     if (this.config.voicemailMessage) {
-      this.speak(this.config.voicemailMessage);
-      this.fullTranscript.push({ role: "AI", content: `[Voicemail] ${this.config.voicemailMessage}` });
-
-      const checkDone = setInterval(() => {
-        if (!this.isSpeaking && this.state !== "ended") {
-          clearInterval(checkDone);
-          this.endCall("voicemail");
-        }
-      }, 500);
-
+      // Short 500ms pause after beep detected before speaking (DetectMessageEnd already waited for beep)
       setTimeout(() => {
-        clearInterval(checkDone);
-        if (this.state !== "ended") {
-          this.endCall("voicemail");
-        }
-      }, 15000);
+        if (this.state === "ended") return;
+        console.log(`[session:${this.config.callId}] Delivering voicemail message`);
+        this.speak(this.config.voicemailMessage!);
+        this.fullTranscript.push({ role: "AI", content: `[Voicemail] ${this.config.voicemailMessage}` });
+
+        const checkDone = setInterval(() => {
+          if (!this.isSpeaking && this.state !== "ended") {
+            clearInterval(checkDone);
+            this.endCall("voicemail");
+          }
+        }, 500);
+
+        setTimeout(() => {
+          clearInterval(checkDone);
+          if (this.state !== "ended") {
+            this.endCall("voicemail");
+          }
+        }, 15000);
+      }, 500);
     } else {
       this.endCall("voicemail");
     }

@@ -24,6 +24,7 @@ import { checkQwen3Health } from "./providers/tts/qwen3";
 import { voiceCloneManager } from "./providers/tts/kokoclone";
 import { chatterboxVoiceManager } from "./providers/tts/chatterbox";
 import { metricsBuffer, startMetricsCollection, stopMetricsCollection, setSessionCountProvider, collectSnapshot } from "./gpu-monitor";
+import { exec } from "child_process";
 
 // ---- Configuration ----
 
@@ -218,19 +219,21 @@ wss.on("connection", (ws: WebSocket) => {
             }
           });
 
-          // Handle call transfer
+          // Handle call transfer (provider-aware: Twilio or SignalWire)
           session.on("transfer", async (transferData: { destination?: string }) => {
-            console.log(`[voice-server] [${callId}] Transfer requested, destination=${transferData.destination || "NONE"}`);
+            const callProvider = config.provider || "twilio";
+            console.log(`[voice-server] [${callId}] Transfer requested (${callProvider}), destination=${transferData.destination || "NONE"}`);
             if (transferData.destination) {
               try {
-                const twilioCallSid = msg.start?.callSid;
-                if (twilioCallSid) {
-                  console.log(`[voice-server] [${callId}] Executing Twilio transfer to ${transferData.destination}`);
+                const providerCallSid = msg.start?.callSid;
+                if (providerCallSid) {
+                  console.log(`[voice-server] [${callId}] Executing ${callProvider} transfer to ${transferData.destination}`);
                   const result = await transferCallWithDial({
-                    callSid: twilioCallSid,
+                    callSid: providerCallSid,
                     destination: transferData.destination,
                     publicUrl: process.env.PUBLIC_URL || "",
                     callerNumber: config.customerNumber,
+                    provider: callProvider as "twilio" | "signalwire",
                   });
                   if (!result.success) {
                     console.error(`[voice-server] [${callId}] Transfer failed:`, result.error);
@@ -238,7 +241,7 @@ wss.on("connection", (ws: WebSocket) => {
                     console.log(`[voice-server] [${callId}] Transfer initiated successfully`);
                   }
                 } else {
-                  console.error(`[voice-server] [${callId}] Transfer failed: no Twilio callSid`);
+                  console.error(`[voice-server] [${callId}] Transfer failed: no callSid from ${callProvider}`);
                 }
               } catch (err) {
                 console.error(`[voice-server] [${callId}] Transfer error:`, err);
@@ -498,6 +501,9 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
           gpu: latest?.gpu || null,
           cpu: latest?.cpu || null,
           systemMemory: latest?.mem || null,
+          processes: latest?.processes || [],
+          disk: latest?.disk || null,
+          network: latest?.network || null,
           ollama: ollamaStatus,
           tts: {
             kokoro: { ok: kokoroOk, url: process.env.KOKORO_API_URL || "http://localhost:8880" },
@@ -932,6 +938,11 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     elevenlabs_api_key: { envKey: "ELEVENLABS_API_KEY", sensitive: true },
     deepseek_api_key: { envKey: "DEEPSEEK_API_KEY", sensitive: true },
     openrouter_api_key: { envKey: "OPENROUTER_API_KEY", sensitive: true },
+    cerebras_api_key: { envKey: "CEREBRAS_API_KEY", sensitive: true },
+    groq_api_key: { envKey: "GROQ_API_KEY", sensitive: true },
+    deepinfra_api_key: { envKey: "DEEPINFRA_API_KEY", sensitive: true },
+    groq_tts_api_key: { envKey: "GROQ_TTS_API_KEY", sensitive: true },
+    groq_stt_api_key: { envKey: "GROQ_STT_API_KEY", sensitive: true },
     twilio_account_sid: { envKey: "TWILIO_ACCOUNT_SID", sensitive: true },
     twilio_auth_token: { envKey: "TWILIO_AUTH_TOKEN", sensitive: true },
     default_llm: { envKey: "DEFAULT_LLM", sensitive: false },
@@ -939,6 +950,9 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     kokoro_voice: { envKey: "KOKORO_VOICE", sensitive: false },
     ollama_flash_attention: { envKey: "OLLAMA_FLASH_ATTENTION", sensitive: false },
     ollama_num_parallel: { envKey: "OLLAMA_NUM_PARALLEL", sensitive: false },
+    sw_project_id: { envKey: "SW_PROJECT_ID", sensitive: true },
+    sw_auth_token: { envKey: "SW_AUTH_TOKEN", sensitive: true },
+    sw_space_url: { envKey: "SW_SPACE_URL", sensitive: false },
   };
 
   // GET /settings -- List current settings (sensitive values masked)
@@ -1097,6 +1111,101 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Session not found" }));
     }
+    return;
+  }
+
+  // POST /amd-result/:callId -- Forward Twilio AMD result to active session
+  if (req.method === "POST" && url.pathname.startsWith("/amd-result/")) {
+    const targetCallId = url.pathname.split("/amd-result/")[1];
+    let body = "";
+    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("end", () => {
+      try {
+        const { answeredBy } = JSON.parse(body);
+        console.log(`[voice-server] AMD result for ${targetCallId}: ${answeredBy}`);
+        const entry = sessions.get(targetCallId);
+        if (entry && entry.session.voicemailDetector) {
+          // Use forceAmdResult to properly handle machine_start (waits for beep)
+          // vs machine_end_beep (speaks immediately)
+          entry.session.voicemailDetector.forceAmdResult(answeredBy);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        } else {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Session not found or no voicemail detector" }));
+        }
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON" }));
+      }
+    });
+    return;
+  }
+
+  // POST /services/:name/:action -- Start/stop GPU services via PM2
+  // Allowed services: kokoro-fastapi, qwen3-tts, ollama
+  if (req.method === "POST" && url.pathname.startsWith("/services/")) {
+    const parts = url.pathname.split("/"); // ["", "services", name, action]
+    const serviceName = parts[2];
+    const action = parts[3]; // "start" or "stop"
+    const ALLOWED_SERVICES = ["kokoro-fastapi", "qwen3-tts", "ollama"];
+
+    if (!ALLOWED_SERVICES.includes(serviceName)) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `Unknown service: ${serviceName}` }));
+      return;
+    }
+    if (action !== "start" && action !== "stop") {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `Invalid action: ${action}. Use start or stop.` }));
+      return;
+    }
+
+    const pm2Cmd = action === "start" ? "restart" : "stop";
+    // exec imported at top level
+    exec(`export PATH=/opt/nvm/versions/node/v24.12.0/bin:$PATH && pm2 ${pm2Cmd} ${serviceName}`, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[voice-server] PM2 ${pm2Cmd} ${serviceName} failed:`, stderr);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: stderr || err.message }));
+      } else {
+        console.log(`[voice-server] PM2 ${pm2Cmd} ${serviceName}: OK`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, service: serviceName, action }));
+      }
+    });
+    return;
+  }
+
+  // GET /services -- List service statuses via PM2
+  if (req.method === "GET" && url.pathname === "/services") {
+    // exec imported at top level
+    exec("export PATH=/opt/nvm/versions/node/v24.12.0/bin:$PATH && pm2 jlist", (err, stdout) => {
+      if (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Failed to get PM2 status" }));
+        return;
+      }
+      try {
+        const pm2List = JSON.parse(stdout);
+        const services = pm2List
+          .filter((p: any) => ["kokoro-fastapi", "qwen3-tts", "ollama"].includes(p.name))
+          .map((p: any) => ({
+            name: p.name,
+            status: p.pm2_env?.status || "unknown",
+            pid: p.pid,
+            uptime: p.pm2_env?.pm_uptime ? Date.now() - p.pm2_env.pm_uptime : 0,
+            restarts: p.pm2_env?.restart_time || 0,
+            memory: Math.round((p.monit?.memory || 0) / 1024 / 1024),
+            cpu: p.monit?.cpu || 0,
+          }));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ services }));
+      } catch {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Failed to parse PM2 output" }));
+      }
+    });
     return;
   }
 
@@ -1606,6 +1715,17 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
               kokoroTTSSingleton = null;
               res.writeHead(500, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ error: "TTS synthesis returned empty audio. Voice pack may still be downloading — try again in 10s." }));
+              return;
+            }
+          } else if (sampleProvider === "kokoclone" || sampleProvider === "clone") {
+            const { KokoCloneTTS } = await import("./providers/tts/kokoclone");
+            const tts = new KokoCloneTTS({ provider: "kokoclone", voiceId: sampleVoice, speed: 1.0 });
+            audioBuffer = await tts.synthesize(sampleText);
+            sampleRate = 16000;
+
+            if (audioBuffer.length === 0) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "KokoClone TTS returned empty audio. Check that the cloned voice exists and dependencies are installed." }));
               return;
             }
           } else if (sampleProvider === "qwen3" || sampleProvider === "qwen3-tts") {

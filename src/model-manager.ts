@@ -33,6 +33,7 @@ const CONFIG_PATH = path.join(DATA_DIR, "model-config.json");
 
 export interface InstalledModel {
   name: string;
+  displayName?: string;
   size: string;
   provider: string;
   installedAt: string;
@@ -43,11 +44,11 @@ export type STTProviderName = "sherpa" | "vosk" | "granite" | "deepgram";
 export interface ModelConfig {
   activeLLM: { provider: "ollama"; model: string } | null;
   activeSTT: { provider: STTProviderName; model: string } | null;
-  activeTTS: { provider: "kokoro" | "piper" | "chatterbox" | "qwen3"; voice: string } | null;
+  activeTTS: { provider: "kokoro" | "piper" | "chatterbox" | "qwen3" | "kokoclone"; voice: string } | null;
   installedModels: {
     llm: Array<{ name: string; size: string; provider: "ollama"; installedAt: string }>;
     stt: Array<{ name: string; size: string; provider: STTProviderName; installedAt: string }>;
-    tts: Array<{ name: string; size: string; provider: "kokoro" | "piper" | "chatterbox" | "qwen3"; installedAt: string }>;
+    tts: Array<{ name: string; size: string; provider: "kokoro" | "piper" | "chatterbox" | "qwen3" | "kokoclone"; installedAt: string }>;
   };
 }
 
@@ -970,6 +971,27 @@ print('ok')
       // Directory may not exist yet
     }
 
+    // Check for KokoClone cloned voices
+    try {
+      const manifestPath = "/data/cloned-voices/manifest.json";
+      const manifestData = await fs.promises.readFile(manifestPath, "utf-8");
+      const clonedVoices = JSON.parse(manifestData);
+      if (Array.isArray(clonedVoices)) {
+        for (const v of clonedVoices) {
+          installed.push({
+            name: v.id,
+            displayName: v.name,
+            size: "cloned",
+            provider: "kokoclone",
+            installedAt: v.createdAt || "",
+            active: activeTTS?.provider === "kokoclone" && activeTTS?.voice === v.id,
+          });
+        }
+      }
+    } catch {
+      // No cloned voices manifest
+    }
+
     // Check for Chatterbox cloned voices
     try {
       const { chatterboxVoiceManager: cvm } = await import("./providers/tts/chatterbox");
@@ -991,7 +1013,7 @@ print('ok')
     this.config.installedModels.tts = installed.map((m) => ({
       name: m.name,
       size: m.size,
-      provider: m.provider as "kokoro" | "piper" | "chatterbox",
+      provider: m.provider as "kokoro" | "piper" | "chatterbox" | "kokoclone",
       installedAt: m.installedAt,
     }));
     await this.saveConfig();

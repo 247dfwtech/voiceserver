@@ -20,7 +20,7 @@ import type { TTSProvider, TTSConfig } from "./interface";
  */
 
 const CLONED_VOICES_DIR = process.env.CLONED_VOICES_DIR || "/data/cloned-voices";
-const KOKOCLONE_SAMPLE_RATE = 24000;
+const KOKOCLONE_SAMPLE_RATE = 16000; // vocos vocoder outputs 16kHz PCM
 
 export interface ClonedVoice {
   id: string;
@@ -216,7 +216,186 @@ export class VoiceCloneManager {
  *
  * Uses Kokoro-ONNX for base synthesis, then Kanade for voice conversion
  * to match the reference speaker.
+ *
+ * Performance: Uses a persistent Python daemon per voice ID so models are
+ * loaded once (~10s cold start) and reused across all synthesis calls (~1s each).
  */
+
+// Daemon Python script — loads models once, processes requests in a loop via stdin/stdout
+const KOKOCLONE_DAEMON_SCRIPT = `
+import sys, struct, json, os
+import numpy as np
+
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+try:
+    from kokoro_onnx import Kokoro
+    from kanade_tokenizer import KanadeModel, load_vocoder, vocode
+    import torchaudio
+    import torch
+except ImportError as e:
+    print(f"KOKOCLONE_ERROR Missing dependency: {e}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+try:
+    # Load models once (HuggingFace weights cached locally after first run)
+    kokoro = Kokoro("/models/kokoro/kokoro-v1.0.onnx", "/models/kokoro/voices-v1.0.bin")
+    kanade = KanadeModel.from_pretrained(repo_id="frothywater/kanade-tokenizer")
+    vocoder = load_vocoder()  # vocos vocoder, outputs 16kHz PCM
+    ref_cache = {}  # cache reference audio by path
+    print("KOKOCLONE_READY", file=sys.stderr, flush=True)
+except Exception as e:
+    import traceback
+    print(f"KOKOCLONE_ERROR model load failed: {e}", file=sys.stderr, flush=True)
+    print(traceback.format_exc(), file=sys.stderr, flush=True)
+    sys.exit(1)
+
+# Request loop: read JSON from stdin, write PCM length+data to stdout
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+        text = req["text"]
+        ref_path = req["refPath"]
+        speed = float(req.get("speed", 1.0))
+        start = __import__("time").time()
+
+        # Cache reference audio (avoid reloading each synthesis)
+        if ref_path not in ref_cache:
+            ref_audio, ref_sr = torchaudio.load(ref_path)
+            if ref_sr != 16000:
+                ref_audio = torchaudio.functional.resample(ref_audio, ref_sr, 16000)
+            ref_cache[ref_path] = ref_audio.mean(dim=0)
+        ref_audio = ref_cache[ref_path]
+
+        # Synthesize base audio with Kokoro (24kHz output)
+        samples, sr = kokoro.create(text, voice="af_heart", speed=speed, lang="en-us")
+
+        # Resample to 16kHz for Kanade
+        source_audio = torch.from_numpy(samples).float()
+        if sr != 16000:
+            source_audio = torchaudio.functional.resample(source_audio, sr, 16000)
+
+        # Voice conversion: source content + reference speaker style
+        with torch.no_grad():
+            mel_spec = kanade.voice_conversion(source_audio, ref_audio)
+            converted_audio = vocode(vocoder, mel_spec.unsqueeze(0))
+
+        # Convert to int16 PCM (vocos outputs 16kHz — no resampling needed in Node.js)
+        audio_np = converted_audio.squeeze().cpu().numpy()
+        audio_int16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
+        pcm_bytes = audio_int16.tobytes()
+
+        sys.stdout.buffer.write(struct.pack("<I", len(pcm_bytes)))
+        sys.stdout.buffer.write(pcm_bytes)
+        sys.stdout.buffer.flush()
+
+        elapsed = __import__("time").time() - start
+        print(f"KOKOCLONE_SYNTH chars={len(text)} samples={len(audio_int16)} dur={len(audio_int16)/16000:.2f}s elapsed={elapsed:.2f}s", file=sys.stderr, flush=True)
+
+    except Exception as e:
+        import traceback
+        print(f"KOKOCLONE_ERROR {e}", file=sys.stderr, flush=True)
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
+        # Write zero-length response so Node.js doesn't hang
+        sys.stdout.buffer.write(struct.pack("<I", 0))
+        sys.stdout.buffer.flush()
+`;
+
+interface DaemonState {
+  proc: ReturnType<typeof spawn>;
+  ready: boolean;
+  readyPromise: Promise<void>;
+  pending: Array<{ resolve: (buf: Buffer) => void; reject: (err: Error) => void; responseBuf: Buffer; expectedLength: number | null }>;
+}
+
+// Global daemon map: voiceId → daemon state (models stay loaded across all calls)
+const _kokocloneDaemons = new Map<string, DaemonState>();
+
+function getOrStartDaemon(voiceId: string): DaemonState {
+  if (_kokocloneDaemons.has(voiceId)) {
+    return _kokocloneDaemons.get(voiceId)!;
+  }
+
+  const proc = spawn("python3", ["-u", "-c", KOKOCLONE_DAEMON_SCRIPT], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, PYTHONUNBUFFERED: "1" },
+  });
+
+  let readyResolve: () => void;
+  let readyReject: (err: Error) => void;
+  const readyPromise = new Promise<void>((res, rej) => {
+    readyResolve = res;
+    readyReject = rej;
+  });
+
+  const state: DaemonState = { proc, ready: false, readyPromise, pending: [] };
+  _kokocloneDaemons.set(voiceId, state);
+
+  let stdoutBuf = Buffer.alloc(0);
+
+  proc.stdout.on("data", (data: Buffer) => {
+    stdoutBuf = Buffer.concat([stdoutBuf, data]);
+
+    // Process all complete responses in the buffer
+    while (state.pending.length > 0) {
+      const current = state.pending[0];
+
+      if (current.expectedLength === null) {
+        if (stdoutBuf.length < 4) break;
+        current.expectedLength = stdoutBuf.readUInt32LE(0);
+        stdoutBuf = stdoutBuf.subarray(4);
+      }
+
+      if (stdoutBuf.length < current.expectedLength) break;
+
+      // Got a complete response
+      const pcmData = stdoutBuf.subarray(0, current.expectedLength);
+      stdoutBuf = stdoutBuf.subarray(current.expectedLength);
+      state.pending.shift();
+      current.resolve(Buffer.from(pcmData));
+    }
+  });
+
+  proc.stderr.on("data", (data: Buffer) => {
+    const msg = data.toString();
+    for (const line of msg.split("\n")) {
+      const l = line.trim();
+      if (!l) continue;
+      if (l.includes("KOKOCLONE_READY")) {
+        state.ready = true;
+        readyResolve!();
+        console.log(`[tts/kokoclone] Daemon ready for voice ${voiceId}`);
+      } else if (l.includes("KOKOCLONE_ERROR")) {
+        console.error(`[tts/kokoclone] ${l}`);
+        if (!state.ready) readyReject!(new Error(l));
+      } else if (l.includes("KOKOCLONE_SYNTH")) {
+        console.log(`[tts/kokoclone] ${l}`);
+      }
+    }
+  });
+
+  proc.on("error", (err) => {
+    console.error(`[tts/kokoclone] Daemon process error: ${err.message}`);
+    _kokocloneDaemons.delete(voiceId);
+    if (!state.ready) readyReject!(err);
+    for (const p of state.pending) p.reject(err);
+    state.pending = [];
+  });
+
+  proc.on("close", (code) => {
+    console.log(`[tts/kokoclone] Daemon for voice ${voiceId} exited (code ${code})`);
+    _kokocloneDaemons.delete(voiceId);
+    if (!state.ready) readyReject!(new Error(`Daemon exited before ready (code ${code})`));
+    for (const p of state.pending) p.reject(new Error(`Daemon exited unexpectedly (code ${code})`));
+    state.pending = [];
+  });
+
+  return state;
+}
+
 export class KokoCloneTTS implements TTSProvider {
   private config: TTSConfig;
   private voiceId: string;
@@ -239,116 +418,42 @@ export class KokoCloneTTS implements TTSProvider {
       throw new Error(`Cloned voice "${this.voiceId}" not found. Upload a reference audio first.`);
     }
 
-    return new Promise((resolve, reject) => {
-      const pythonScript = `
-import sys, json, struct
-import numpy as np
+    const daemon = getOrStartDaemon(this.voiceId);
 
-try:
-    from kokoro_onnx import Kokoro
-    from kanade_tokenizer import KanadeModel, vocode
-    import torchaudio
-    import torch
-except ImportError as e:
-    print(f"KOKOCLONE_ERROR Missing dependency: {e}", file=sys.stderr, flush=True)
-    sys.stdout.buffer.write(struct.pack("<I", 0))
-    sys.stdout.buffer.flush()
-    sys.exit(0)
+    // Wait for daemon to be ready (models loaded) — up to 90s for first cold start
+    if (!daemon.ready) {
+      const timeout = new Promise<never>((_, rej) =>
+        setTimeout(() => rej(new Error("KokoClone daemon startup timed out (90s)")), 90_000)
+      );
+      await Promise.race([daemon.readyPromise, timeout]);
+    }
 
-try:
-    # Load models
-    kokoro = Kokoro.from_pretrained()
-    kanade = KanadeModel.from_pretrained()
-    vocoder = kanade.vocoder
+    // Enqueue synthesis request
+    return new Promise<Buffer>((resolve, reject) => {
+      const entry = { resolve: (pcm: Buffer) => {
+        if (pcm.length === 0) { resolve(Buffer.alloc(0)); return; }
+        const resampled = this.resampleTo16k(pcm, KOKOCLONE_SAMPLE_RATE);
+        onChunk?.(resampled);
+        resolve(resampled);
+      }, reject, responseBuf: Buffer.alloc(0), expectedLength: null as number | null };
+      daemon.pending.push(entry);
 
-    # Load reference audio
-    ref_audio, ref_sr = torchaudio.load("${refPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}")
-    if ref_sr != 24000:
-        ref_audio = torchaudio.functional.resample(ref_audio, ref_sr, 24000)
-    ref_audio = ref_audio.mean(dim=0)  # mono
+      // Send request to daemon
+      const req = JSON.stringify({ text, refPath, speed: this.speed }) + "\n";
+      daemon.proc.stdin!.write(req);
 
-    # Synthesize base audio with Kokoro
-    text = ${JSON.stringify(text)}
-    speed = ${this.speed}
-    samples, sr = kokoro.create(text, voice="af_heart", speed=speed, lang="en-us")
-
-    # Convert to torch tensor
-    source_audio = torch.from_numpy(samples).float()
-
-    # Voice conversion with Kanade
-    with torch.no_grad():
-        converted_mel = kanade.voice_conversion(source_audio.unsqueeze(0), ref_audio.unsqueeze(0))
-        converted_audio = vocode(vocoder, converted_mel)
-
-    # Convert to int16 PCM
-    audio_np = converted_audio.squeeze().cpu().numpy()
-    audio_int16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
-    pcm_bytes = audio_int16.tobytes()
-
-    sys.stdout.buffer.write(struct.pack("<I", len(pcm_bytes)))
-    sys.stdout.buffer.write(pcm_bytes)
-    sys.stdout.buffer.flush()
-
-    print(f"KOKOCLONE_SYNTH chars={len(text)} samples={len(audio_int16)} duration={len(audio_int16)/24000:.2f}s", file=sys.stderr, flush=True)
-
-except Exception as e:
-    print(f"KOKOCLONE_ERROR {e}", file=sys.stderr, flush=True)
-    sys.stdout.buffer.write(struct.pack("<I", 0))
-    sys.stdout.buffer.flush()
-`;
-
-      const proc = spawn("python3", ["-u", "-c", pythonScript], {
-        stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, PYTHONUNBUFFERED: "1" },
-      });
-
-      let responseBuf = Buffer.alloc(0);
-      let expectedLength: number | null = null;
-
-      proc.stdout.on("data", (data: Buffer) => {
-        responseBuf = Buffer.concat([responseBuf, data]);
-
-        if (expectedLength === null && responseBuf.length >= 4) {
-          expectedLength = responseBuf.readUInt32LE(0);
-          responseBuf = responseBuf.subarray(4);
-        }
-
-        if (expectedLength !== null && responseBuf.length >= expectedLength) {
-          const pcmData = responseBuf.subarray(0, expectedLength);
-          if (pcmData.length === 0) {
-            resolve(Buffer.alloc(0));
-            return;
-          }
-          const resampled = this.resampleTo16k(pcmData, KOKOCLONE_SAMPLE_RATE);
-          onChunk?.(resampled);
-          resolve(resampled);
-        }
-      });
-
-      proc.stderr.on("data", (data: Buffer) => {
-        const msg = data.toString().trim();
-        if (msg.includes("KOKOCLONE_ERROR")) {
-          console.error(`[tts/kokoclone] ${msg}`);
-        } else if (msg.includes("KOKOCLONE_SYNTH")) {
-          console.log(`[tts/kokoclone] ${msg}`);
-        }
-      });
-
-      proc.on("error", (err) => {
-        reject(new Error(`KokoClone Python error: ${err.message}`));
-      });
-
-      proc.on("close", (code) => {
-        if (expectedLength === null || (expectedLength !== null && responseBuf.length < expectedLength)) {
-          reject(new Error(`KokoClone process exited with code ${code} before producing audio`));
-        }
-      });
-
-      // Timeout
-      setTimeout(() => {
-        proc.kill("SIGTERM");
-        reject(new Error("KokoClone TTS timed out after 60s"));
+      // Per-request timeout
+      const timer = setTimeout(() => {
+        const idx = daemon.pending.indexOf(entry);
+        if (idx !== -1) daemon.pending.splice(idx, 1);
+        reject(new Error("KokoClone synthesis timed out after 60s"));
       }, 60_000);
+
+      // Clear timer on completion
+      const origResolve = entry.resolve;
+      entry.resolve = (pcm: Buffer) => { clearTimeout(timer); origResolve(pcm); };
+      const origReject = entry.reject;
+      entry.reject = (err: Error) => { clearTimeout(timer); origReject(err); };
     });
   }
 
