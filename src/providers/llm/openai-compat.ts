@@ -19,6 +19,7 @@ export class OpenAICompatLLM implements LLMProvider {
     onToken: (token: string) => void;
     onToolCall: (toolCall: LLMToolCall) => void;
     onDone: (fullText: string) => void;
+    onUsage?: (inputTokens: number, outputTokens: number) => void;
   }): { cancel: () => void } {
     let cancelled = false;
     let abortController: AbortController | null = new AbortController();
@@ -40,6 +41,7 @@ export class OpenAICompatLLM implements LLMProvider {
           temperature: this.config.temperature ?? 0.3,
           max_tokens: effectiveMaxTokens,
           stream: true,
+          stream_options: params.onUsage ? { include_usage: true } : undefined,
         };
 
         if (params.tools && params.tools.length > 0) {
@@ -77,6 +79,14 @@ export class OpenAICompatLLM implements LLMProvider {
               if (tc.id) existing.id = tc.id;
               if (tc.function?.name) existing.name = tc.function.name;
               if (tc.function?.arguments) existing.args += tc.function.arguments;
+            }
+          }
+
+          // Extract token usage from final chunk (OpenAI-compatible APIs)
+          if (params.onUsage && (chunk as unknown as Record<string, unknown>).usage) {
+            const u = (chunk as unknown as Record<string, unknown>).usage as { prompt_tokens?: number; completion_tokens?: number };
+            if (u.prompt_tokens || u.completion_tokens) {
+              params.onUsage(u.prompt_tokens || 0, u.completion_tokens || 0);
             }
           }
         }

@@ -18,6 +18,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { CallSession, type CallSessionConfig, type CostBreakdown } from "./voice-pipeline/call-session";
 import { runPostCallAnalysis } from "./voice-pipeline/analysis-runner";
 import { transferCallWithDial } from "./voice-pipeline/call-transfer";
+import { getOllamaActiveRequests, getOllamaMaxParallel } from "./ollama-concurrency";
 import { modelManager } from "./model-manager";
 import { warmupKokoro, checkKokoroHealth } from "./providers/tts/kokoro";
 import { checkQwen3Health } from "./providers/tts/qwen3";
@@ -356,6 +357,7 @@ async function notifyCallEnded(
     transcript: string;
     duration: number;
     cost: CostBreakdown;
+    overflow?: { used: boolean; count?: number; provider?: string | null; model?: string | null };
   },
   config: CallSessionConfig
 ): Promise<void> {
@@ -405,6 +407,7 @@ async function notifyCallEnded(
           sttProvider: config.transcriber?.provider || "unknown",
           sttModel: config.transcriber?.model || "unknown",
           analysis,
+          overflow: endData.overflow,
           customer: {
             number: config.customerNumber,
             name: config.customerName,
@@ -953,6 +956,8 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     sw_project_id: { envKey: "SW_PROJECT_ID", sensitive: true },
     sw_auth_token: { envKey: "SW_AUTH_TOKEN", sensitive: true },
     sw_space_url: { envKey: "SW_SPACE_URL", sensitive: false },
+    overflow_llm_provider: { envKey: "OVERFLOW_LLM_PROVIDER", sensitive: false },
+    overflow_llm_model: { envKey: "OVERFLOW_LLM_MODEL", sensitive: false },
   };
 
   // GET /settings -- List current settings (sensitive values masked)
@@ -994,7 +999,8 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
         if (applied.length > 0) {
           try {
             const fs = await import("fs");
-            const envPath = process.env.ENV_FILE_PATH || "/opt/voiceserver/.env";
+            const path = await import("path");
+            const envPath = process.env.ENV_FILE_PATH || path.join(process.cwd(), ".env");
             let envContent = "";
             try {
               envContent = fs.readFileSync(envPath, "utf-8");
@@ -1086,16 +1092,31 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
 
   // GET /sessions -- List active sessions (PII masked)
   if (req.method === "GET" && url.pathname === "/sessions") {
-    const sessionList = Array.from(sessions.entries()).map(([id, entry]) => ({
-      callId: id,
-      assistantId: entry.config.assistantId,
-      customerNumber: maskPhone(entry.config.customerNumber),
-      state: entry.session.getState(),
-      duration: Math.round((Date.now() - entry.startedAt) / 1000),
-    }));
+    let overflowActiveCount = 0;
+    const sessionList = Array.from(sessions.entries()).map(([id, entry]) => {
+      const isOverflow = entry.session.isUsingOverflow();
+      if (isOverflow) overflowActiveCount++;
+      return {
+        callId: id,
+        assistantId: entry.config.assistantId,
+        customerNumber: maskPhone(entry.config.customerNumber),
+        state: entry.session.getState(),
+        duration: Math.round((Date.now() - entry.startedAt) / 1000),
+        isOverflow,
+      };
+    });
 
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ sessions: sessionList, count: sessionList.length }));
+    res.end(JSON.stringify({
+      sessions: sessionList,
+      count: sessionList.length,
+      ollama: { active: getOllamaActiveRequests(), max: getOllamaMaxParallel() },
+      overflow: {
+        active: overflowActiveCount,
+        provider: process.env.OVERFLOW_LLM_PROVIDER || null,
+        model: process.env.OVERFLOW_LLM_MODEL || null,
+      },
+    }));
     return;
   }
 

@@ -39,5 +39,6 @@ export interface LLMProvider {
     onToken: (token: string) => void;
     onToolCall: (toolCall: LLMToolCall) => void;
     onDone: (fullText: string) => void;
+    onUsage?: (inputTokens: number, outputTokens: number) => void;
   }): { cancel: () => void };
 }

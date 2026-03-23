@@ -11,6 +11,7 @@ import type { STTProvider } from "../providers/stt/interface";
 import type { TTSProvider } from "../providers/tts/interface";
 import type { LLMProvider, LLMMessage, LLMToolDefinition, LLMToolCall } from "../providers/llm/interface";
 import { executeTool, type ToolDefinition, type ToolResult } from "./tool-executor";
+import { incrementOllama, decrementOllama, getOllamaActiveRequests, getOllamaMaxParallel } from "../ollama-concurrency";
 
 // ---- Inline utilities to avoid external dependencies ----
 
@@ -31,6 +32,7 @@ export interface CostBreakdown {
   tts: number;
   transport: number;
   analysis: number;
+  overflowLlm: number;
   total: number;
 }
 
@@ -39,6 +41,9 @@ class CostTracker {
   private sttMinutes = 0;
   private llmInputTokens = 0;
   private llmOutputTokens = 0;
+  private overflowLlmInputTokens = 0;
+  private overflowLlmOutputTokens = 0;
+  private overflowLlmModel: string | null = null;
   private ttsCharacters = 0;
   private transportMinutes = 0;
 
@@ -57,6 +62,11 @@ class CostTracker {
       "gpt-4o": { input: 0.0025, output: 0.01 },
       "gpt-4o-mini": { input: 0.00015, output: 0.0006 },
       "deepseek-chat": { input: 0.00014, output: 0.00028 },
+      "llama-3.3-70b-versatile": { input: 0.00059, output: 0.00079 },
+      "llama-3.1-8b-instant": { input: 0.00005, output: 0.00008 },
+      "llama-3.3-70b": { input: 0.0001, output: 0.0001 },
+      "meta-llama/Llama-3.3-70B-Instruct": { input: 0.00035, output: 0.0004 },
+      "meta-llama/Meta-Llama-3.1-8B-Instruct": { input: 0.00003, output: 0.00005 },
     } as Record<string, { input: number; output: number }>,
     tts: {
       elevenlabs: parseFloat(process.env.COST_TTS_ELEVENLABS || "0.18"),
@@ -83,6 +93,12 @@ class CostTracker {
     this.llmOutputTokens += outputTokens;
   }
 
+  addOverflowLLMUsage(inputTokens: number, outputTokens: number, model: string): void {
+    this.overflowLlmInputTokens += inputTokens;
+    this.overflowLlmOutputTokens += outputTokens;
+    this.overflowLlmModel = model;
+  }
+
   addTTSUsage(characterCount: number): void {
     this.ttsCharacters += characterCount;
   }
@@ -100,12 +116,19 @@ class CostTracker {
       (this.llmInputTokens / 1000) * llmPricing.input +
       (this.llmOutputTokens / 1000) * llmPricing.output;
 
+    const overflowPricing = this.overflowLlmModel
+      ? (CostTracker.PRICING.llm[this.overflowLlmModel] ?? { input: 0.001, output: 0.002 })
+      : { input: 0, output: 0 };
+    const overflowLlmCost =
+      (this.overflowLlmInputTokens / 1000) * overflowPricing.input +
+      (this.overflowLlmOutputTokens / 1000) * overflowPricing.output;
+
     const ttsRate = CostTracker.PRICING.tts[this.ttsProvider] ?? 0;
     const ttsCost = (this.ttsCharacters / 1000) * ttsRate;
 
     const transportCost = this.transportMinutes * CostTracker.PRICING.transport.twilio;
 
-    const total = sttCost + llmCost + ttsCost + transportCost;
+    const total = sttCost + llmCost + overflowLlmCost + ttsCost + transportCost;
 
     return {
       stt: Math.round(sttCost * 10000) / 10000,
@@ -113,6 +136,7 @@ class CostTracker {
       tts: Math.round(ttsCost * 10000) / 10000,
       transport: Math.round(transportCost * 10000) / 10000,
       analysis: 0, // Set post-call by notifyCallEnded
+      overflowLlm: Math.round(overflowLlmCost * 10000) / 10000,
       total: Math.round(total * 10000) / 10000,
     };
   }
@@ -381,6 +405,12 @@ export class CallSession extends EventEmitter {
   private playingFirstMessage = false; // true while first message TTS is playing — ignore user speech
   private pendingAudioDurationMs = 0; // tracks audio duration queued but not yet played by Twilio
   private lastBargeInAt: number | null = null; // timestamp of last barge-in for backoff
+
+  // Overflow LLM tracking
+  private overflowCount = 0; // how many LLM turns used overflow this call
+  private overflowProvider: string | null = null;
+  private overflowModel: string | null = null;
+  private currentlyUsingOverflow = false; // true if the current/last LLM request used overflow
 
   constructor(config: CallSessionConfig) {
     super();
@@ -839,6 +869,40 @@ export class CallSession extends EventEmitter {
   private processWithLLM(): void {
     if (!this.llm) return;
 
+    // --- Overflow LLM routing ---
+    const isOllama = this.config.model.provider === "ollama" || !this.config.model.provider;
+    let llmToUse: LLMProvider = this.llm;
+    let usingOverflow = false;
+    let decrementOnComplete = false;
+
+    if (isOllama) {
+      const active = getOllamaActiveRequests();
+      const max = getOllamaMaxParallel();
+      const overflowProvider = process.env.OVERFLOW_LLM_PROVIDER;
+      const overflowModel = process.env.OVERFLOW_LLM_MODEL;
+
+      if (active >= max && overflowProvider && overflowModel) {
+        // Overflow to cloud API
+        console.log(`[session:${this.config.callId}] Overflow triggered: ollama ${active}/${max} → ${overflowProvider}/${overflowModel}`);
+        llmToUse = createLLMProvider({
+          provider: overflowProvider,
+          model: overflowModel,
+          temperature: this.config.model.temperature,
+          maxTokens: this.config.model.maxTokens,
+        });
+        usingOverflow = true;
+        this.overflowCount++;
+        this.overflowProvider = overflowProvider;
+        this.overflowModel = overflowModel;
+        this.currentlyUsingOverflow = true;
+      } else {
+        // Use Ollama — track the slot
+        incrementOllama();
+        decrementOnComplete = true;
+        this.currentlyUsingOverflow = false;
+      }
+    }
+
     // In trigger-phrases mode, don't send tools to the LLM
     const useTriggerPhrases = this.config.toolMode === "trigger-phrases";
     console.log(`[session:${this.config.callId}] LLM dispatch: toolMode=${this.config.toolMode || "not-set"}, tools=${this.config.tools.length}, triggerPhrases=${(this.config.triggerPhrases || []).length}, useTriggerPhrases=${useTriggerPhrases}`);
@@ -890,10 +954,20 @@ export class CallSession extends EventEmitter {
 
     let fullResponse = "";
     let ignoredToolCall = false;
+    let decremented = false;
+    const releaseOllamaSlot = () => {
+      if (decrementOnComplete && !decremented) {
+        decremented = true;
+        decrementOllama();
+      }
+    };
 
-    const { cancel } = this.llm.streamCompletion({
+    const { cancel } = llmToUse.streamCompletion({
       messages: this.conversationHistory,
       tools: llmTools.length > 0 ? llmTools : undefined,
+      onUsage: usingOverflow
+        ? (input, output) => this.costTracker.addOverflowLLMUsage(input, output, this.overflowModel!)
+        : (input, output) => this.costTracker.addLLMUsage(input, output),
       onToken: (token: string) => {
         fullResponse += token;
         if (this.shouldStartTTS(fullResponse)) {
@@ -921,6 +995,7 @@ export class CallSession extends EventEmitter {
         this.handleToolCall(toolCall);
       },
       onDone: (text: string) => {
+        releaseOllamaSlot();
         const remaining = (fullResponse || text).trim();
 
         // If LLM produced only a tool call with no text in trigger-phrases mode,
@@ -984,7 +1059,10 @@ export class CallSession extends EventEmitter {
       },
     });
 
-    this.currentLLMCancel = cancel;
+    this.currentLLMCancel = () => {
+      releaseOllamaSlot();
+      cancel();
+    };
   }
 
   private shouldStartTTS(text: string): boolean {
@@ -1203,6 +1281,9 @@ export class CallSession extends EventEmitter {
       transcript: transcriptStr,
       duration,
       cost: this.costTracker.getCost(),
+      overflow: this.overflowCount > 0
+        ? { used: true, count: this.overflowCount, provider: this.overflowProvider, model: this.overflowModel }
+        : { used: false },
     });
   }
 
@@ -1212,5 +1293,9 @@ export class CallSession extends EventEmitter {
 
   getTranscript(): string {
     return this.fullTranscript.map((t) => `${t.role}: ${t.content}`).join("\n");
+  }
+
+  isUsingOverflow(): boolean {
+    return this.currentlyUsingOverflow;
   }
 }
