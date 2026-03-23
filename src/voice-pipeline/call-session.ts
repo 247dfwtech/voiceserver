@@ -176,8 +176,8 @@ class VoicemailDetector {
     this.attemptsRemaining = config.maxRetries ?? 3;
     this.maxVoicemailWaitSeconds = config.maxVoicemailWaitSeconds ?? 25;
 
-    // Skip audio analysis if provider is "twilio" only
-    const useAudio = config.provider !== "twilio";
+    // Skip audio analysis if provider is AMD-only (twilio or signalwire)
+    const useAudio = config.provider !== "twilio" && config.provider !== "signalwire";
 
     if (config.twilioAmdResult) {
       const amd = config.twilioAmdResult.toLowerCase();
