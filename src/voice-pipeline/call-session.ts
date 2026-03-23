@@ -158,7 +158,7 @@ class VoicemailDetector {
   private maxContinuousSpeech = 0;
   private resolved = false;
   private result: VMDetectionResult = "unknown";
-  private resolveCallback: ((result: VMDetectionResult) => void) | null = null;
+  private resolveCallbacks: ((result: VMDetectionResult) => void)[] = [];
   private attemptsRemaining: number;
   private pendingMachineStart = false;
   private amdBeepReceived = false;
@@ -284,14 +284,13 @@ class VoicemailDetector {
     if (this.resolved) return;
     this.resolved = true;
     this.result = result;
-    if (this.resolveCallback) {
-      this.resolveCallback(result);
-    }
+    for (const cb of this.resolveCallbacks) cb(result);
+    this.resolveCallbacks = [];
   }
 
   getResult(): Promise<VMDetectionResult> {
     if (this.resolved) return Promise.resolve(this.result);
-    return new Promise((resolve) => { this.resolveCallback = resolve; });
+    return new Promise((resolve) => { this.resolveCallbacks.push(resolve); });
   }
 
   isResolved(): boolean { return this.resolved; }
