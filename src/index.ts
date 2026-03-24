@@ -951,6 +951,7 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     groq_api_key: { envKey: "GROQ_API_KEY", sensitive: true },
     deepinfra_api_key: { envKey: "DEEPINFRA_API_KEY", sensitive: true },
     groq_tts_api_key: { envKey: "GROQ_TTS_API_KEY", sensitive: true },
+    unrealspeech_api_key: { envKey: "UNREALSPEECH_API_KEY", sensitive: true },
     groq_stt_api_key: { envKey: "GROQ_STT_API_KEY", sensitive: true },
     twilio_account_sid: { envKey: "TWILIO_ACCOUNT_SID", sensitive: true },
     twilio_auth_token: { envKey: "TWILIO_AUTH_TOKEN", sensitive: true },
@@ -1907,6 +1908,11 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
               res.end(JSON.stringify({ error: "Chatterbox TTS returned empty audio." }));
               return;
             }
+          } else if (sampleProvider === "unrealspeech") {
+            const { UnrealSpeechTTS } = await import("./providers/tts/unrealspeech");
+            const tts = new UnrealSpeechTTS({ provider: "unrealspeech", voiceId: sampleVoice });
+            audioBuffer = await tts.synthesize(sampleText);
+            sampleRate = 16000;
           } else {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: `Provider '${sampleProvider}' not supported for preview` }));

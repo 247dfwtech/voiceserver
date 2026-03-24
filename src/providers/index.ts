@@ -12,6 +12,8 @@ import { KokoCloneTTS } from "./tts/kokoclone";
 import { ChatterboxTurboTTS } from "./tts/chatterbox";
 import { Qwen3TTS } from "./tts/qwen3";
 import { FishSpeechTTS } from "./tts/fish-speech";
+import { UnrealSpeechTTS } from "./tts/unrealspeech";
+import { GroqTTS } from "./tts/groq";
 import { checkKokoroHealth } from "./tts/kokoro";
 import { checkQwen3Health } from "./tts/qwen3";
 import { checkFishSpeechHealth } from "./tts/fish-speech";
@@ -128,6 +130,24 @@ export function createTTSProvider(config: TTSConfig): TTSProvider {
     case "fish-speech":
     case "fish":
       return new FishSpeechTTS(config);
+    case "groq":
+    case "groq-tts": {
+      const groqTtsKey = process.env.GROQ_TTS_API_KEY;
+      if (!groqTtsKey) {
+        console.warn("[providers] Groq TTS requested but GROQ_TTS_API_KEY not set, falling back to Kokoro");
+        return new KokoroTTS(config);
+      }
+      console.log(`[providers] Using Groq TTS (voice=${config.voiceId || "Fritz-PlayAI"})`);
+      return new GroqTTS(config);
+    }
+    case "unrealspeech": {
+      const apiKey = process.env.UNREALSPEECH_API_KEY;
+      if (!apiKey) {
+        console.warn("[providers] UnrealSpeech requested but UNREALSPEECH_API_KEY not set, falling back to Kokoro");
+        return new KokoroTTS(config);
+      }
+      return new UnrealSpeechTTS(config);
+    }
     case "piper":
       return new PiperTTS(config);
     default:
