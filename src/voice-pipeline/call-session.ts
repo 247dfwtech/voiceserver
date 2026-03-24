@@ -850,13 +850,21 @@ export class CallSession extends EventEmitter {
             type: "function",
             function: { name: tool.name || tp.toolName, arguments: "{}" },
           };
-          this.waitForTTSFinish().then(() => this.handleToolCall(toolCall));
+          this.waitForTTSFinish().then(async () => {
+            // Extra buffer for network transit — audio may still be in Twilio/SignalWire buffer
+            await new Promise(r => setTimeout(r, 1500));
+            this.handleToolCall(toolCall);
+          });
         } else if (tp.toolName === "end_call" || tp.toolName === "endCall") {
           // Built-in end call
-          this.waitForTTSFinish().then(() => this.endCall("assistant-ended-call"));
+          this.waitForTTSFinish().then(async () => {
+            await new Promise(r => setTimeout(r, 1500));
+            this.endCall("assistant-ended-call");
+          });
         } else if (tp.toolName === "transfer" || tp.toolName === "transferCall") {
           // Built-in transfer with fallback destination
-          this.waitForTTSFinish().then(() => {
+          this.waitForTTSFinish().then(async () => {
+            await new Promise(r => setTimeout(r, 1500));
             this.state = "transferring";
             this.emit("transfer", { destination: this.config.fallbackDestination });
           });
@@ -1231,12 +1239,15 @@ export class CallSession extends EventEmitter {
 
     if (result.action === "endCall") {
       await this.waitForTTSFinish();
+      // Extra buffer for network transit — audio may still be in Twilio/SignalWire buffer
+      await new Promise(r => setTimeout(r, 1500));
       this.endCall("assistant-ended-call");
       return;
     }
 
     if (result.action === "transfer") {
       await this.waitForTTSFinish();
+      await new Promise(r => setTimeout(r, 1500));
       this.state = "transferring";
       this.emit("transfer", result.actionData);
       return;
