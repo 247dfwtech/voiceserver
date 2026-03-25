@@ -9,13 +9,17 @@ Handles real-time STT → LLM → TTS for concurrent AI phone calls.
 - **Runtime**: Node.js + TypeScript, managed by PM2 on GPU server
 - **Deploy**: `ssh -p 45194 root@70.29.210.33` then `cd /opt/voiceserverV2 && git pull && npx tsc && pm2 restart voiceserver --update-env`
 - **Ports**: 8765 (WebSocket for Twilio/SignalWire media streams), 8766 (IPC HTTP)
-- **RAM**: 63GB total — Ollama NUM_PARALLEL=14 uses ~49GB KV cache
+- **RAM**: 63GB total
 - **Tunnels**: Cloudflare quick tunnels (random URLs on restart). URLs configured in vapiclone Settings page (DB-backed).
 
 ## Verified Production Settings (2026-03-23)
 
 These exact settings produced perfect calls on both Twilio and SignalWire:
-- **LLM**: Ollama llama3.2:3b (NUM_PARALLEL=14, FLASH_ATTENTION=1)
+- **LLM**: Ollama llama3.2:3b-4k (NUM_PARALLEL=9, FLASH_ATTENTION=1, 4K context)
+  - IMPORTANT: Use `-4k` model variants (created via Modelfile with `PARAMETER num_ctx 4096`)
+  - Default 32K context wastes VRAM (52GB, spills to CPU). 4K is sufficient for phone calls.
+  - Available models: `llama3.2:3b-4k`, `qwen2.5:3b-4k`, `phi4-mini-4k`
+  - To create a 4K variant: `echo "FROM model:tag\nPARAMETER num_ctx 4096" | ollama create model:tag-4k`
 - **STT**: Deepgram Flux (flux-general-en, v2 API, mulaw 8kHz direct)
 - **TTS**: Kokoro-82M via FastAPI (voice: am_fenrir, port 8880)
 - **AMD**: Audio-based voicemail detection (no Twilio/SignalWire AMD charges)
@@ -81,7 +85,8 @@ wss://api.deepgram.com/v2/listen?model=flux-general-en&encoding=mulaw&sample_rat
 
 **No Twilio/SignalWire AMD used** — all detection is built-in audio analysis in `call-session.ts`:
 - `VoicemailDetector` class: RMS energy analysis on PCM frames, speech ratio, continuous speech detection
-- Long continuous speech (3s+) → machine detected → enters beep-wait mode → waits for silence → resolves as voicemail
+- Long continuous speech (2s+) → machine detected → enters beep-wait mode → waits for silence → resolves as voicemail
+- Thresholds (tuned 2026-03-24): speech ratio >65%, max continuous >30 frames (600ms), min 80 speech frames
 - Short speech with pauses → human → delivers first message
 - First message HELD while detection runs (~5s analysis window)
 - All STT transcripts suppressed while detection pending AND after voicemail confirmed
@@ -89,6 +94,14 @@ wss://api.deepgram.com/v2/listen?model=flux-general-en&encoding=mulaw&sample_rat
 - If `voicemailMessage` set → TTS speaks it → `waitForTTSFinish` waits actual audio duration (up to 60s) → hangs up
 - If no `voicemailMessage` → hangs up immediately
 - dialer4clone controls whether voicemailMessage is sent per-call (N/M frequency)
+- System prompt includes voicemail awareness as LLM-level fallback detection
+
+## Transfer Detection — Distinct EndedReasons (2026-03-24)
+
+Stream stop no longer always reports `twilio-stream-stopped`. `SessionEntry` tracks `transferInitiated` flag:
+- Transfer tool fires → flag set → stream stops → `endedReason: "call-forwarded"`
+- No transfer → stream stops → `endedReason: "customer-ended-call"`
+- dialer4clone uses `call-forwarded` to trigger auto phone lookup (no more false positives)
 
 ## Post-Call Analysis
 
@@ -117,3 +130,4 @@ cd /opt/voiceserverV2 && git pull && npx tsc && pm2 restart voiceserver --update
 - **GitHub Actions deploy is a no-op** — must deploy manually via SSH
 - **Vast.ai instance IP is dynamic** — tunnel URLs change on reboot, must update in vapiclone Settings
 - **Stale src/call-session.ts on GPU** — moved to src/voice-pipeline/call-session.ts, old file causes harmless tsc warnings
+- **Build path on GPU**: `export PATH=/opt/nvm/versions/node/v24.12.0/bin:$PATH` required before npm/npx commands
