@@ -248,7 +248,7 @@ wss.on("connection", (ws: WebSocket) => {
                   } else {
                     console.log(`[voice-server] [${callId}] Transfer initiated successfully`);
                     // Mark transfer so stream-stop uses "call-forwarded" instead of "customer-ended-call"
-                    const transferEntry = sessions.get(callId);
+                    const transferEntry = callId ? sessions.get(callId) : undefined;
                     if (transferEntry) transferEntry.transferInitiated = true;
                   }
                 } else {
