@@ -37,6 +37,7 @@ export const KOKORO_VOICES = [
   { id: "am_liam", name: "Liam", gender: "male", accent: "american", description: "Warm, trustworthy" },
   { id: "am_michael", name: "Michael", gender: "male", accent: "american", description: "Versatile, natural" },
   { id: "am_onyx", name: "Onyx", gender: "male", accent: "american", description: "Smooth, deep" },
+  { id: "am_adrian", name: "Adrian", gender: "male", accent: "american", description: "Custom, trained voice" },
   // British Female
   { id: "bf_emma", name: "Emma", gender: "female", accent: "british", description: "British, refined" },
   { id: "bf_isabella", name: "Isabella", gender: "female", accent: "british", description: "British, elegant" },

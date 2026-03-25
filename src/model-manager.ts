@@ -6,7 +6,7 @@
  * Fallback STT: Vosk (CPU-only, lightweight)
  * GPU STT: IBM Granite 4.0 1B Speech (self-hosted, keyword biasing)
  * Cloud STT: Deepgram Flux (paid, native end-of-turn detection)
- * Default LLM: llama3.2:3b (ultra-fast, 2GB VRAM, 0.7s first-speech)
+ * Default LLM: llama3.2:3b-4k (ultra-fast, 2GB VRAM, 4K context for phone calls)
  *
  * Default TTS: Kokoro-82M (#1 TTS Arena, near-human quality, Apache 2.0)
  * Fallback TTS: Piper (ultra-lightweight CPU option)
@@ -137,6 +137,7 @@ const KOKORO_VOICE_CATALOG: TTSVoiceInfo[] = [
   { name: "am_liam", description: "Liam — Warm, trustworthy", provider: "kokoro", gender: "male", accent: "american" },
   { name: "am_michael", description: "Michael — Versatile, natural", provider: "kokoro", gender: "male", accent: "american" },
   { name: "am_onyx", description: "Onyx — Smooth, deep", provider: "kokoro", gender: "male", accent: "american" },
+  { name: "am_adrian", description: "Adrian — Custom, trained voice", provider: "kokoro", gender: "male", accent: "american" },
   // British Female
   { name: "bf_emma", description: "Emma — British, refined", provider: "kokoro", gender: "female", accent: "british" },
   { name: "bf_isabella", description: "Isabella — British, elegant", provider: "kokoro", gender: "female", accent: "british" },
@@ -190,7 +191,7 @@ export class ModelManager {
   }
 
   // Default LLM to auto-pull on first boot if no LLM is configured
-  private static readonly DEFAULT_LLM = "llama3.2:3b";
+  private static readonly DEFAULT_LLM = process.env.DEFAULT_LLM || "llama3.2:3b-4k";
 
   private defaultConfig(): ModelConfig {
     return {
