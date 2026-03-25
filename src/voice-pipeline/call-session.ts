@@ -171,7 +171,7 @@ class VoicemailDetector {
   constructor(config: { analysisWindowSeconds?: number; speechThreshold?: number; continuousSpeechFramesThreshold?: number; twilioAmdResult?: string; initialDelaySeconds?: number; maxRetries?: number; provider?: string; maxVoicemailWaitSeconds?: number } = {}) {
     this.analysisWindowSeconds = config.analysisWindowSeconds ?? 5;
     this.speechThreshold = config.speechThreshold ?? 300;
-    this.continuousSpeechFramesThreshold = config.continuousSpeechFramesThreshold ?? 150; // 150 * 20ms = 3s of unbroken speech
+    this.continuousSpeechFramesThreshold = config.continuousSpeechFramesThreshold ?? 100; // 100 * 20ms = 2s of unbroken speech
     this.initialDelayFrames = Math.round(((config.initialDelaySeconds ?? 1) * 1000) / 20); // convert seconds to 20ms frames
     this.attemptsRemaining = config.maxRetries ?? 3;
     this.maxVoicemailWaitSeconds = config.maxVoicemailWaitSeconds ?? 25;
@@ -271,9 +271,9 @@ class VoicemailDetector {
   private makeDecision(): void {
     if (this.resolved) return;
     const speechRatio = this.speechFrameCount / this.totalFrames;
-    // Require high speech ratio (80%), long continuous speech (40+ frames = 800ms),
-    // and minimum total speech frames (100+) to avoid false positives on talkative humans
-    if (speechRatio > 0.8 && this.maxContinuousSpeech > 40 && this.speechFrameCount > 100) {
+    // Require sustained speech ratio (65%), continuous speech (30+ frames = 600ms),
+    // and minimum total speech frames (80+) to catch more voicemail greetings
+    if (speechRatio > 0.65 && this.maxContinuousSpeech > 30 && this.speechFrameCount > 80) {
       this.resolve("voicemail");
     } else {
       this.resolve("human");

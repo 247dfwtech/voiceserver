@@ -18,7 +18,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { CallSession, type CallSessionConfig, type CostBreakdown } from "./voice-pipeline/call-session";
 import { runPostCallAnalysis } from "./voice-pipeline/analysis-runner";
 import { transferCallWithDial } from "./voice-pipeline/call-transfer";
-import { getOllamaActiveRequests, getOllamaMaxParallel } from "./ollama-concurrency";
+import { getOllamaActiveRequests, getOllamaMaxParallel, incrementOllama, decrementOllama } from "./ollama-concurrency";
+import { createLLMProvider } from "./providers";
+import type { LLMToolDefinition, LLMToolCall, LLMMessage } from "./providers/llm/interface";
 import { modelManager } from "./model-manager";
 import { warmupKokoro, checkKokoroHealth } from "./providers/tts/kokoro";
 import { checkQwen3Health } from "./providers/tts/qwen3";
@@ -49,6 +51,7 @@ interface SessionEntry {
   config: CallSessionConfig;
   startedAt: number;
   twilioCallSid?: string;
+  transferInitiated?: boolean;
 }
 
 const sessions = new Map<string, SessionEntry>();
@@ -244,6 +247,9 @@ wss.on("connection", (ws: WebSocket) => {
                     console.error(`[voice-server] [${callId}] Transfer failed:`, result.error);
                   } else {
                     console.log(`[voice-server] [${callId}] Transfer initiated successfully`);
+                    // Mark transfer so stream-stop uses "call-forwarded" instead of "customer-ended-call"
+                    const transferEntry = sessions.get(callId);
+                    if (transferEntry) transferEntry.transferInitiated = true;
                   }
                 } else {
                   console.error(`[voice-server] [${callId}] Transfer failed: no callSid from ${callProvider}`);
@@ -323,11 +329,14 @@ wss.on("connection", (ws: WebSocket) => {
         }
 
         case "stop": {
-          console.log(`[voice-server] Stream stopped: callId=${callId}`);
           if (callId) {
             const entry = sessions.get(callId);
             if (entry) {
-              entry.session.endCall("twilio-stream-stopped");
+              const reason = entry.transferInitiated ? "call-forwarded" : "customer-ended-call";
+              console.log(`[voice-server] Stream stopped: callId=${callId} reason=${reason} (transferInitiated=${!!entry.transferInitiated})`);
+              entry.session.endCall(reason);
+            } else {
+              console.log(`[voice-server] Stream stopped: callId=${callId} (no session)`);
             }
           }
           break;
@@ -1942,6 +1951,216 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
+  // ---- POST /test-chat — LLM chat using same providers/tools as live calls ----
+  if (req.method === "POST" && url.pathname === "/test-chat") {
+    readBody(req, MAX_IPC_BODY_BYTES)
+      .then(async (raw) => {
+        const body = JSON.parse(raw);
+        const { systemPrompt, messages, tools: bodyTools, toolMode, triggerPhrases, model } = body;
+
+        if (!systemPrompt || !messages || !model) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing required fields: systemPrompt, messages, model" }));
+          return;
+        }
+
+        // --- Overflow LLM routing (same as call-session.ts lines 872-904) ---
+        const isOllama = model.provider === "ollama" || !model.provider;
+        let usingOverflow = false;
+        let decrementOnComplete = false;
+        let llmProvider;
+
+        try {
+          if (isOllama) {
+            const active = getOllamaActiveRequests();
+            const max = getOllamaMaxParallel();
+            const overflowProvider = process.env.OVERFLOW_LLM_PROVIDER;
+            const overflowModel = process.env.OVERFLOW_LLM_MODEL;
+
+            if (active >= max && overflowProvider && overflowModel) {
+              console.log(`[test-chat] Overflow triggered: ollama ${active}/${max} → ${overflowProvider}/${overflowModel}`);
+              llmProvider = createLLMProvider({
+                provider: overflowProvider,
+                model: overflowModel,
+                temperature: model.temperature,
+                maxTokens: model.maxTokens,
+              });
+              usingOverflow = true;
+            } else {
+              incrementOllama();
+              decrementOnComplete = true;
+              llmProvider = createLLMProvider(model);
+            }
+          } else {
+            llmProvider = createLLMProvider(model);
+          }
+        } catch (err) {
+          ipcError(res, err, "POST /test-chat create provider", 500);
+          return;
+        }
+
+        // --- Build tool definitions (same as call-session.ts lines 906-954) ---
+        const useTriggerPhrases = toolMode === "trigger-phrases";
+        const safeTools = bodyTools || [];
+
+        const llmTools: LLMToolDefinition[] = useTriggerPhrases ? [] : safeTools
+          .filter((t: any) => t.functionDefinition)
+          .map((t: any) => ({
+            type: "function" as const,
+            function: {
+              name: t.functionDefinition.name,
+              description: t.functionDefinition.description,
+              parameters: t.functionDefinition.parameters,
+            },
+          }));
+
+        if (!useTriggerPhrases) {
+          for (const t of safeTools) {
+            if (t.type === "endCall" && !t.functionDefinition) {
+              llmTools.push({ type: "function", function: { name: "end_call", description: "End the phone call", parameters: { type: "object", properties: {} } } });
+            }
+            if (t.type === "transferCall" && !t.functionDefinition) {
+              llmTools.push({ type: "function", function: { name: t.name, description: t.description || "Transfer the call", parameters: { type: "object", properties: {} } } });
+            }
+            if (t.type === "dtmf" && !t.functionDefinition) {
+              llmTools.push({ type: "function", function: { name: t.name, description: t.description || "Send DTMF tones", parameters: { type: "object", properties: {} } } });
+            }
+          }
+        }
+
+        // --- Build LLM messages ---
+        const llmMessages: LLMMessage[] = [
+          { role: "system", content: systemPrompt },
+          ...messages.map((m: any) => ({ role: m.role as "user" | "assistant", content: m.content })),
+        ];
+
+        // --- Run streamCompletion as a Promise ---
+        const releaseSlot = () => {
+          if (decrementOnComplete) {
+            decrementOnComplete = false;
+            decrementOllama();
+          }
+        };
+
+        const TIMEOUT_MS = 30_000;
+        let timedOut = false;
+
+        try {
+          const result = await new Promise<{ fullText: string; toolCalls: LLMToolCall[]; ignoredToolCall: boolean }>((resolve, reject) => {
+            let fullText = "";
+            const collectedToolCalls: LLMToolCall[] = [];
+            let ignoredToolCall = false;
+
+            const timeout = setTimeout(() => {
+              timedOut = true;
+              cancelFn?.();
+              releaseSlot();
+              reject(new Error("LLM request timed out after 30s"));
+            }, TIMEOUT_MS);
+
+            let cancelFn: (() => void) | null = null;
+            const { cancel } = llmProvider.streamCompletion({
+              messages: llmMessages,
+              tools: llmTools.length > 0 ? llmTools : undefined,
+              onToken: (token: string) => { fullText += token; },
+              onToolCall: (toolCall: LLMToolCall) => {
+                if (useTriggerPhrases) {
+                  ignoredToolCall = true;
+                  return;
+                }
+                collectedToolCalls.push(toolCall);
+              },
+              onDone: () => {
+                clearTimeout(timeout);
+                if (!timedOut) resolve({ fullText, toolCalls: collectedToolCalls, ignoredToolCall });
+              },
+            });
+            cancelFn = cancel;
+          });
+
+          releaseSlot();
+
+          let reply = result.fullText;
+
+          // --- Handle tool-call-only response in trigger-phrases mode (retry) ---
+          if (useTriggerPhrases && result.ignoredToolCall && !reply.trim()) {
+            console.log("[test-chat] LLM produced only tool call, no text — retrying with clean messages");
+            const cleanMessages: LLMMessage[] = llmMessages.filter(
+              (m: any) => m.role !== "tool" && !m.tool_calls && !m.tool_call_id
+            );
+            cleanMessages.push({ role: "system", content: "Respond naturally to the customer. Do not attempt to call any functions or tools. Just speak." });
+
+            const retryResult = await new Promise<{ fullText: string }>((resolve, reject) => {
+              let fullText = "";
+              const timeout = setTimeout(() => { reject(new Error("Retry timed out")); }, TIMEOUT_MS);
+              llmProvider.streamCompletion({
+                messages: cleanMessages,
+                onToken: (token: string) => { fullText += token; },
+                onToolCall: () => {},
+                onDone: () => { clearTimeout(timeout); resolve({ fullText }); },
+              });
+            });
+            reply = retryResult.fullText;
+          }
+
+          // --- Strip <think> blocks ---
+          reply = reply.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+          reply = reply.replace(/<think>[\s\S]*/g, "").trim();
+          if (!reply) {
+            reply = "I'm sorry, could you repeat that? I want to make sure I understand correctly.";
+          }
+
+          // --- Trigger phrase scanning ---
+          const responseToolCalls: { name: string; action: string; arguments?: string }[] = [];
+
+          if (useTriggerPhrases && triggerPhrases && triggerPhrases.length > 0) {
+            const lower = reply.toLowerCase();
+            for (const tp of triggerPhrases) {
+              if (lower.includes(tp.phrase.toLowerCase())) {
+                console.log(`[test-chat] Trigger phrase matched: "${tp.phrase}" → ${tp.toolName}`);
+                const tool = safeTools.find((t: any) => t.name === tp.toolName || t.type === tp.toolName);
+                if (tool) {
+                  responseToolCalls.push({ name: tool.name || tp.toolName, action: tool.type === "endCall" ? "endCall" : tool.type === "transferCall" ? "transfer" : tool.type === "dtmf" ? "dtmf" : "function" });
+                } else if (tp.toolName === "end_call" || tp.toolName === "endCall") {
+                  responseToolCalls.push({ name: "end_call", action: "endCall" });
+                } else if (tp.toolName === "transfer" || tp.toolName === "transferCall") {
+                  responseToolCalls.push({ name: "transferCall", action: "transfer" });
+                }
+                break; // Only first match
+              }
+            }
+          }
+
+          // --- In tools mode, map LLM tool calls ---
+          if (!useTriggerPhrases && result.toolCalls.length > 0) {
+            for (const tc of result.toolCalls) {
+              const matchingTool = safeTools.find((t: any) =>
+                (t.functionDefinition && t.functionDefinition.name === tc.function.name) || t.name === tc.function.name
+              );
+              const action = matchingTool?.type === "endCall" ? "endCall"
+                : matchingTool?.type === "transferCall" ? "transfer"
+                : matchingTool?.type === "dtmf" ? "dtmf"
+                : tc.function.name === "end_call" ? "endCall"
+                : "function";
+              responseToolCalls.push({ name: tc.function.name, action, arguments: tc.function.arguments });
+            }
+          }
+
+          const responseBody: any = { reply };
+          if (responseToolCalls.length > 0) responseBody.toolCalls = responseToolCalls;
+          if (usingOverflow) responseBody.overflow = true;
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(responseBody));
+        } catch (err) {
+          releaseSlot();
+          ipcError(res, err, "POST /test-chat LLM", 500);
+        }
+      })
+      .catch((err) => ipcError(res, err, "POST /test-chat"));
+    return;
+  }
+
   res.writeHead(404);
   res.end("Not found");
 }
@@ -1969,7 +2188,7 @@ function pcmToWav(pcm: Buffer, sampleRate: number, numChannels: number, bitDepth
 const ipcServer = createServer(handleIPC);
 // Bind to 0.0.0.0 so it's accessible from Railway and other external services
 ipcServer.listen(IPC_PORT, "0.0.0.0", () => {
-  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /tts/test, /sessions, /metrics, /settings, /register-call, /end-call/:id, /voice-clone/*, /chatterbox/*`);
+  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /tts/test, /test-chat, /sessions, /metrics, /settings, /register-call, /end-call/:id, /voice-clone/*, /chatterbox/*`);
 });
 
 // ---- Call Config Registration ----
