@@ -369,6 +369,8 @@ export interface CallSessionConfig {
     successEvaluationPrompt?: string;
     successEvaluationRubric?: string;
   };
+  /** Pre-synthesized first message PCM (16kHz 16-bit mono) — synthesized at register-call time */
+  preSynthesizedFirstMessage?: Buffer;
 }
 
 export class CallSession extends EventEmitter {
@@ -511,6 +513,17 @@ export class CallSession extends EventEmitter {
         firstMsg = substituteVariables(firstMsg, this.config.variableValues);
       }
 
+      // Helper: deliver first message using pre-synth cache or live TTS
+      const deliverFirstMessage = () => {
+        this.playingFirstMessage = true;
+        if (this.config.preSynthesizedFirstMessage) {
+          console.log(`[session:${this.config.callId}] Using pre-synthesized first message (cached at register-call)`);
+          this.speakPreSynthesized(this.config.preSynthesizedFirstMessage, firstMsg);
+        } else {
+          this.speak(firstMsg);
+        }
+      };
+
       // If voicemail detection is active and not yet resolved, hold first message
       if (this.voicemailDetector && !this.voicemailDetector.isResolved()) {
         console.log(`[session:${this.config.callId}] Holding first message — voicemail detection pending`);
@@ -519,8 +532,7 @@ export class CallSession extends EventEmitter {
         this.voicemailDetector.getResult().then((result) => {
           if (result === "human" && this.state !== "ended") {
             console.log(`[session:${this.config.callId}] Human confirmed — delivering first message`);
-            this.playingFirstMessage = true;
-            this.speak(firstMsg);
+            deliverFirstMessage();
             this.conversationHistory.push({ role: "assistant", content: firstMsg });
             this.fullTranscript.push({ role: "AI", content: firstMsg });
             const estimatedPlaybackMs = Math.max(firstMsg.length * 60, 5000);
@@ -533,8 +545,7 @@ export class CallSession extends EventEmitter {
           // If voicemail — handleVoicemailDetected() already handles the voicemail message
         });
       } else {
-      this.playingFirstMessage = true;
-      this.speak(firstMsg);
+      deliverFirstMessage();
       // Don't rely on TTS completion callback to clear playingFirstMessage —
       // TTS synthesis finishes in ~1s but audio plays for 10-15s on the phone.
       // Estimate playback: ~60ms per character is a rough TTS duration heuristic.
@@ -1142,6 +1153,40 @@ export class CallSession extends EventEmitter {
       if (commaMatch) return commaMatch[1];
     }
     return null;
+  }
+
+  /** Stream pre-synthesized PCM audio (16kHz 16-bit mono) without calling TTS */
+  private speakPreSynthesized(pcm16k: Buffer, text: string): void {
+    if (this.state === "ended") return;
+
+    this.isSpeaking = true;
+    this.state = "speaking";
+    this.costTracker.addTTSUsage(text.length);
+
+    // Emit in 100ms chunks (3200 bytes at 16kHz 16-bit mono)
+    const CHUNK_SIZE = 3200;
+    let offset = 0;
+
+    const emitChunks = () => {
+      while (offset < pcm16k.length) {
+        const end = Math.min(offset + CHUNK_SIZE, pcm16k.length);
+        const chunk = pcm16k.subarray(offset, end);
+        const mulaw = pcm16kToMulaw(chunk);
+        const base64 = encodeBase64Audio(mulaw);
+        this.pendingAudioDurationMs += (mulaw.length / 8000) * 1000;
+        this.emit("audio", base64);
+        offset = end;
+      }
+      this.isSpeaking = false;
+      if (this.state !== "ended") {
+        this.state = "waiting_for_speech";
+        this.resetSilenceTimer();
+      }
+    };
+
+    // Use setImmediate to avoid blocking the event loop
+    setImmediate(emitChunks);
+    console.log(`[session:${this.config.callId}] Streaming pre-synthesized first message (${pcm16k.length} bytes, ${(pcm16k.length / 2 / 16000).toFixed(2)}s)`);
   }
 
   private speak(text: string): void {

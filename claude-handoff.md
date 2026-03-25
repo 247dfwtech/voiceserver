@@ -32,7 +32,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 - **Post-call analysis** — Summary generation and success evaluation (uses DEFAULT_LLM env var)
 - **Voicemail detection** — Detects sustained speech patterns in first 5 seconds (disabled by default for testing)
 - **Cost tracking** — Per-call breakdown (STT, LLM, TTS, transport). Local models = $0.
-- **PM2 managed** — voiceserver + ollama + 3 cloudflared tunnels, auto-restart, boot persistence
+- **PM2 managed** — voiceserver + ollama + kokoro-fastapi, auto-restart, boot persistence (Cloudflare tunnels removed 2026-03-25)
 - **GitHub Actions auto-deploy** ✅ — Push to main → SSH into Vast.ai → pull, build, restart. Deploy logs deployed commit hash. Syncs Twilio + Deepgram + OpenAI keys from GitHub Secrets to `.env`.
 - **GPU/CPU/Memory monitoring** ✅ — `gpu-monitor.ts` collects metrics every 30s via nvidia-smi + os module. 3-day in-memory ring buffer (8640 entries, ~1.7MB). Endpoints: `/health` (enhanced with GPU data inline), `/health/gpu` (fresh snapshot), `/metrics/history?range=1h|6h|24h|3d` (historical data for charts)
 - **`/logs` endpoint** — `GET /logs?lines=N` returns recent PM2 log lines; requires `x-ipc-secret` header
@@ -40,7 +40,7 @@ VoiceServer is the GPU-powered voice processing engine that handles real-time ph
 
 ## What's Not Working / Known Issues
 
-- **Cloudflared tunnel URLs are ephemeral** — Quick tunnels generate random `trycloudflare.com` URLs. If tunnel processes restart, URLs change and Railway env vars need manual updating. Need Cloudflare named tunnel.
+- ~~**Cloudflared tunnel URLs are ephemeral**~~ — RESOLVED 2026-03-25: Cloudflare tunnels removed entirely. Now using Caddy reverse proxy + **TLS (Let's Encrypt)** on Vast.ai mapped ports. WebSocket URL: `wss://gpu.prosbookings.com:45087`. Caddy config in `/etc/Caddyfile`, certs at `/etc/certs/`. Port mapping: ext 45087→Caddy :6006 [TLS]→WS :8765, ext 45164→Caddy :8080→IPC :8766, ext 45035→Caddy :8384→Ollama :11434. **IMPORTANT: Twilio/SignalWire require `wss://` — plain `ws://` silently fails.** See CLAUDE.md "New Instance Setup" for TLS cert instructions.
 - **Deepgram WebSocket drops every ~5 seconds** — FIXED (rev 13). Root cause: KeepAlive sent as text data frames interleaved with binary audio caused Deepgram's audio processor to choke. Fix: switched to `ws.ping()` control frames.
 - **Whisper hallucinations on 8kHz phone audio** — Whisper `small.en` produces severe hallucinations on Twilio phone audio (mulaw 8kHz resampled to 16kHz): "Thanks for watching!", "$100,000,000,000,000,000", "I'll get them ready" when user said something completely different. **Deepgram Flux is strongly recommended for production phone calls.** Whisper may work better with `medium.en` or `turbo` but untested.
 - **PM2 doesn't auto-reload .env on file change** — If you add/change API keys in `.env`, you must run `pm2 restart voiceserver --update-env`. The `dotenv/config` import only reads `.env` at process startup.
@@ -329,11 +329,10 @@ wss://api.deepgram.com/v2/listen?model=flux-general-en&encoding=mulaw&sample_rat
 
 ### Important — Will cause confusion if forgotten
 
-- **Cloudflared URLs change on restart** — Check `pm2 logs tunnel-ipc --lines 5 --nostream` for new URL. Update Railway env vars.
-- **Vast.ai "200 ports" is misleading** — Only 6 Docker-mapped ports accessible externally. 8765/8766 NOT accessible. Always use cloudflared tunnels.
+- **Vast.ai port mapping** — Only Docker-mapped ports are accessible externally. Voiceserver ports (8765/8766/11434) are exposed via Caddy reverse proxy on mapped ports (6006→8765, 8080→8766, 8384→11434). Caddy config: `/etc/Caddyfile`.
 - **IPC auth headers** — IPC endpoints require `x-ipc-secret: <IPC_SECRET>` header. Current: `vs-ipc-2026`.
 - **Audio format** — Twilio sends mu-law 8kHz mono. For Deepgram: raw mulaw bytes sent directly with `encoding=mulaw&sample_rate=8000` (Deepgram handles conversion). For Whisper: converted to PCM 16-bit 16kHz. Kokoro outputs 24kHz, resampled to 16kHz, then to mu-law 8kHz for Twilio.
-- **Ollama needs OLLAMA_ORIGINS=*** — Without this, returns 403 to cloudflared tunnel requests.
+- **Ollama needs OLLAMA_ORIGINS=*** — Without this, returns 403 to requests from external IPs (Caddy proxy or otherwise).
 - **HF_HOME stale file handle** — When copying Vast.ai instance, `/etc/environment` has stale HF_HOME path. Fix: `sed -i 's|HF_HOME=.*|HF_HOME="/root/.cache/huggingface"|g' /etc/environment`.
 - **Voicemail detection false positives** — The audio-based detector (not Twilio AMD) uses `continuousSpeechFramesThreshold: 60` (1.2s of continuous speech). This is aggressive for phone calls. Recommend disabling for initial testing.
 
@@ -399,13 +398,15 @@ DEEPGRAM_API_KEY=***
 | `TWILIO_AUTH_TOKEN` | Twilio auth token — synced to .env on deploy |
 | `DEEPGRAM_API_KEY` | Deepgram API key — synced to .env on deploy |
 
-### Current Cloudflared Tunnel URLs
+### Direct Connection URLs (Caddy Reverse Proxy — set 2026-03-25)
 
-| Service | URL |
-|---|---|
-| IPC (VOICE_SERVER_IPC_URL) | `https://additionally-recovery-rice-deposit.trycloudflare.com` |
-| WebSocket (VOICE_SERVER_URL) | `wss://diy-brakes-ping-collaboration.trycloudflare.com` |
-| Ollama (OLLAMA_URL) | `https://health-selling-moment-oregon.trycloudflare.com/v1` |
+| Service | URL | Route |
+|---|---|---|
+| IPC (VOICE_SERVER_IPC_URL) | `http://70.29.210.33:45164` | ext 45164 → Caddy :8080 → localhost:8766 |
+| WebSocket (VOICE_SERVER_URL) | `ws://70.29.210.33:45087` | ext 45087 → Caddy :6006 → localhost:8765 |
+| Ollama (OLLAMA_URL) | `http://70.29.210.33:45035/v1` | ext 45035 → Caddy :8384 → localhost:11434 |
+
+**Preference: Always use direct connections over Cloudflare tunnels.** Lower latency, static URLs, fewer processes.
 
 ---
 
@@ -414,23 +415,23 @@ DEEPGRAM_API_KEY=***
 ```bash
 # Check voiceserver logs remotely (no SSH needed)
 curl -s -H "x-ipc-secret: vs-ipc-2026" \
-  "https://additionally-recovery-rice-deposit.trycloudflare.com/logs?lines=50" \
+  "http://70.29.210.33:45164/logs?lines=50" \
   | python3 -c "import sys,json; [print(l) for l in json.load(sys.stdin)['lines']]"
 
 # Check model status
 curl -s -H "x-ipc-secret: vs-ipc-2026" \
-  "https://additionally-recovery-rice-deposit.trycloudflare.com/models/status" \
+  "http://70.29.210.33:45164/models/status" \
   | python3 -m json.tool
 
 # Pre-warm Kokoro TTS
 curl -s -H "x-ipc-secret: vs-ipc-2026" \
-  "https://additionally-recovery-rice-deposit.trycloudflare.com/tts/test" \
+  "http://70.29.210.33:45164/tts/test" \
   -X POST -H "Content-Type: application/json" \
   -d '{"text":"Test.","voice":"af_heart"}'
 
 # Switch active STT/LLM
 curl -s -X POST -H "x-ipc-secret: vs-ipc-2026" -H "Content-Type: application/json" \
-  "https://additionally-recovery-rice-deposit.trycloudflare.com/models/stt/activate" \
+  "http://70.29.210.33:45164/models/stt/activate" \
   -d '{"name":"small.en"}'
 
 # SSH into GPU
@@ -496,7 +497,7 @@ Twilio → Caller hears AI response
 
 ## Next Steps (In Order)
 
-1. **Set up Cloudflare named tunnel** — Permanent URLs that survive restarts. Currently tunnel URLs change on every PM2 restart.
+1. ~~**Set up Cloudflare named tunnel**~~ — DONE (2026-03-25): Removed tunnels entirely. Using direct Caddy reverse proxy on Vast.ai mapped ports. Static URLs, lower latency.
 3. **Tune voicemail detection thresholds** — Now at 150 frames (3s). Test with voicemail detection enabled.
 4. **Full UI redesign** — Bushido Pros branding across vapiclone and dialer4clone (separate session).
 
@@ -513,7 +514,7 @@ Twilio → Caller hears AI response
 | LLM | **Ollama + llama3.2:3b** (default, NUM_PARALLEL=8), qwen3:1.7b (backup), OpenAI/DeepSeek (paid) |
 | GPU | NVIDIA RTX 4090 (24GB VRAM) on Vast.ai |
 | Process Manager | PM2 (auto-restart, boot persistence) |
-| Tunneling | Cloudflared quick tunnels (ephemeral URLs) |
+| External Access | Caddy reverse proxy on Vast.ai mapped ports (direct, static URLs — no Cloudflare tunnels) |
 | CI/CD | GitHub Actions → SSH deploy to Vast.ai |
 | Monitoring | nvidia-smi + os module → in-memory ring buffer (3 days) → `/metrics/history` API |
 | Audio | mu-law ↔ PCM conversion, 8kHz ↔ 16kHz ↔ 24kHz resampling |

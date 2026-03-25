@@ -22,7 +22,7 @@ import { getOllamaActiveRequests, getOllamaMaxParallel, incrementOllama, decreme
 import { createLLMProvider } from "./providers";
 import type { LLMToolDefinition, LLMToolCall, LLMMessage } from "./providers/llm/interface";
 import { modelManager } from "./model-manager";
-import { warmupKokoro, checkKokoroHealth } from "./providers/tts/kokoro";
+import { warmupKokoro, checkKokoroHealth, KokoroTTS } from "./providers/tts/kokoro";
 import { checkQwen3Health } from "./providers/tts/qwen3";
 import { voiceCloneManager } from "./providers/tts/kokoclone";
 import { chatterboxVoiceManager } from "./providers/tts/chatterbox";
@@ -2195,6 +2195,30 @@ ipcServer.listen(IPC_PORT, "0.0.0.0", () => {
 
 function registerCallConfig(callId: string, config: CallSessionConfig): void {
   pendingConfigs.set(callId, { config, createdAt: Date.now() });
+
+  // Pre-synthesize first message with Kokoro while waiting for Twilio WebSocket
+  if (
+    config.firstMessage &&
+    config.firstMessageMode !== "assistant-waits-for-user" &&
+    config.voice?.provider === "kokoro"
+  ) {
+    let firstMsg = config.firstMessage;
+    if (config.variableValues) {
+      firstMsg = firstMsg.replace(/\{\{(\w+)\}\}/g, (_, key) => config.variableValues?.[key] || "");
+    }
+
+    const tts = new KokoroTTS({ provider: "kokoro", voiceId: config.voice.voiceId });
+    const startMs = Date.now();
+    tts.synthesize(firstMsg).then((pcm16k) => {
+      const entry = pendingConfigs.get(callId);
+      if (entry) {
+        entry.config.preSynthesizedFirstMessage = pcm16k;
+        console.log(`[voice-server] Pre-synthesized first message for ${callId} (${pcm16k.length} bytes, ${Date.now() - startMs}ms)`);
+      }
+    }).catch((err) => {
+      console.warn(`[voice-server] Pre-synth failed for ${callId}: ${err.message} — will synthesize live`);
+    });
+  }
 }
 
 // ---- Periodic Health & Stale Session Cleanup ----
