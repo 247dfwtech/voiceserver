@@ -116,7 +116,7 @@ console.log(`[voice-server] -----------------------------------------------`);
 
 // Initialize model manager (loads config, creates data dir, auto-pulls default LLM)
 modelManager.initialize().then(() => {
-  console.log(`[voice-server] Model manager ready (default LLM: ${process.env.DEFAULT_LLM || "llama3.2:3b"})`);
+  console.log(`[voice-server] Model manager ready (default LLM: ${process.env.DEFAULT_LLM || "llama3.2:3b-4k"})`);
 }).catch((err) => {
   console.error("[voice-server] Model manager initialization failed:", err);
 });
@@ -128,7 +128,7 @@ warmupKokoro();
 (async () => {
   try {
     const ollamaUrl = (process.env.OLLAMA_URL || "http://localhost:11434/v1").replace(/\/v1\/?$/, "");
-    const defaultLLM = process.env.DEFAULT_LLM || "llama3.2:3b";
+    const defaultLLM = process.env.DEFAULT_LLM || "llama3.2:3b-4k";
     console.log(`[voice-server] Pre-warming LLM: ${defaultLLM}...`);
     const res = await fetch(`${ollamaUrl}/api/generate`, {
       method: "POST",

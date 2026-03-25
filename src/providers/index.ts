@@ -28,7 +28,7 @@ import { modelManager } from "../model-manager";
  *   Vosk — self-hosted CPU, lightweight fallback
  *   Granite 4.0 1B — self-hosted GPU, multimodal (limited concurrency)
  *
- * LLM: Ollama with FLASH_ATTENTION + NUM_PARALLEL=8 (llama3.2:3b default)
+ * LLM: Ollama with FLASH_ATTENTION + NUM_PARALLEL=9 (llama3.2:3b-4k default, 4K context)
  * TTS: Kokoro-82M (Piper as fallback)
  */
 
