@@ -466,8 +466,8 @@ export class CallSession extends EventEmitter {
       }
     });
 
-    // Start STT
-    await this.stt.start();
+    // Start STT in background — don't block first message on Deepgram WebSocket connect
+    const sttReady = this.stt.start();
 
     // Set max duration timer
     this.maxDurationTimer = setTimeout(() => {
@@ -487,6 +487,7 @@ export class CallSession extends EventEmitter {
       });
 
       if (this.voicemailDetector.isResolved() && this.voicemailDetector.getCurrentResult() === "voicemail") {
+        await sttReady; // Ensure STT is ready before returning
         this.handleVoicemailDetected();
         return;
       }
@@ -500,7 +501,7 @@ export class CallSession extends EventEmitter {
       }
     }
 
-    // Handle first message — delay if voicemail detection is still pending
+    // Handle first message — fire TTS immediately (parallel with STT connect)
     if (
       this.config.firstMessage &&
       this.config.firstMessageMode !== "assistant-waits-for-user"
@@ -557,6 +558,9 @@ export class CallSession extends EventEmitter {
       this.state = "waiting_for_speech";
       this.resetSilenceTimer();
     }
+
+    // Ensure STT is connected before we start processing user audio
+    await sttReady;
   }
 
   // Debug: capture first 5s of PCM audio to WAV for analysis
