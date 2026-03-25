@@ -169,9 +169,9 @@ class VoicemailDetector {
   private maxVoicemailWaitSeconds: number;
 
   constructor(config: { analysisWindowSeconds?: number; speechThreshold?: number; continuousSpeechFramesThreshold?: number; twilioAmdResult?: string; initialDelaySeconds?: number; maxRetries?: number; provider?: string; maxVoicemailWaitSeconds?: number } = {}) {
-    this.analysisWindowSeconds = config.analysisWindowSeconds ?? 5;
+    this.analysisWindowSeconds = config.analysisWindowSeconds ?? 7;
     this.speechThreshold = config.speechThreshold ?? 300;
-    this.continuousSpeechFramesThreshold = config.continuousSpeechFramesThreshold ?? 100; // 100 * 20ms = 2s of unbroken speech
+    this.continuousSpeechFramesThreshold = config.continuousSpeechFramesThreshold ?? 60; // 60 * 20ms = 1.2s of unbroken speech
     this.initialDelayFrames = Math.round(((config.initialDelaySeconds ?? 1) * 1000) / 20); // convert seconds to 20ms frames
     this.attemptsRemaining = config.maxRetries ?? 3;
     this.maxVoicemailWaitSeconds = config.maxVoicemailWaitSeconds ?? 25;
@@ -219,8 +219,8 @@ class VoicemailDetector {
         this.speechFrameCount++;
       } else {
         this.silenceAfterSpeechFrames++;
-        // After hearing speech then 40+ frames of silence (800ms) → greeting ended, beep likely passed
-        if (this.speechFrameCount > 50 && this.silenceAfterSpeechFrames > 40) {
+        // After hearing speech then 60+ frames of silence (1.2s) → greeting ended, beep likely passed
+        if (this.speechFrameCount > 50 && this.silenceAfterSpeechFrames > 60) {
           this.pendingMachineStart = false;
           this.resolve("voicemail");
           return;
@@ -273,7 +273,7 @@ class VoicemailDetector {
     const speechRatio = this.speechFrameCount / this.totalFrames;
     // Require sustained speech ratio (65%), continuous speech (30+ frames = 600ms),
     // and minimum total speech frames (80+) to catch more voicemail greetings
-    if (speechRatio > 0.65 && this.maxContinuousSpeech > 30 && this.speechFrameCount > 80) {
+    if (speechRatio > 0.65 && this.maxContinuousSpeech > 20 && this.speechFrameCount > 50) {
       this.resolve("voicemail");
     } else {
       this.resolve("human");
@@ -743,6 +743,25 @@ export class CallSession extends EventEmitter {
     // Reset STT error counter on successful transcription
     this.consecutiveSTTErrors = 0;
 
+    // Fallback: if detection resolved as "human" but transcript contains VM keywords,
+    // retroactively treat as voicemail (catches short greetings the audio analyzer missed)
+    if (this.voicemailDetector && this.voicemailDetector.getCurrentResult() === "human" &&
+        this.playingFirstMessage && isFinal) {
+      const lower = text.toLowerCase();
+      const vmKeywords = ["leave a message", "leave your message", "record your message",
+                          "at the tone", "can't take your call", "not available",
+                          "voicemail", "after the beep", "record a message",
+                          "press pound", "hang up or press", "leave me a message"];
+      if (vmKeywords.some(kw => lower.includes(kw))) {
+        console.log(`[session:${this.config.callId}] VM keyword detected in transcript: "${text}" — switching to voicemail`);
+        this.playingFirstMessage = false;
+        this.cancelSpeaking();
+        this.voicemailDetector.forceResult("voicemail");
+        this.handleVoicemailDetected();
+        return;
+      }
+    }
+
     // During first message: only allow barge-in if user says enough words (stopSpeakingPlan threshold)
     // Short acknowledgements like "right", "yes", "hello" are discarded
     if (this.playingFirstMessage) {
@@ -871,9 +890,11 @@ export class CallSession extends EventEmitter {
             this.handleToolCall(toolCall);
           });
         } else if (tp.toolName === "end_call" || tp.toolName === "endCall") {
-          // Built-in end call
+          // Built-in end call — wait for full TTS playback before hanging up
           this.waitForTTSFinish().then(async () => {
-            await new Promise(r => setTimeout(r, 1500));
+            // Wait for pending audio to play on the phone + network buffer
+            const audioWait = Math.max(this.pendingAudioDurationMs + 2000, 1500);
+            await new Promise(r => setTimeout(r, audioWait));
             this.endCall("assistant-ended-call");
           });
         } else if (tp.toolName === "transfer" || tp.toolName === "transferCall") {
@@ -1340,7 +1361,7 @@ export class CallSession extends EventEmitter {
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
 
     if (this.config.voicemailMessage) {
-      // Short 500ms pause after beep detected before speaking (DetectMessageEnd already waited for beep)
+      // 1500ms pause after beep detected before speaking — ensures beep has fully passed
       setTimeout(async () => {
         if (this.state === "ended") return;
         console.log(`[session:${this.config.callId}] Delivering voicemail message`);
@@ -1359,7 +1380,7 @@ export class CallSession extends EventEmitter {
 
         // endCall guards against double-call internally
         this.endCall("voicemail");
-      }, 500);
+      }, 1500);
     } else {
       this.endCall("voicemail");
     }
