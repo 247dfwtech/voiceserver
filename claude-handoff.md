@@ -1,6 +1,6 @@
 # VoiceServer V2 — Claude Handoff Document
 
-**Last updated:** 2026-03-19 (rev 18 — V2 upgrade)
+**Last updated:** 2026-03-25 (rev 19 — LIVE1 double-transfer guard)
 **GitHub:** https://github.com/247dfwtech/voiceserver (V2 not pushed yet)
 **Local path:** /Users/adriansanchez/Desktop/voiceserverV2
 **Running on:** Vast.ai Reserved GPU Instance #33032104 (Quebec, CA — RTX 4090)
@@ -94,6 +94,15 @@ wss://api.deepgram.com/v2/listen?model=flux-general-en&encoding=mulaw&sample_rat
 - `stt.finish()` sends Deepgram `Finalize` which splits active utterances — NEVER call during live speech
 - Text KeepAlive frames interleaved with binary audio cause Deepgram to choke — always use ws.ping()
 - Assistant must have provider: "deepgram" and model: "flux-general-en" saved in VapiClone
+
+---
+
+## Session LIVE1 — March 25, 2026
+
+### Double-Transfer Guard
+Transfer could fire twice if LLM both triggered "transfer" phrase AND invoked transfer tool — two `transferCallWithDial()` calls, two outbound legs to fallback number. Fixed with:
+1. `index.ts`: transfer event handler checks `transferInitiated` flag before executing
+2. `call-session.ts`: both trigger-phrase (line 882) and tool-call (line 1299) paths check `this.state === "transferring"` before emitting
 
 ---
 

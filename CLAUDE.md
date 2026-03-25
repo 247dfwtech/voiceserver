@@ -34,6 +34,15 @@ These exact settings produced perfect calls on both Twilio and SignalWire:
 - **Tool mode**: trigger-phrases (5 phrases, 2 tools) — matched "transfer you" → ff_transfer in 3s
 - **Post-call analysis**: Groq llama-3.1-8b-instant
 - **Overflow LLM**: Groq (configured, activates when Ollama slots full)
+- **Custom voices**: `am_adrian` (custom trained) at `/app/api/src/voices/v1_0/am_adrian.pt`
+
+## First Message Optimization
+
+Two optimizations ensure the first message plays as fast as possible:
+
+1. **STT starts in background** (not blocking) — `const sttReady = this.stt.start()` (no `await`), so Deepgram WebSocket connects in parallel with first message delivery. `await sttReady` only happens at end of `start()`.
+
+2. **Pre-synthesized first message** — When `/register-call` receives a config with a `firstMessage` and Kokoro TTS, it immediately synthesizes the audio in the background. By the time Twilio's WebSocket connects (~1-2s later), the PCM is already cached. `CallSession.start()` checks for `config.preSynthesizedFirstMessage` and streams it directly via `speakPreSynthesized()` instead of calling Kokoro live. Falls back to live synthesis if pre-synth hasn't completed.
 
 ## CRITICAL: SignalWire streamSid (DO NOT REVERT)
 
@@ -110,6 +119,11 @@ Stream stop no longer always reports `twilio-stream-stopped`. `SessionEntry` tra
 - Transfer tool fires → flag set → stream stops → `endedReason: "call-forwarded"`
 - No transfer → stream stops → `endedReason: "customer-ended-call"`
 - dialer4clone uses `call-forwarded` to trigger auto phone lookup (no more false positives)
+
+### Double-Transfer Guard (2026-03-25 LIVE1)
+Transfer could fire twice if LLM both said "transfer" (trigger phrase) AND invoked the transfer tool — causing two outbound legs to the fallback number. Fixed with two guards:
+1. `index.ts` transfer event handler: skips if `transferInitiated` already true
+2. `call-session.ts`: both trigger-phrase and tool-call paths check `this.state === "transferring"` before emitting
 
 ## Post-Call Analysis
 

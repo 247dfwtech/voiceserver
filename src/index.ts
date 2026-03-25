@@ -229,6 +229,12 @@ wss.on("connection", (ws: WebSocket) => {
 
           // Handle call transfer (provider-aware: Twilio or SignalWire)
           session.on("transfer", async (transferData: { destination?: string }) => {
+            // Guard: prevent double transfer if already initiated
+            const existingEntry = callId ? sessions.get(callId) : undefined;
+            if (existingEntry?.transferInitiated) {
+              console.log(`[voice-server] [${callId}] Transfer already initiated, skipping duplicate`);
+              return;
+            }
             const callProvider = config.provider || "twilio";
             console.log(`[voice-server] [${callId}] Transfer requested (${callProvider}), destination=${transferData.destination || "NONE"}`);
             if (transferData.destination) {

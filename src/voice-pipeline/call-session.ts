@@ -879,6 +879,7 @@ export class CallSession extends EventEmitter {
         } else if (tp.toolName === "transfer" || tp.toolName === "transferCall") {
           // Built-in transfer with fallback destination
           this.waitForTTSFinish().then(async () => {
+            if (this.state === "transferring") return; // Guard: prevent double transfer
             await new Promise(r => setTimeout(r, 1500));
             this.state = "transferring";
             this.emit("transfer", { destination: this.config.fallbackDestination });
@@ -1295,6 +1296,7 @@ export class CallSession extends EventEmitter {
     }
 
     if (result.action === "transfer") {
+      if (this.state === "transferring") return; // Guard: prevent double transfer
       await this.waitForTTSFinish();
       await new Promise(r => setTimeout(r, 1500));
       this.state = "transferring";
