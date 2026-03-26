@@ -54,9 +54,7 @@ class CostTracker {
   private static readonly PRICING = {
     stt: {
       deepgram: parseFloat(process.env.COST_STT_DEEPGRAM || "0.0059"),
-      parakeet: 0,
       vosk: 0,
-      granite: 0,
     } as Record<string, number>,
     llm: {
       "gpt-4o": { input: 0.0025, output: 0.01 },
@@ -69,11 +67,8 @@ class CostTracker {
       "meta-llama/Meta-Llama-3.1-8B-Instruct": { input: 0.00003, output: 0.00005 },
     } as Record<string, { input: number; output: number }>,
     tts: {
-      elevenlabs: parseFloat(process.env.COST_TTS_ELEVENLABS || "0.18"),
       piper: 0.0,
       kokoro: 0.0,
-      chatterbox: 0.0,
-      qwen3: 0.0,
     } as Record<string, number>,
     transport: { twilio: parseFloat(process.env.COST_TRANSPORT_TWILIO || "0.014") },
   };
@@ -259,6 +254,12 @@ class VoicemailDetector {
       this.silenceFrameCount++;
       if (this.silenceFrameCount > 5) {
         this.continuousSpeechRun = 0;
+      }
+      // Early human detection: short speech burst (e.g. "Hello?") followed by 1s+ silence.
+      // Voicemail greetings never pause after a brief word — humans do.
+      if (this.speechFrameCount > 5 && this.silenceFrameCount >= 50) {
+        this.resolve("human");
+        return;
       }
     }
 
