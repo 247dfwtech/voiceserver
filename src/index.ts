@@ -433,6 +433,7 @@ async function notifyCallEnded(
           llmModel: config.model?.model || "unknown",
           analysis,
           overflow: endData.overflow,
+          firstMessageSource: (config.metadata as Record<string, unknown>)?.firstMessageSource || undefined,
           customer: {
             number: config.customerNumber,
             name: config.customerName,
