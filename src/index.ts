@@ -23,6 +23,10 @@ import { createLLMProvider } from "./providers";
 import type { LLMToolDefinition, LLMToolCall, LLMMessage } from "./providers/llm/interface";
 import { modelManager } from "./model-manager";
 import { warmupKokoro, checkKokoroHealth, KokoroTTS } from "./providers/tts/kokoro";
+import { pcm16kToMulaw } from "./voice-pipeline/audio-utils";
+import { createHash } from "crypto";
+import * as fs from "fs/promises";
+import * as path from "path";
 import { checkQwen3Health } from "./providers/tts/qwen3";
 import { voiceCloneManager } from "./providers/tts/kokoclone";
 import { chatterboxVoiceManager } from "./providers/tts/chatterbox";
@@ -2199,10 +2203,64 @@ ipcServer.listen(IPC_PORT, "0.0.0.0", () => {
 
 // ---- Call Config Registration ----
 
+const AUDIO_CACHE_DIR = path.join(process.env.DATA_DIR || "/data", "audio-first-messages");
+
+// Ensure audio cache directory exists on startup
+fs.mkdir(AUDIO_CACHE_DIR, { recursive: true }).catch(() => {});
+
 function registerCallConfig(callId: string, config: CallSessionConfig): void {
   pendingConfigs.set(callId, { config, createdAt: Date.now() });
 
-  // Pre-synthesize first message with Kokoro while waiting for Twilio WebSocket
+  // Audio First Message: check for cached mulaw file or synthesize and cache
+  if (
+    config.audioFirstMessage &&
+    config.firstMessage &&
+    config.firstMessageMode !== "assistant-waits-for-user" &&
+    config.voice?.provider === "kokoro"
+  ) {
+    let firstMsg = config.firstMessage;
+    if (config.variableValues) {
+      firstMsg = firstMsg.replace(/\{\{(\w+)\}\}/g, (_, key) => config.variableValues?.[key] || "");
+    }
+
+    const agentName = config.variableValues?.agentName || "default";
+    const textHash = createHash("md5").update(firstMsg).digest("hex").slice(0, 8);
+    const cacheFile = path.join(AUDIO_CACHE_DIR, `${config.assistantId}_${agentName}_${textHash}.ulaw`);
+
+    fs.readFile(cacheFile).then((mulawBuffer) => {
+      // Cache hit — instant playback
+      const entry = pendingConfigs.get(callId);
+      if (entry) {
+        entry.config.preSynthesizedFirstMessageMulaw = mulawBuffer;
+        if (!entry.config.metadata) entry.config.metadata = {};
+        (entry.config.metadata as Record<string, unknown>).firstMessageSource = "audio-cache";
+        console.log(`[voice-server] Audio cache HIT for ${callId} (${cacheFile}, ${mulawBuffer.length} bytes)`);
+      }
+    }).catch(() => {
+      // Cache miss — synthesize, convert to mulaw, save, and use
+      const tts = new KokoroTTS({ provider: "kokoro", voiceId: config.voice!.voiceId });
+      const startMs = Date.now();
+      tts.synthesize(firstMsg).then(async (pcm16k) => {
+        const mulaw = pcm16kToMulaw(pcm16k);
+        // Save to cache for future calls
+        await fs.writeFile(cacheFile, mulaw).catch((e) =>
+          console.warn(`[voice-server] Failed to cache audio file: ${e.message}`)
+        );
+        const entry = pendingConfigs.get(callId);
+        if (entry) {
+          entry.config.preSynthesizedFirstMessageMulaw = mulaw;
+          if (!entry.config.metadata) entry.config.metadata = {};
+          (entry.config.metadata as Record<string, unknown>).firstMessageSource = "live-tts";
+          console.log(`[voice-server] Audio cache MISS — synthesized and cached for ${callId} (${mulaw.length} bytes, ${Date.now() - startMs}ms, saved to ${cacheFile})`);
+        }
+      }).catch((err) => {
+        console.warn(`[voice-server] Audio first message synth failed for ${callId}: ${err.message} — will synthesize live`);
+      });
+    });
+    return;
+  }
+
+  // Standard pre-synthesize first message with Kokoro while waiting for Twilio WebSocket
   if (
     config.firstMessage &&
     config.firstMessageMode !== "assistant-waits-for-user" &&

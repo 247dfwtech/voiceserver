@@ -371,6 +371,10 @@ export interface CallSessionConfig {
   };
   /** Pre-synthesized first message PCM (16kHz 16-bit mono) — synthesized at register-call time */
   preSynthesizedFirstMessage?: Buffer;
+  /** Pre-synthesized first message as raw mulaw 8kHz — from audio cache file */
+  preSynthesizedFirstMessageMulaw?: Buffer;
+  /** Use cached audio first message (non-interruptable, instant playback) */
+  audioFirstMessage?: boolean;
 }
 
 export class CallSession extends EventEmitter {
@@ -405,6 +409,7 @@ export class CallSession extends EventEmitter {
   private interimWordCount = 0;
   private utteranceDelayTimer: ReturnType<typeof setTimeout> | null = null;
   private playingFirstMessage = false; // true while first message TTS is playing — ignore user speech
+  private audioFirstMessagePlaying = false; // true during cached audio playback — fully non-interruptable
   private pendingAudioDurationMs = 0; // tracks audio duration queued but not yet played by Twilio
   private lastBargeInAt: number | null = null; // timestamp of last barge-in for backoff
 
@@ -513,10 +518,15 @@ export class CallSession extends EventEmitter {
         firstMsg = substituteVariables(firstMsg, this.config.variableValues);
       }
 
-      // Helper: deliver first message using pre-synth cache or live TTS
+      // Helper: deliver first message using cached mulaw, pre-synth PCM, or live TTS
       const deliverFirstMessage = () => {
         this.playingFirstMessage = true;
-        if (this.config.preSynthesizedFirstMessage) {
+        if (this.config.preSynthesizedFirstMessageMulaw) {
+          // Cached audio file — fastest path, non-interruptable
+          this.audioFirstMessagePlaying = true;
+          console.log(`[session:${this.config.callId}] Using cached audio first message (mulaw, non-interruptable)`);
+          this.speakPreSynthesizedMulaw(this.config.preSynthesizedFirstMessageMulaw);
+        } else if (this.config.preSynthesizedFirstMessage) {
           console.log(`[session:${this.config.callId}] Using pre-synthesized first message (cached at register-call)`);
           this.speakPreSynthesized(this.config.preSynthesizedFirstMessage, firstMsg);
         } else {
@@ -538,6 +548,7 @@ export class CallSession extends EventEmitter {
             const estimatedPlaybackMs = Math.max(firstMsg.length * 60, 5000);
             setTimeout(() => {
               this.playingFirstMessage = false;
+              this.audioFirstMessagePlaying = false;
               this.currentTranscript = "";
               console.log(`[session:${this.config.callId}] First message playback window ended (${estimatedPlaybackMs}ms)`);
             }, estimatedPlaybackMs);
@@ -551,14 +562,8 @@ export class CallSession extends EventEmitter {
       // Estimate playback: ~60ms per character is a rough TTS duration heuristic.
       const estimatedPlaybackMs = Math.max(firstMsg.length * 60, 5000);
       setTimeout(() => {
-        // Don't call stt.finish() here — it sends Deepgram "Finalize" which
-        // forces a transcript boundary, splitting the user's sentence in half.
-        // The first half gets discarded (playingFirstMessage still true) and only
-        // the tail end comes through. Deepgram handles echo/silence natively.
-        //
-        // For Vosk/local STT: any accumulated noise transcripts during first message
-        // are simply cleared by resetting currentTranscript below.
         this.playingFirstMessage = false;
+        this.audioFirstMessagePlaying = false;
         this.currentTranscript = "";
         console.log(`[session:${this.config.callId}] First message playback window ended (${estimatedPlaybackMs}ms)`);
       }, estimatedPlaybackMs);
@@ -712,6 +717,9 @@ export class CallSession extends EventEmitter {
     this.speechStartedAt = Date.now();
     this.interimWordCount = 0;
 
+    // Cached audio first message — fully non-interruptable, ignore all speech
+    if (this.audioFirstMessagePlaying) return;
+
     // During first message: always defer to handleTranscript for threshold-based barge-in
     // Short acknowledgements ("right", "yes") will be discarded; 3+ words will barge in
     if (this.playingFirstMessage) return;
@@ -733,6 +741,9 @@ export class CallSession extends EventEmitter {
 
   private handleTranscript(text: string, isFinal: boolean): void {
     if (this.state === "ended") return;
+
+    // Cached audio first message — fully non-interruptable, suppress all transcripts
+    if (this.audioFirstMessagePlaying) return;
 
     // Suppress transcripts while voicemail detection is pending OR after voicemail confirmed.
     // Without this, the greeting audio gets transcribed and the LLM responds to it.
@@ -1209,6 +1220,30 @@ export class CallSession extends EventEmitter {
     // Use setImmediate to avoid blocking the event loop
     setImmediate(emitChunks);
     console.log(`[session:${this.config.callId}] Streaming pre-synthesized first message (${pcm16k.length} bytes, ${(pcm16k.length / 2 / 16000).toFixed(2)}s)`);
+  }
+
+  /** Stream raw mulaw audio from cached file — zero conversion, fastest possible playback */
+  private speakPreSynthesizedMulaw(mulaw: Buffer): void {
+    this.isSpeaking = true;
+    // Emit in 800-byte chunks (100ms at 8kHz mulaw)
+    const CHUNK_SIZE = 800;
+    let offset = 0;
+
+    const emitChunks = () => {
+      while (offset < mulaw.length) {
+        const end = Math.min(offset + CHUNK_SIZE, mulaw.length);
+        const chunk = mulaw.subarray(offset, end);
+        const base64 = encodeBase64Audio(chunk);
+        this.pendingAudioDurationMs += (chunk.length / 8000) * 1000;
+        this.emit("audio", base64);
+        offset = end;
+      }
+      this.isSpeaking = false;
+    };
+
+    setImmediate(emitChunks);
+    const durationSec = (mulaw.length / 8000).toFixed(2);
+    console.log(`[session:${this.config.callId}] Streaming cached audio first message (${mulaw.length} bytes, ${durationSec}s, non-interruptable)`);
   }
 
   private speak(text: string): void {
