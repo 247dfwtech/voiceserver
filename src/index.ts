@@ -29,6 +29,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { metricsBuffer, startMetricsCollection, stopMetricsCollection, setSessionCountProvider, collectSnapshot } from "./gpu-monitor";
 import { exec } from "child_process";
+import * as kvm from "./kvoicewalk-manager";
 
 // ---- Configuration ----
 
@@ -1558,6 +1559,103 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
+  // ---- POST /kvoicewalk/start — begin a voice-cloning training run ----
+  if (req.method === "POST" && url.pathname === "/kvoicewalk/start") {
+    readBody(req, 10_000_000)
+      .then(async (raw) => {
+        const body = JSON.parse(raw);
+        const { audio, transcript, name } = body;
+
+        if (!audio || !transcript || !name) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing required fields: audio, transcript, name" }));
+          return;
+        }
+
+        // Validate name: lowercase alphanumeric + underscores, 2-30 chars
+        if (!/^[a-z0-9_]{2,30}$/.test(name)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid name: must be 2-30 chars, lowercase alphanumeric and underscores only" }));
+          return;
+        }
+
+        const audioBuffer = Buffer.from(audio, "base64");
+        const result = await kvm.startWalk(audioBuffer, transcript, name);
+
+        res.writeHead(result.ok ? 200 : 409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      })
+      .catch((err) => ipcError(res, err, "POST /kvoicewalk/start"));
+    return;
+  }
+
+  // ---- GET /kvoicewalk/status — get current training status ----
+  if (req.method === "GET" && url.pathname === "/kvoicewalk/status") {
+    const status = kvm.getStatus();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(status ?? { running: false }));
+    return;
+  }
+
+  // ---- POST /kvoicewalk/stop — stop training and install best voice ----
+  if (req.method === "POST" && url.pathname === "/kvoicewalk/stop") {
+    kvm.stopWalk()
+      .then((result) => {
+        res.writeHead(result.ok ? 200 : 400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      })
+      .catch((err) => ipcError(res, err, "POST /kvoicewalk/stop"));
+    return;
+  }
+
+  // ---- GET /kvoicewalk/best-sample — return best WAV sample audio ----
+  if (req.method === "GET" && url.pathname === "/kvoicewalk/best-sample") {
+    kvm.getBestSample()
+      .then((sample) => {
+        if (!sample) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "No sample available" }));
+          return;
+        }
+        res.writeHead(200, {
+          "Content-Type": "audio/wav",
+          "Content-Length": sample.audio.length,
+          "Content-Disposition": `inline; filename="${sample.filename}"`,
+        });
+        res.end(sample.audio);
+      })
+      .catch((err) => ipcError(res, err, "GET /kvoicewalk/best-sample"));
+    return;
+  }
+
+  // ---- GET /kvoicewalk/voices — list custom (non-stock) Kokoro voices ----
+  if (req.method === "GET" && url.pathname === "/kvoicewalk/voices") {
+    kvm.listCustomVoices()
+      .then((voices) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ voices }));
+      })
+      .catch((err) => ipcError(res, err, "GET /kvoicewalk/voices"));
+    return;
+  }
+
+  // ---- DELETE /kvoicewalk/voices/:name — delete a custom voice ----
+  if (req.method === "DELETE" && url.pathname.startsWith("/kvoicewalk/voices/")) {
+    const voiceName = url.pathname.slice("/kvoicewalk/voices/".length);
+    if (!voiceName) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing voice name in path" }));
+      return;
+    }
+    kvm.deleteVoice(voiceName)
+      .then((result) => {
+        res.writeHead(result.ok ? 200 : 400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      })
+      .catch((err) => ipcError(res, err, `DELETE /kvoicewalk/voices/${voiceName}`));
+    return;
+  }
+
   res.writeHead(404);
   res.end("Not found");
 }
@@ -1585,7 +1683,7 @@ function pcmToWav(pcm: Buffer, sampleRate: number, numChannels: number, bitDepth
 const ipcServer = createServer(handleIPC);
 // Bind to 0.0.0.0 so it's accessible from Railway and other external services
 ipcServer.listen(IPC_PORT, "0.0.0.0", () => {
-  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /tts/test, /test-chat, /sessions, /metrics, /settings, /register-call, /end-call/:id`);
+  console.log(`[voice-server] IPC endpoints: /health, /models, /models/status, /models/{llm,stt,tts}, /models/search, /tts/test, /test-chat, /sessions, /metrics, /settings, /register-call, /end-call/:id, /kvoicewalk/start, /kvoicewalk/status, /kvoicewalk/stop, /kvoicewalk/best-sample, /kvoicewalk/voices, /kvoicewalk/voices/:name`);
 });
 
 // ---- Call Config Registration ----
