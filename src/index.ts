@@ -1315,6 +1315,17 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
               res.end(JSON.stringify({ error: "TTS synthesis returned empty audio. Voice pack may still be downloading — try again in 10s." }));
               return;
             }
+          } else if (sampleProvider === "elevenlabs") {
+            const { ElevenLabsTTS } = await import("./providers/tts/elevenlabs");
+            const parsed = JSON.parse(body);
+            const tts = new ElevenLabsTTS({
+              provider: "elevenlabs",
+              voiceId: sampleVoice,
+              model: parsed.model || "eleven_turbo_v2_5",
+              stability: parsed.stability ?? 0.5,
+            });
+            audioBuffer = await tts.synthesize(sampleText);
+            sampleRate = 16000; // ElevenLabs returns pcm_16000 directly
           } else if (sampleProvider === "unrealspeech") {
             const { UnrealSpeechTTS } = await import("./providers/tts/unrealspeech");
             const tts = new UnrealSpeechTTS({ provider: "unrealspeech", voiceId: sampleVoice });
