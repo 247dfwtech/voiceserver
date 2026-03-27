@@ -12,7 +12,8 @@
  * - Memory monitoring and periodic health logging
  */
 
-import "dotenv/config"; // Load .env file before anything else
+import { config as dotenvConfig } from "dotenv";
+dotenvConfig({ override: true }); // Load .env file, override PM2-injected empty vars
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { CallSession, type CallSessionConfig, type CostBreakdown } from "./voice-pipeline/call-session";
