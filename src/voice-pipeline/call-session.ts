@@ -70,6 +70,7 @@ class CostTracker {
     tts: {
       piper: 0.0,
       kokoro: 0.0,
+      elevenlabs: parseFloat(process.env.COST_TTS_ELEVENLABS || "0.18"),
     } as Record<string, number>,
     transport: { twilio: parseFloat(process.env.COST_TRANSPORT_TWILIO || "0.014") },
   };

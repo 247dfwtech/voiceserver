@@ -8,6 +8,7 @@ import { PiperTTS } from "./tts/piper";
 import { KokoroTTS, checkKokoroHealth } from "./tts/kokoro";
 import { UnrealSpeechTTS } from "./tts/unrealspeech";
 import { GroqTTS } from "./tts/groq";
+import { ElevenLabsTTS } from "./tts/elevenlabs";
 import { modelManager } from "../model-manager";
 
 /**
@@ -93,6 +94,15 @@ export function createTTSProvider(config: TTSConfig): TTSProvider {
         return new KokoroTTS(config);
       }
       return new UnrealSpeechTTS(config);
+    }
+    case "elevenlabs": {
+      const elKey = process.env.ELEVENLABS_API_KEY;
+      if (!elKey) {
+        console.warn("[providers] ElevenLabs requested but ELEVENLABS_API_KEY not set, falling back to Kokoro");
+        return new KokoroTTS(config);
+      }
+      console.log(`[providers] Using ElevenLabs TTS (voice=${config.voiceId || "default"}, model=${config.model || "eleven_turbo_v2_5"})`);
+      return new ElevenLabsTTS(config);
     }
     case "piper":
       return new PiperTTS(config);
