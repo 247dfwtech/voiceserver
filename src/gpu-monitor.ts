@@ -24,7 +24,7 @@ export interface GpuInfo {
 }
 
 export interface ProcessResourceInfo {
-  name: string;        // e.g. "ollama", "kokoro-fastapi", "qwen3-tts", "voiceserver"
+  name: string;        // e.g. "ollama", "kokoro-fastapi", "voiceserver"
   pid: number;
   cpuPercent: number;  // CPU %
   ramMB: number;       // RSS in MB
@@ -64,25 +64,14 @@ export interface GpuSnapshot {
 const TRACKED_PROCESSES: Record<string, string> = {
   "ollama_llama_se": "ollama",    // ollama_llama_server
   "ollama": "ollama",
-  "python3": "python",            // could be kokoro or qwen3
+  "python3": "python",
   "python": "python",
   "node": "voiceserver",
   "uvicorn": "python",
 };
 
-// Track parent→child relationships for qwen3-tts torch workers
-let _qwen3MainPid = 0;
-
 function classifyProcess(comm: string, pid: number, cmdline: string): string | null {
   if (cmdline.includes("kokoro") || cmdline.includes("8880")) return "kokoro-fastapi";
-  if (cmdline.includes("qwen3") || cmdline.includes("8881")) return "qwen3-tts";
-  // qwen3-tts runs as "python3 -m api.main" without "qwen3" in cmdline
-  // Its torch compile workers reference parent PID
-  if (cmdline.includes("api.main") && !cmdline.includes("8880")) {
-    _qwen3MainPid = pid;
-    return "qwen3-tts";
-  }
-  if (cmdline.includes("compile_worker") && _qwen3MainPid > 0 && cmdline.includes(`parent=${_qwen3MainPid}`)) return "qwen3-tts";
   if (cmdline.includes("ollama")) return "ollama";
   if (cmdline.includes("voiceserverV2") || cmdline.includes("dist/index")) return "voiceserver";
   const base = comm.replace(/\s+/g, "");
@@ -186,21 +175,12 @@ async function queryProcessResources(): Promise<ProcessResourceInfo[]> {
       if (ollamaProc && vramByName.has("ollama")) {
         ollamaProc.vramMB = vramByName.get("ollama")!;
       }
-      // Distribute python GPU VRAM between kokoro and qwen3 based on RAM ratio
+      // Assign python GPU VRAM to kokoro (only python GPU process)
       const pythonVram = vramByName.get("python-gpu") || 0;
       if (pythonVram > 0) {
         const kokoro = grouped.get("kokoro-fastapi");
-        const qwen3 = grouped.get("qwen3-tts");
-        if (kokoro && qwen3) {
-          const totalRam = kokoro.ramMB + qwen3.ramMB;
-          if (totalRam > 0) {
-            kokoro.vramMB = Math.round(pythonVram * (kokoro.ramMB / totalRam));
-            qwen3.vramMB = pythonVram - kokoro.vramMB;
-          }
-        } else if (kokoro) {
+        if (kokoro) {
           kokoro.vramMB = pythonVram;
-        } else if (qwen3) {
-          qwen3.vramMB = pythonVram;
         }
       }
       // If no name matching worked either, show total on ollama (primary GPU user)

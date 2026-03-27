@@ -551,6 +551,8 @@ export class CallSession extends EventEmitter {
               this.playingFirstMessage = false;
               this.audioFirstMessagePlaying = false;
               this.currentTranscript = "";
+              this.state = "waiting_for_speech";
+              this.resetSilenceTimer();
               console.log(`[session:${this.config.callId}] First message playback window ended (${estimatedPlaybackMs}ms)`);
             }, estimatedPlaybackMs);
           }
@@ -566,6 +568,8 @@ export class CallSession extends EventEmitter {
         this.playingFirstMessage = false;
         this.audioFirstMessagePlaying = false;
         this.currentTranscript = "";
+        this.state = "waiting_for_speech";
+        this.resetSilenceTimer();
         console.log(`[session:${this.config.callId}] First message playback window ended (${estimatedPlaybackMs}ms)`);
       }, estimatedPlaybackMs);
       this.conversationHistory.push({ role: "assistant", content: firstMsg });

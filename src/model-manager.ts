@@ -1,10 +1,8 @@
 /**
- * Model Manager -- Manages LLM (Ollama), STT (Sherpa-ONNX/Vosk/Granite/Deepgram), and TTS (Kokoro/Piper) models.
+ * Model Manager -- Manages LLM (Ollama), STT (Vosk/Deepgram), and TTS (Kokoro/Piper) models.
  *
  * V2: Optimized for 10+ concurrent calls.
- * Default STT: Sherpa-ONNX (CPU streaming, native concurrency up to 500 connections)
- * Fallback STT: Vosk (CPU-only, lightweight)
- * GPU STT: IBM Granite 4.0 1B Speech (self-hosted, keyword biasing)
+ * Default STT: Vosk (CPU-only, lightweight)
  * Cloud STT: Deepgram Flux (paid, native end-of-turn detection)
  * Default LLM: llama3.2:3b-4k (ultra-fast, 2GB VRAM, 4K context for phone calls)
  *
@@ -23,9 +21,7 @@ import { exec } from "child_process";
 
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const VOSK_MODELS_DIR = process.env.VOSK_MODELS_DIR || "/models/vosk";
-const GRANITE_MODELS_DIR = process.env.GRANITE_MODELS_DIR || "/models/granite";
 const PIPER_MODELS_DIR = process.env.PIPER_MODELS_DIR || "/models/piper";
-const KOKORO_MODELS_DIR = process.env.KOKORO_MODELS_DIR || "/models/kokoro";
 const OLLAMA_URL = (process.env.OLLAMA_URL || "http://localhost:11434/v1").replace(/\/v1\/?$/, "");
 const CONFIG_PATH = path.join(DATA_DIR, "model-config.json");
 
@@ -39,16 +35,16 @@ export interface InstalledModel {
   installedAt: string;
 }
 
-export type STTProviderName = "sherpa" | "vosk" | "granite" | "deepgram";
+export type STTProviderName = "vosk" | "deepgram";
 
 export interface ModelConfig {
   activeLLM: { provider: "ollama"; model: string } | null;
   activeSTT: { provider: STTProviderName; model: string } | null;
-  activeTTS: { provider: "kokoro" | "piper" | "chatterbox" | "qwen3" | "kokoclone"; voice: string } | null;
+  activeTTS: { provider: "kokoro" | "piper"; voice: string } | null;
   installedModels: {
     llm: Array<{ name: string; size: string; provider: "ollama"; installedAt: string }>;
     stt: Array<{ name: string; size: string; provider: STTProviderName; installedAt: string }>;
-    tts: Array<{ name: string; size: string; provider: "kokoro" | "piper" | "chatterbox" | "qwen3" | "kokoclone"; installedAt: string }>;
+    tts: Array<{ name: string; size: string; provider: "kokoro" | "piper"; installedAt: string }>;
   };
 }
 
@@ -67,17 +63,6 @@ export interface HuggingFaceSearchResult {
   description: string;
 }
 
-// ---- Sherpa-ONNX model catalog (CPU STT, streaming, best concurrency) ----
-
-const SHERPA_MODEL_CATALOG: STTModelInfo[] = [
-  {
-    name: "sherpa-onnx-streaming-zipformer-en-20M",
-    size: "~20MB",
-    description: "Zipformer 20M English, CPU streaming, native concurrency (DEFAULT)",
-    provider: "sherpa",
-  },
-];
-
 // ---- Vosk model catalog (CPU STT) ----
 
 const VOSK_MODEL_CATALOG: STTModelInfo[] = [
@@ -95,23 +80,12 @@ const VOSK_MODEL_CATALOG: STTModelInfo[] = [
   },
 ];
 
-// ---- Hardcoded Granite STT model catalog ----
-
-const GRANITE_MODEL_CATALOG: STTModelInfo[] = [
-  {
-    name: "ibm-granite/granite-4.0-1b-speech",
-    size: "~2GB",
-    description: "Granite 4.0 1B Speech, keyword biasing, Apache 2.0",
-    provider: "granite",
-  },
-];
-
 // ---- Kokoro-82M voice catalog (default TTS) ----
 
 export interface TTSVoiceInfo {
   name: string;
   description: string;
-  provider: "kokoro" | "piper" | "chatterbox";
+  provider: "kokoro" | "piper";
   gender?: string;
   accent?: string;
 }
@@ -227,7 +201,7 @@ export class ModelManager {
 
   /**
    * Checks if any LLM model is installed via Ollama. If not, automatically
-   * pulls the default model (qwen3.5:9b) so the voiceserver is ready for
+   * pulls the default model so the voiceserver is ready for
    * calls immediately after first boot.
    */
   private async autoPullDefaultLLM(): Promise<void> {
@@ -402,9 +376,7 @@ export class ModelManager {
       },
       available: {
         stt: [
-          ...SHERPA_MODEL_CATALOG,
           ...VOSK_MODEL_CATALOG,
-          ...GRANITE_MODEL_CATALOG,
         ],
         tts: [
           ...KOKORO_VOICE_CATALOG,
@@ -597,33 +569,11 @@ export class ModelManager {
     return { success: true };
   }
 
-  // ---- STT Management (Sherpa-ONNX + Vosk + Granite) ----
+  // ---- STT Management (Vosk + Deepgram) ----
 
   async listSTTModels(): Promise<Array<InstalledModel & { active: boolean }>> {
     const activeSTT = this.config.activeSTT;
     const installed: Array<InstalledModel & { active: boolean }> = [];
-
-    // Check for installed Sherpa-ONNX models
-    const SHERPA_MODELS_DIR = process.env.SHERPA_MODELS_DIR || "/models/sherpa-onnx";
-    try {
-      const sherpaEntries = await fs.promises.readdir(SHERPA_MODELS_DIR, { withFileTypes: true });
-      for (const entry of sherpaEntries) {
-        if (entry.isDirectory() && entry.name.includes("sherpa")) {
-          // Match catalog by partial name (directory may have date suffix like -2023-02-17)
-          const catalogEntry = SHERPA_MODEL_CATALOG.find((c) => entry.name.startsWith(c.name));
-          const displayName = catalogEntry?.name || entry.name;
-          installed.push({
-            name: displayName,
-            size: catalogEntry?.size || "~20MB",
-            provider: "sherpa",
-            installedAt: "",
-            active: activeSTT?.provider === "sherpa",
-          });
-        }
-      }
-    } catch {
-      // Sherpa directory may not exist yet
-    }
 
     // Check for installed Vosk models
     try {
@@ -644,46 +594,6 @@ export class ModelManager {
       // Directory may not exist yet
     }
 
-    // Check for installed Granite models
-    try {
-      const graniteEntries = await fs.promises.readdir(GRANITE_MODELS_DIR, { withFileTypes: true });
-      for (const entry of graniteEntries) {
-        if (entry.isDirectory()) {
-          const catalogEntry = GRANITE_MODEL_CATALOG.find((c) => entry.name.includes(c.name.split("/").pop()!));
-          const modelName = catalogEntry?.name || `ibm-granite/${entry.name}`;
-          installed.push({
-            name: modelName,
-            size: catalogEntry?.size || "unknown",
-            provider: "granite",
-            installedAt: "",
-            active: activeSTT?.provider === "granite" && activeSTT?.model === modelName,
-          });
-        }
-      }
-    } catch {
-      // Directory may not exist yet
-    }
-
-    // Also check for Granite via Python (model cached by HuggingFace transformers)
-    if (installed.filter((m) => m.provider === "granite").length === 0) {
-      try {
-        const { stdout } = await runCommand(
-          `python3 -c "from transformers import AutoProcessor; AutoProcessor.from_pretrained('ibm-granite/granite-4.0-1b-speech', local_files_only=True); print('ok')" 2>/dev/null`
-        );
-        if (stdout.includes("ok")) {
-          installed.push({
-            name: "ibm-granite/granite-4.0-1b-speech",
-            size: "~2GB",
-            provider: "granite",
-            installedAt: "",
-            active: activeSTT?.provider === "granite" && activeSTT?.model === "ibm-granite/granite-4.0-1b-speech",
-          });
-        }
-      } catch {
-        // Granite not installed via transformers cache
-      }
-    }
-
     // Sync the config's installed list
     this.config.installedModels.stt = installed.map((m) => ({
       name: m.name,
@@ -698,9 +608,7 @@ export class ModelManager {
 
   getSTTCatalog(): STTModelInfo[] {
     return [
-      ...SHERPA_MODEL_CATALOG,
       ...VOSK_MODEL_CATALOG,
-      ...GRANITE_MODEL_CATALOG,
     ];
   }
 
@@ -708,60 +616,8 @@ export class ModelManager {
     name: string,
     provider?: STTProviderName
   ): Promise<{ success: boolean; error?: string }> {
-    // Auto-detect provider from model name
-    const isSherpa = provider === "sherpa" || name.includes("sherpa");
-    const isGranite = provider === "granite" || name.includes("granite");
-    const isVosk = provider === "vosk" || name.includes("vosk");
-
-    if (isSherpa) {
-      // Sherpa-ONNX models are pre-installed on the GPU server — just activate
-      return { success: true };
-    }
-    if (isVosk) {
-      return this.installVoskModel(name);
-    }
-    if (isGranite) {
-      return this.installGraniteModel(name);
-    }
-    // Default to Vosk
+    // Only Vosk models can be installed locally; Deepgram is cloud-based
     return this.installVoskModel(name);
-  }
-
-  private async installGraniteModel(name: string): Promise<{ success: boolean; error?: string }> {
-    const modelId = name.includes("/") ? name : "ibm-granite/granite-4.0-1b-speech";
-
-    try {
-      console.log(`[model-manager] Installing Granite STT model: ${modelId}`);
-
-      // Download model via HuggingFace transformers (caches automatically)
-      const cmd = `python3 -c "
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-print('Downloading processor...')
-AutoProcessor.from_pretrained('${modelId}', trust_remote_code=True)
-print('Downloading model...')
-AutoModelForSpeechSeq2Seq.from_pretrained('${modelId}', trust_remote_code=True)
-print('ok')
-"`;
-      await runCommand(cmd);
-
-      console.log(`[model-manager] Granite STT model ${modelId} installed successfully`);
-
-      const existing = this.config.installedModels.stt.find((m) => m.name === modelId);
-      if (!existing) {
-        this.config.installedModels.stt.push({
-          name: modelId,
-          size: "~2GB",
-          provider: "granite",
-          installedAt: new Date().toISOString(),
-        });
-      }
-      await this.saveConfig();
-      return { success: true };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[model-manager] Granite STT install failed for ${modelId}:`, msg);
-      return { success: false, error: msg };
-    }
   }
 
   private async installVoskModel(name: string): Promise<{ success: boolean; error?: string }> {
@@ -816,55 +672,17 @@ else:
   }
 
   async deleteSTTModel(name: string): Promise<{ success: boolean; error?: string }> {
-    const isGranite = name.includes("granite");
-    const isVosk = name.includes("vosk");
-
     try {
       let deleted = false;
 
-      if (isVosk) {
-        // Delete Vosk model directory
-        try {
-          const modelPath = path.join(VOSK_MODELS_DIR, name);
-          await fs.promises.rm(modelPath, { recursive: true, force: true });
-          console.log(`[model-manager] Deleted Vosk STT model directory: ${modelPath}`);
-          deleted = true;
-        } catch {
-          // Directory may not exist
-        }
-      } else if (isGranite) {
-        // For Granite, clear the HuggingFace transformers cache for this model
-        try {
-          const cmd = `python3 -c "
-from huggingface_hub import scan_cache_dir
-cache = scan_cache_dir()
-for repo in cache.repos:
-    if '${name.split('/').pop()}' in repo.repo_id:
-        for revision in repo.revisions:
-            print(f'Deleting {repo.repo_id}')
-            revision.delete()
-print('ok')
-"`;
-          await runCommand(cmd);
-          deleted = true;
-          console.log(`[model-manager] Deleted Granite STT model cache: ${name}`);
-        } catch {
-          // Also try deleting from GRANITE_MODELS_DIR if it exists
-        }
-
-        // Also check GRANITE_MODELS_DIR
-        try {
-          const entries = await fs.promises.readdir(GRANITE_MODELS_DIR, { withFileTypes: true });
-          for (const entry of entries) {
-            if (entry.isDirectory() && entry.name.includes(name.split("/").pop()!)) {
-              const modelPath = path.join(GRANITE_MODELS_DIR, entry.name);
-              await fs.promises.rm(modelPath, { recursive: true, force: true });
-              deleted = true;
-            }
-          }
-        } catch {
-          // Directory may not exist
-        }
+      // Delete Vosk model directory
+      try {
+        const modelPath = path.join(VOSK_MODELS_DIR, name);
+        await fs.promises.rm(modelPath, { recursive: true, force: true });
+        console.log(`[model-manager] Deleted Vosk STT model directory: ${modelPath}`);
+        deleted = true;
+      } catch {
+        // Directory may not exist
       }
 
       if (!deleted) {
@@ -895,17 +713,18 @@ print('ok')
   ): Promise<{ success: boolean; error?: string }> {
     // Auto-detect provider from name
     const resolvedProvider = provider
-      || (name.includes("sherpa") ? "sherpa" as const
-        : name.includes("vosk") ? "vosk" as const
-        : name.includes("granite") ? "granite" as const
-        : "sherpa" as const);
+      || (name.includes("vosk") ? "vosk" as const
+        : "deepgram" as const);
 
     // Check if model is in catalog or installed
-    const allCatalogs = [...SHERPA_MODEL_CATALOG, ...VOSK_MODEL_CATALOG, ...GRANITE_MODEL_CATALOG];
+    const allCatalogs = [...VOSK_MODEL_CATALOG];
     const inCatalog = allCatalogs.some((m) => m.name === name);
     const inInstalled = this.config.installedModels.stt.some((m) => m.name === name);
 
-    if (!inCatalog && !inInstalled) {
+    // Deepgram models are cloud-based — always allow activation
+    const isDeepgram = resolvedProvider === "deepgram" || provider === "deepgram";
+
+    if (!inCatalog && !inInstalled && !isDeepgram) {
       return {
         success: false,
         error: `STT model "${name}" is not recognized. Available: ${allCatalogs.map((m) => m.name).join(", ")}`,
@@ -972,49 +791,11 @@ print('ok')
       // Directory may not exist yet
     }
 
-    // Check for KokoClone cloned voices
-    try {
-      const manifestPath = "/data/cloned-voices/manifest.json";
-      const manifestData = await fs.promises.readFile(manifestPath, "utf-8");
-      const clonedVoices = JSON.parse(manifestData);
-      if (Array.isArray(clonedVoices)) {
-        for (const v of clonedVoices) {
-          installed.push({
-            name: v.id,
-            displayName: v.name,
-            size: "cloned",
-            provider: "kokoclone",
-            installedAt: v.createdAt || "",
-            active: activeTTS?.provider === "kokoclone" && activeTTS?.voice === v.id,
-          });
-        }
-      }
-    } catch {
-      // No cloned voices manifest
-    }
-
-    // Check for Chatterbox cloned voices
-    try {
-      const { chatterboxVoiceManager: cvm } = await import("./providers/tts/chatterbox");
-      const cbVoices = await cvm.listVoices();
-      for (const v of cbVoices) {
-        installed.push({
-          name: v.id,
-          size: "cloned",
-          provider: "chatterbox",
-          installedAt: v.createdAt,
-          active: activeTTS?.provider === "chatterbox" && activeTTS?.voice === v.id,
-        });
-      }
-    } catch {
-      // Chatterbox module not available
-    }
-
     // Sync config
     this.config.installedModels.tts = installed.map((m) => ({
       name: m.name,
       size: m.size,
-      provider: m.provider as "kokoro" | "piper" | "chatterbox" | "kokoclone",
+      provider: m.provider as "kokoro" | "piper",
       installedAt: m.installedAt,
     }));
     await this.saveConfig();
@@ -1271,7 +1052,7 @@ print('ok')
     type: "llm" | "stt" | "tts"
   ): Promise<HuggingFaceSearchResult[]> {
     if (type === "stt") {
-      // Return Vosk + Deepgram + Granite model lists
+      // Return Vosk + Deepgram model lists
       const voskResults = VOSK_MODEL_CATALOG.map((m) => ({
         id: m.name,
         name: m.name,
@@ -1284,14 +1065,7 @@ print('ok')
         { id: "deepgram/nova-3-general", name: "nova-3-general", downloads: 0, likes: 0, description: "[DEEPGRAM] Latest general-purpose model, highest accuracy" },
         { id: "deepgram/nova-2-general", name: "nova-2-general", downloads: 0, likes: 0, description: "[DEEPGRAM] Previous generation, stable" },
       ];
-      const graniteResults = GRANITE_MODEL_CATALOG.map((m) => ({
-        id: m.name,
-        name: m.name.split("/").pop()!,
-        downloads: 0,
-        likes: 0,
-        description: `[GRANITE] ${m.description} (${m.size})`,
-      }));
-      return [...voskResults, ...deepgramResults, ...graniteResults];
+      return [...voskResults, ...deepgramResults];
     }
 
     try {

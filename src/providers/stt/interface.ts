@@ -9,9 +9,9 @@ export interface STTConfig {
   acceptsMulaw?: boolean;
   /** Filter transcripts below this confidence (0-1, default 0). Provider-agnostic. */
   confidenceThreshold?: number;
-  /** End-of-turn confidence threshold (0-1). Maps to Deepgram eot_threshold / Whisper sensitivity. */
+  /** End-of-turn confidence threshold (0-1). Maps to Deepgram eot_threshold. */
   endOfTurnConfidence?: number;
-  /** End-of-turn timeout in ms. Maps to Deepgram eot_timeout_ms / Whisper silence frames. */
+  /** End-of-turn timeout in ms. Maps to Deepgram eot_timeout_ms. */
   endOfTurnTimeoutMs?: number;
 }
 

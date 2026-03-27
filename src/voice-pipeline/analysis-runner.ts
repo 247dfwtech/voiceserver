@@ -147,7 +147,12 @@ export async function runPostCallAnalysis(
   config: AnalysisConfig,
   apiKey?: string
 ): Promise<AnalysisResult> {
-  if (!transcript || (!config.summaryEnabled && !config.successEvaluationEnabled)) {
+  if (!transcript) {
+    console.log("[analysis] Skipped in runner: empty transcript");
+    return {};
+  }
+  if (!config.summaryEnabled && !config.successEvaluationEnabled) {
+    console.log("[analysis] Skipped in runner: neither summary nor successEvaluation enabled");
     return {};
   }
 

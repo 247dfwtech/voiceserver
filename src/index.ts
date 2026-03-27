@@ -388,9 +388,16 @@ async function notifyCallEnded(
   let analysis: { summary?: string; successEvaluation?: string; analysisCost?: number; analysisProvider?: string; analysisModel?: string } = {};
   const analysisConfig = config.analysisConfig;
   const SKIP_ANALYSIS_REASONS = new Set(["voicemail", "stt-failure", "no-answer", "busy", "failed", "machine-detected"]);
-  const hasRealConversation = endData.transcript && endData.transcript.split("\n").filter((l: string) => l.trim()).length >= 2;
+  const lineCount = endData.transcript ? endData.transcript.split("\n").filter((l: string) => l.trim()).length : 0;
+  const hasRealConversation = lineCount >= 1;
 
-  if (analysisConfig && !SKIP_ANALYSIS_REASONS.has(endData.endedReason) && hasRealConversation) {
+  if (!analysisConfig) {
+    console.log(`[analysis] Skipped for ${callId}: no analysisConfig`);
+  } else if (SKIP_ANALYSIS_REASONS.has(endData.endedReason)) {
+    console.log(`[analysis] Skipped for ${callId}: endedReason=${endData.endedReason} (in skip list)`);
+  } else if (!hasRealConversation) {
+    console.log(`[analysis] Skipped for ${callId}: no real conversation (${lineCount} lines)`);
+  } else {
     try {
       analysis = await runPostCallAnalysis(endData.transcript, analysisConfig);
       // Add analysis cost to the cost breakdown
@@ -401,8 +408,6 @@ async function notifyCallEnded(
     } catch (err) {
       console.error(`[voice-server] Analysis failed for ${callId}:`, err);
     }
-  } else if (analysisConfig) {
-    console.log(`[voice-server] Skipping analysis for ${callId}: reason=${endData.endedReason}, transcriptLines=${endData.transcript?.split("\n").filter((l: string) => l.trim()).length || 0}`);
   }
 
   // Send end-of-call report to VapiClone
