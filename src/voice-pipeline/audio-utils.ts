@@ -110,6 +110,44 @@ export function calculateRMS(pcm: Buffer): number {
 }
 
 /**
+ * Goertzel algorithm — efficient single-frequency magnitude detector.
+ * Returns magnitude (power) at the target frequency.
+ */
+export function goertzelMagnitude(pcm: Buffer, sampleRate: number, targetFreq: number): number {
+  const numSamples = pcm.length / 2;
+  if (numSamples === 0) return 0;
+  const k = Math.round(numSamples * targetFreq / sampleRate);
+  const w = (2 * Math.PI * k) / numSamples;
+  const coeff = 2 * Math.cos(w);
+  let s1 = 0, s2 = 0;
+  for (let i = 0; i < numSamples; i++) {
+    const sample = pcm.readInt16LE(i * 2) / 32768;
+    const s0 = sample + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  return Math.sqrt(s1 * s1 + s2 * s2 - coeff * s1 * s2);
+}
+
+/**
+ * Detect if audio contains a voicemail beep tone (900-1200Hz).
+ * Uses Goertzel to check if beep-range frequency is dominant vs other bands.
+ */
+export function detectBeep(pcm: Buffer, sampleRate: number = 16000): boolean {
+  const rms = calculateRMS(pcm);
+  if (rms < 200) return false; // Too quiet to be a beep
+
+  const mag1000 = goertzelMagnitude(pcm, sampleRate, 1000);
+  const mag440 = goertzelMagnitude(pcm, sampleRate, 440);
+  const mag2000 = goertzelMagnitude(pcm, sampleRate, 2000);
+
+  const beepPower = mag1000;
+  const noisePower = (mag440 + mag2000) / 2;
+
+  return beepPower > 0.1 && (noisePower === 0 || beepPower / noisePower > 3);
+}
+
+/**
  * Twilio sends base64-encoded mu-law audio. Decode it.
  */
 export function decodeBase64Audio(base64: string): Buffer {

@@ -5,6 +5,7 @@ import {
   calculateRMS,
   decodeBase64Audio,
   encodeBase64Audio,
+  detectBeep,
 } from "./audio-utils";
 import { createSTTProvider, createTTSProvider, createLLMProvider } from "../providers";
 import type { STTProvider } from "../providers/stt/interface";
@@ -137,10 +138,30 @@ class CostTracker {
   }
 }
 
-/** Voicemail/IVR detector */
+/** Voicemail/IVR detector — hybrid audio + transcript scoring */
 type VMDetectionResult = "human" | "voicemail" | "unknown";
 
+/** Expanded VM keyword list for STT fallback and real-time transcript detection */
+const VM_KEYWORDS = [
+  "leave a message", "leave your message", "record your message",
+  "at the tone", "can't take your call", "not available",
+  "voicemail", "after the beep", "record a message",
+  "press pound", "hang up or press", "leave me a message",
+  // VM menu/system phrases
+  "press one", "press two", "press three",
+  "you have reached", "not available right now",
+  "leave your name", "leave a brief message",
+  "at the beep", "is not available",
+  "please leave", "the person you are calling",
+  "the mailbox is full", "to replay your message",
+  "to continue recording", "when you have finished recording",
+  "record your name", "to send a fax",
+  "your call has been forwarded",
+  "no one is available to take your call",
+];
+
 class VoicemailDetector {
+  // Audio analysis state
   private analysisWindowSeconds: number;
   private speechThreshold: number;
   private continuousSpeechFramesThreshold: number;
@@ -151,25 +172,57 @@ class VoicemailDetector {
   private totalFrames = 0;
   private continuousSpeechRun = 0;
   private maxContinuousSpeech = 0;
+
+  // Resolution state
   private resolved = false;
   private result: VMDetectionResult = "unknown";
   private resolveCallbacks: ((result: VMDetectionResult) => void)[] = [];
+
+  // AMD / beep detection
   private attemptsRemaining: number;
   private pendingMachineStart = false;
   private amdBeepReceived = false;
   private beepWaitTimer: ReturnType<typeof setTimeout> | null = null;
   private silenceAfterSpeechFrames = 0;
   private greetingEnded = false;
-
   private maxVoicemailWaitSeconds: number;
 
-  constructor(config: { analysisWindowSeconds?: number; speechThreshold?: number; continuousSpeechFramesThreshold?: number; twilioAmdResult?: string; initialDelaySeconds?: number; maxRetries?: number; provider?: string; maxVoicemailWaitSeconds?: number } = {}) {
-    this.analysisWindowSeconds = config.analysisWindowSeconds ?? 7;
+  // Transcript-based detection (Tasks 3, 4, 6)
+  private transcriptWordCount = 0;
+  private firstTranscriptTime = 0;
+  private transcriptContainsVmKeyword = false;
+
+  // Configurable thresholds (Task 7)
+  private noSpeechTimeoutFrames: number;
+  private wordCountThreshold: number;
+  private confidenceThreshold: number;
+
+  private callId: string;
+
+  constructor(config: {
+    analysisWindowSeconds?: number;
+    speechThreshold?: number;
+    continuousSpeechFramesThreshold?: number;
+    twilioAmdResult?: string;
+    initialDelaySeconds?: number;
+    maxRetries?: number;
+    provider?: string;
+    maxVoicemailWaitSeconds?: number;
+    noSpeechTimeoutSeconds?: number;
+    wordCountThreshold?: number;
+    confidenceThreshold?: number;
+    callId?: string;
+  } = {}) {
+    this.analysisWindowSeconds = config.analysisWindowSeconds ?? 20; // Task 1: extended from 7 → 20
     this.speechThreshold = config.speechThreshold ?? 300;
-    this.continuousSpeechFramesThreshold = config.continuousSpeechFramesThreshold ?? 60; // 60 * 20ms = 1.2s of unbroken speech
-    this.initialDelayFrames = Math.round(((config.initialDelaySeconds ?? 1) * 1000) / 20); // convert seconds to 20ms frames
+    this.continuousSpeechFramesThreshold = config.continuousSpeechFramesThreshold ?? 60;
+    this.initialDelayFrames = Math.round(((config.initialDelaySeconds ?? 1) * 1000) / 20);
     this.attemptsRemaining = config.maxRetries ?? 3;
     this.maxVoicemailWaitSeconds = config.maxVoicemailWaitSeconds ?? 25;
+    this.noSpeechTimeoutFrames = Math.round(((config.noSpeechTimeoutSeconds ?? 5) * 1000) / 20); // Task 1: 5s default
+    this.wordCountThreshold = config.wordCountThreshold ?? 6; // Task 3
+    this.confidenceThreshold = config.confidenceThreshold ?? 40; // Task 6
+    this.callId = config.callId ?? "unknown";
 
     // Skip audio analysis if provider is AMD-only (twilio or signalwire)
     const useAudio = config.provider !== "twilio" && config.provider !== "signalwire";
@@ -177,13 +230,10 @@ class VoicemailDetector {
     if (config.twilioAmdResult) {
       const amd = config.twilioAmdResult.toLowerCase();
       if (amd === "machine_end_beep" || amd === "machine_end_silence" || amd === "machine_end_other") {
-        // Beep already happened or greeting ended — safe to speak after short delay
         this.result = "voicemail";
         this.resolved = true;
         this.amdBeepReceived = true;
       } else if (amd === "machine_start") {
-        // Greeting is STILL PLAYING — do NOT resolve yet. We need to wait for the beep.
-        // Mark as voicemail but don't resolve — will wait for beep detection or timeout
         this.pendingMachineStart = true;
       } else if (amd === "human") {
         this.result = "human";
@@ -197,6 +247,35 @@ class VoicemailDetector {
     }
   }
 
+  /** Task 3: Feed real-time transcript to detector for word-count and keyword analysis */
+  feedTranscript(text: string, isFinal: boolean): void {
+    if (this.resolved) return;
+    const words = text.trim().split(/\s+/).filter(w => w.length > 0).length;
+    if (words > this.transcriptWordCount) {
+      this.transcriptWordCount = words;
+    }
+    if (this.firstTranscriptTime === 0 && words > 0) {
+      this.firstTranscriptTime = Date.now();
+    }
+    // Word count trigger: 6+ words in a single utterance within first 5s = likely VM
+    const elapsed = this.firstTranscriptTime > 0 ? Date.now() - this.firstTranscriptTime : 0;
+    if (words >= this.wordCountThreshold && elapsed < 5000 && !this.pendingMachineStart) {
+      console.log(`[vm-detect:${this.callId}] Word count trigger: ${words} words in ${elapsed}ms — entering beep-wait`);
+      this.pendingMachineStart = true;
+    }
+    // Task 6: Check for VM keywords in real-time transcripts
+    if (isFinal && !this.transcriptContainsVmKeyword) {
+      const lower = text.toLowerCase();
+      if (VM_KEYWORDS.some(kw => lower.includes(kw))) {
+        this.transcriptContainsVmKeyword = true;
+        console.log(`[vm-detect:${this.callId}] VM keyword detected in transcript: "${text}"`);
+        if (!this.pendingMachineStart) {
+          this.pendingMachineStart = true;
+        }
+      }
+    }
+  }
+
   analyzeFrame(pcmAudio: Buffer): void {
     if (this.resolved) return;
 
@@ -204,28 +283,37 @@ class VoicemailDetector {
     this.audioFrames.push(rms);
     this.totalFrames++;
 
-    // If we got machine_start from AMD, we KNOW it's voicemail but need to wait for the beep
+    // If we got machine_start from AMD or audio/transcript analysis, wait for beep
     if (this.pendingMachineStart) {
       const isSpeech = rms > this.speechThreshold;
 
+      // Task 5: Direct beep frequency detection
+      if (!this.amdBeepReceived && detectBeep(pcmAudio)) {
+        this.amdBeepReceived = true;
+        console.log(`[vm-detect:${this.callId}] Beep tone detected via frequency analysis`);
+      }
+
+      // If beep detected + now silence → resolve immediately
+      if (this.amdBeepReceived && rms < this.speechThreshold) {
+        this.resolve("voicemail");
+        return;
+      }
+
       if (isSpeech) {
-        // Greeting is still playing
         this.silenceAfterSpeechFrames = 0;
         this.speechFrameCount++;
       } else {
         this.silenceAfterSpeechFrames++;
         // After hearing speech then 60+ frames of silence (1.2s) → greeting ended, beep likely passed
         if (this.speechFrameCount > 50 && this.silenceAfterSpeechFrames > 60) {
-          this.pendingMachineStart = false;
           this.resolve("voicemail");
           return;
         }
       }
 
       // Safety timeout: after maxVoicemailWaitSeconds (default 25s), just speak
-      const maxWaitFrames = ((this.maxVoicemailWaitSeconds ?? 25) * 1000) / 20;
+      const maxWaitFrames = (this.maxVoicemailWaitSeconds * 1000) / 20;
       if (this.totalFrames >= maxWaitFrames) {
-        this.pendingMachineStart = false;
         this.resolve("voicemail");
       }
       return;
@@ -246,7 +334,7 @@ class VoicemailDetector {
       if (this.continuousSpeechRun >= this.continuousSpeechFramesThreshold) {
         // Don't resolve immediately — mark as detected but wait for beep/silence
         this.pendingMachineStart = true;
-        this.speechFrameCount = 0; // reset for beep detection phase
+        this.speechFrameCount = 0;
         this.silenceAfterSpeechFrames = 0;
         return;
       }
@@ -255,36 +343,70 @@ class VoicemailDetector {
       if (this.silenceFrameCount > 5) {
         this.continuousSpeechRun = 0;
       }
-      // Early human detection: short speech burst (e.g. "Hello?") followed by 1s+ silence.
-      // Voicemail greetings never pause after a brief word — humans do.
+      // Early human detection: short speech burst followed by 1s+ silence
       if (this.speechFrameCount > 5 && this.silenceFrameCount >= 50) {
+        // Task 4: Check if transcript suggests VM despite short audio pattern
+        if (this.transcriptWordCount >= this.wordCountThreshold) {
+          console.log(`[vm-detect:${this.callId}] Early human overridden: ${this.transcriptWordCount} words detected`);
+          this.pendingMachineStart = true;
+          return;
+        }
         this.resolve("human");
         return;
       }
     }
 
+    // Task 1: No-speech timeout — if 5s elapsed with ZERO speech, resolve as human
+    // A silent answer is more likely human than a silent voicemail
+    if (this.totalFrames >= this.initialDelayFrames + this.noSpeechTimeoutFrames && this.speechFrameCount === 0) {
+      console.log(`[vm-detect:${this.callId}] No speech after ${this.noSpeechTimeoutFrames * 20}ms — resolving human`);
+      this.resolve("human");
+      return;
+    }
+
+    // Analysis window timeout — make final decision
     const maxFrames = (this.analysisWindowSeconds * 1000) / 20;
     if (this.totalFrames >= maxFrames) {
       this.makeDecision();
     }
   }
 
+  /** Task 6: Hybrid confidence scoring replacing binary decision */
   private makeDecision(): void {
     if (this.resolved) return;
-    const speechRatio = this.speechFrameCount / this.totalFrames;
-    // Require sustained speech ratio (65%), continuous speech (30+ frames = 600ms),
-    // and minimum total speech frames (80+) to catch more voicemail greetings
-    if (speechRatio > 0.65 && this.maxContinuousSpeech > 20 && this.speechFrameCount > 50) {
-      this.resolve("voicemail");
-    } else {
-      this.resolve("human");
-    }
+    const speechRatio = this.speechFrameCount / Math.max(this.totalFrames, 1);
+
+    let score = 0; // 0 = definitely human, 100 = definitely voicemail
+
+    // Audio features (max 60 points)
+    if (speechRatio > 0.65) score += 20;
+    if (speechRatio > 0.45) score += 10;
+    if (this.maxContinuousSpeech > 60) score += 20; // 1.2s+ continuous
+    if (this.maxContinuousSpeech > 30) score += 10; // 0.6s+ continuous
+
+    // Transcript features (max 40 points)
+    if (this.transcriptWordCount >= 10) score += 25;
+    else if (this.transcriptWordCount >= this.wordCountThreshold) score += 15;
+
+    // Keyword match
+    if (this.transcriptContainsVmKeyword) score += 30;
+
+    // Beep detected
+    if (this.amdBeepReceived) score += 30;
+
+    const decision = score >= this.confidenceThreshold ? "voicemail" : "human";
+    console.log(`[vm-detect:${this.callId}] Decision: ${decision} (score=${score}/${this.confidenceThreshold}, ` +
+      `speechRatio=${speechRatio.toFixed(2)}, maxSpeech=${this.maxContinuousSpeech}, ` +
+      `words=${this.transcriptWordCount}, beep=${this.amdBeepReceived}, keyword=${this.transcriptContainsVmKeyword})`);
+
+    this.resolve(decision);
   }
 
   private resolve(result: VMDetectionResult): void {
     if (this.resolved) return;
     this.resolved = true;
     this.result = result;
+    console.log(`[vm-detect:${this.callId}] Resolved: ${result}`);
     for (const cb of this.resolveCallbacks) cb(result);
     this.resolveCallbacks = [];
   }
@@ -303,12 +425,10 @@ class VoicemailDetector {
     if (this.resolved) return;
     const amd = answeredBy.toLowerCase();
     if (amd === "machine_end_beep" || amd === "machine_end_silence" || amd === "machine_end_other") {
-      // Beep already passed — safe to speak
       this.resolve("voicemail");
     } else if (amd === "machine_start") {
-      // Greeting still playing — enter beep-wait mode, don't resolve yet
       this.pendingMachineStart = true;
-      console.log(`[voicemail-detector] AMD machine_start received — waiting for beep/silence`);
+      console.log(`[vm-detect:${this.callId}] AMD machine_start received — waiting for beep/silence`);
     } else if (amd === "human") {
       this.resolve("human");
     }
@@ -350,6 +470,10 @@ export interface CallSessionConfig {
     analysisWindowSeconds?: number;
     maxRetries?: number;
     maxVoicemailWaitSeconds?: number;
+    speechThreshold?: number;
+    noSpeechTimeoutSeconds?: number;
+    wordCountThreshold?: number;
+    confidenceThreshold?: number;
   };
   customerNumber: string;
   customerName?: string;
@@ -492,6 +616,11 @@ export class CallSession extends EventEmitter {
         maxRetries: vmConfig.maxRetries,
         maxVoicemailWaitSeconds: vmConfig.maxVoicemailWaitSeconds,
         provider: vmConfig.provider,
+        speechThreshold: vmConfig.speechThreshold,
+        noSpeechTimeoutSeconds: vmConfig.noSpeechTimeoutSeconds,
+        wordCountThreshold: vmConfig.wordCountThreshold,
+        confidenceThreshold: vmConfig.confidenceThreshold,
+        callId: this.config.callId,
       });
 
       if (this.voicemailDetector.isResolved() && this.voicemailDetector.getCurrentResult() === "voicemail") {
@@ -750,6 +879,11 @@ export class CallSession extends EventEmitter {
     // Cached audio first message — fully non-interruptable, suppress all transcripts
     if (this.audioFirstMessagePlaying) return;
 
+    // Feed transcript to VM detector for word-count and keyword analysis (before suppression)
+    if (this.voicemailDetector && !this.voicemailDetector.isResolved()) {
+      this.voicemailDetector.feedTranscript(text, isFinal);
+    }
+
     // Suppress transcripts while voicemail detection is pending OR after voicemail confirmed.
     // Without this, the greeting audio gets transcribed and the LLM responds to it.
     if (this.voicemailDetector && (!this.voicemailDetector.isResolved() || this.voicemailDetector.getCurrentResult() === "voicemail")) {
@@ -764,10 +898,7 @@ export class CallSession extends EventEmitter {
     if (this.voicemailDetector && this.voicemailDetector.getCurrentResult() === "human" &&
         this.playingFirstMessage && isFinal) {
       const lower = text.toLowerCase();
-      const vmKeywords = ["leave a message", "leave your message", "record your message",
-                          "at the tone", "can't take your call", "not available",
-                          "voicemail", "after the beep", "record a message",
-                          "press pound", "hang up or press", "leave me a message"];
+      const vmKeywords = VM_KEYWORDS;
       if (vmKeywords.some(kw => lower.includes(kw))) {
         console.log(`[session:${this.config.callId}] VM keyword detected in transcript: "${text}" — switching to voicemail`);
         this.playingFirstMessage = false;
