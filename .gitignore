@@ -5,3 +5,4 @@ dist/
 models/
 voiceserver/
 .DS_Store
+CLAUDE.md
