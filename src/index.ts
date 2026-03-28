@@ -20,7 +20,7 @@ import { CallSession, type CallSessionConfig, type CostBreakdown } from "./voice
 import { runPostCallAnalysis } from "./voice-pipeline/analysis-runner";
 import { transferCallWithDial } from "./voice-pipeline/call-transfer";
 import { getOllamaActiveRequests, getOllamaMaxParallel, incrementOllama, decrementOllama } from "./ollama-concurrency";
-import { createLLMProvider } from "./providers";
+import { createLLMProvider, createTTSProvider } from "./providers";
 import type { LLMToolDefinition, LLMToolCall, LLMMessage } from "./providers/llm/interface";
 import { modelManager } from "./model-manager";
 import { warmupKokoro, checkKokoroHealth, KokoroTTS } from "./providers/tts/kokoro";
@@ -1767,11 +1767,11 @@ function registerCallConfig(callId: string, config: CallSessionConfig): void {
   pendingConfigs.set(callId, { config, createdAt: Date.now() });
 
   // Audio First Message: check for cached mulaw file or synthesize and cache
+  // Works with any TTS provider — cached mulaw is provider-independent once generated
   if (
     config.audioFirstMessage &&
     config.firstMessage &&
-    config.firstMessageMode !== "assistant-waits-for-user" &&
-    config.voice?.provider === "kokoro"
+    config.firstMessageMode !== "assistant-waits-for-user"
   ) {
     let firstMsg = config.firstMessage;
     if (config.variableValues) {
@@ -1779,8 +1779,9 @@ function registerCallConfig(callId: string, config: CallSessionConfig): void {
     }
 
     const agentName = config.variableValues?.agentName || "default";
+    const voiceKey = `${config.voice?.provider || "kokoro"}_${config.voice?.voiceId || "default"}`;
     const textHash = createHash("md5").update(firstMsg).digest("hex").slice(0, 8);
-    const cacheFile = path.join(AUDIO_CACHE_DIR, `${config.assistantId}_${agentName}_${textHash}.ulaw`);
+    const cacheFile = path.join(AUDIO_CACHE_DIR, `${config.assistantId}_${agentName}_${voiceKey}_${textHash}.ulaw`);
 
     fs.readFile(cacheFile).then((mulawBuffer) => {
       // Cache hit — instant playback
@@ -1792,8 +1793,8 @@ function registerCallConfig(callId: string, config: CallSessionConfig): void {
         console.log(`[voice-server] Audio cache HIT for ${callId} (${cacheFile}, ${mulawBuffer.length} bytes)`);
       }
     }).catch(() => {
-      // Cache miss — synthesize, convert to mulaw, save, and use
-      const tts = new KokoroTTS({ provider: "kokoro", voiceId: config.voice!.voiceId });
+      // Cache miss — synthesize with configured TTS provider, convert to mulaw, save
+      const tts = createTTSProvider(config.voice || { provider: "kokoro", voiceId: "af_heart" });
       const startMs = Date.now();
       tts.synthesize(firstMsg).then(async (pcm16k) => {
         const mulaw = pcm16kToMulaw(pcm16k);
@@ -1815,18 +1816,18 @@ function registerCallConfig(callId: string, config: CallSessionConfig): void {
     return;
   }
 
-  // Standard pre-synthesize first message with Kokoro while waiting for Twilio WebSocket
+  // Standard pre-synthesize first message while waiting for Twilio WebSocket
+  // Works with any TTS provider that has a synthesize() method
   if (
     config.firstMessage &&
-    config.firstMessageMode !== "assistant-waits-for-user" &&
-    config.voice?.provider === "kokoro"
+    config.firstMessageMode !== "assistant-waits-for-user"
   ) {
     let firstMsg = config.firstMessage;
     if (config.variableValues) {
       firstMsg = firstMsg.replace(/\{\{(\w+)\}\}/g, (_, key) => config.variableValues?.[key] || "");
     }
 
-    const tts = new KokoroTTS({ provider: "kokoro", voiceId: config.voice.voiceId });
+    const tts = createTTSProvider(config.voice || { provider: "kokoro", voiceId: "af_heart" });
     const startMs = Date.now();
     tts.synthesize(firstMsg).then((pcm16k) => {
       const entry = pendingConfigs.get(callId);
