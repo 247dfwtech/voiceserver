@@ -636,7 +636,13 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
   }
 
   // ---- All remaining endpoints require IPC secret ----
-  if (IPC_SECRET) {
+  if (!IPC_SECRET) {
+    console.error("[voice-server] FATAL: IPC_SECRET is not set — rejecting all IPC requests");
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Server misconfigured: IPC_SECRET not set" }));
+    return;
+  }
+  {
     const authHeader = req.headers["x-ipc-secret"] || "";
     if (authHeader !== IPC_SECRET) {
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -1119,6 +1125,12 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
       .then((body) => {
         const { callId, config } = JSON.parse(body);
 
+        if (!callId || typeof callId !== "string" || !config || typeof config !== "object") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "callId (string) and config (object) are required" }));
+          return;
+        }
+
         if (sessions.size >= MAX_SESSIONS) {
           res.writeHead(429, { "Content-Type": "application/json" });
           res.end(
@@ -1183,6 +1195,10 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
       entry.session.endCall("admin-force-ended");
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, callId: targetCallId }));
+    } else if (pendingConfigs.has(targetCallId)) {
+      pendingConfigs.delete(targetCallId);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, callId: targetCallId, cleared: "pending" }));
     } else {
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Session not found" }));

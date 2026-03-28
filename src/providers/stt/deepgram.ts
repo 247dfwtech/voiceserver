@@ -80,7 +80,7 @@ export class DeepgramSTT extends EventEmitter implements STTProvider {
           this.ws.send(JSON.stringify({ type: "CloseStream" }));
         }
         this.ws.close();
-      } catch {}
+      } catch (e: any) { console.debug("[deepgram] ws.close() cleanup error:", e?.message); }
       this.ws = null;
     }
     this.removeAllListeners();
