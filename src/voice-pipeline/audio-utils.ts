@@ -130,21 +130,30 @@ export function goertzelMagnitude(pcm: Buffer, sampleRate: number, targetFreq: n
 }
 
 /**
- * Detect if audio contains a voicemail beep tone (900-1200Hz).
- * Uses Goertzel to check if beep-range frequency is dominant vs other bands.
+ * Detect if audio contains a voicemail beep tone.
+ * Checks multiple common beep frequencies:
+ *   - 440Hz  (T-Mobile, some landlines)
+ *   - 850Hz  (AT&T, some VOIP)
+ *   - 1000Hz (most common carrier default)
+ *   - 1400Hz (some international / VOIP carriers)
+ * A beep is a sustained pure tone that dominates the spectrum.
  */
 export function detectBeep(pcm: Buffer, sampleRate: number = 16000): boolean {
   const rms = calculateRMS(pcm);
   if (rms < 200) return false; // Too quiet to be a beep
 
-  const mag1000 = goertzelMagnitude(pcm, sampleRate, 1000);
-  const mag440 = goertzelMagnitude(pcm, sampleRate, 440);
-  const mag2000 = goertzelMagnitude(pcm, sampleRate, 2000);
+  const beepFreqs = [440, 850, 1000, 1400];
+  const noiseFreq = 2000;
+  const magNoise = goertzelMagnitude(pcm, sampleRate, noiseFreq);
 
-  const beepPower = mag1000;
-  const noisePower = (mag440 + mag2000) / 2;
+  for (const freq of beepFreqs) {
+    const mag = goertzelMagnitude(pcm, sampleRate, freq);
+    if (mag > 0.1 && (magNoise === 0 || mag / magNoise > 3)) {
+      return true;
+    }
+  }
 
-  return beepPower > 0.1 && (noisePower === 0 || beepPower / noisePower > 3);
+  return false;
 }
 
 /**
