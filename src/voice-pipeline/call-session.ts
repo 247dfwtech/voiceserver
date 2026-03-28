@@ -185,6 +185,8 @@ class VoicemailDetector {
   private amdBeepReceived = false;
   private beepWaitTimer: ReturnType<typeof setTimeout> | null = null;
   private silenceAfterSpeechFrames = 0;
+  private waitingForBeepAfterSilence = false;
+  private beepWaitAfterSilenceFrames = 0;
   private greetingEnded = false;
   private maxVoicemailWaitSeconds: number;
 
@@ -303,13 +305,38 @@ class VoicemailDetector {
       if (isSpeech) {
         this.silenceAfterSpeechFrames = 0;
         this.speechFrameCount++;
+        // If speech resumes during beep-wait, reset the post-silence beep watch
+        if (this.waitingForBeepAfterSilence) {
+          this.waitingForBeepAfterSilence = false;
+          this.beepWaitAfterSilenceFrames = 0;
+          console.log(`[vm-detect:${this.callId}] Speech resumed during beep-wait — resetting`);
+        }
       } else {
         this.silenceAfterSpeechFrames++;
-        // After hearing speech then 125+ frames of silence (2.5s) → greeting ended, beep likely passed
+        // After hearing speech then 125+ frames of silence (2.5s) → greeting likely ended
         // Was 60 frames (1.2s) but mid-greeting pauses (1-2s) caused premature resolution
-        if (this.speechFrameCount > 50 && this.silenceAfterSpeechFrames > 125) {
-          this.resolve("voicemail");
-          return;
+        // Don't resolve immediately — enter beep-watch phase to wait for the actual beep
+        if (this.speechFrameCount > 50 && this.silenceAfterSpeechFrames > 125 && !this.waitingForBeepAfterSilence) {
+          this.waitingForBeepAfterSilence = true;
+          this.beepWaitAfterSilenceFrames = 0;
+          console.log(`[vm-detect:${this.callId}] Greeting ended (2.5s silence) — waiting up to 5s for beep before speaking`);
+        }
+
+        // During beep-watch: keep listening for beep for up to 5s (250 frames)
+        if (this.waitingForBeepAfterSilence) {
+          this.beepWaitAfterSilenceFrames++;
+          // Beep detected during watch → resolve immediately (beep + silence already confirmed)
+          if (this.amdBeepReceived) {
+            console.log(`[vm-detect:${this.callId}] Beep detected during post-silence watch — resolving`);
+            this.resolve("voicemail");
+            return;
+          }
+          // 5s (250 frames) elapsed with no beep — resolve anyway
+          if (this.beepWaitAfterSilenceFrames >= 250) {
+            console.log(`[vm-detect:${this.callId}] No beep after 5s post-silence — resolving as voicemail`);
+            this.resolve("voicemail");
+            return;
+          }
         }
       }
 
