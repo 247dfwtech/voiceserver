@@ -305,8 +305,9 @@ class VoicemailDetector {
         this.speechFrameCount++;
       } else {
         this.silenceAfterSpeechFrames++;
-        // After hearing speech then 60+ frames of silence (1.2s) → greeting ended, beep likely passed
-        if (this.speechFrameCount > 50 && this.silenceAfterSpeechFrames > 60) {
+        // After hearing speech then 125+ frames of silence (2.5s) → greeting ended, beep likely passed
+        // Was 60 frames (1.2s) but mid-greeting pauses (1-2s) caused premature resolution
+        if (this.speechFrameCount > 50 && this.silenceAfterSpeechFrames > 125) {
           this.resolve("voicemail");
           return;
         }
