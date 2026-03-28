@@ -1020,9 +1020,22 @@ export class CallSession extends EventEmitter {
   private checkTriggerPhrases(text: string): void {
     if (!this.config.triggerPhrases || this.config.triggerPhrases.length === 0) return;
     const lower = text.toLowerCase();
+    // Find the trigger phrase that appears earliest in the response text
+    // (not earliest in array) so "we'll give you a callback. Have a wonderful day"
+    // correctly triggers callback, not endCall
+    let bestMatch: typeof this.config.triggerPhrases[0] | null = null;
+    let bestIndex = lower.length;
     for (const tp of this.config.triggerPhrases) {
-      if (lower.includes(tp.phrase.toLowerCase())) {
-        console.log(`[session:${this.config.callId}] Trigger phrase matched: "${tp.phrase}" → ${tp.toolName}`);
+      const idx = lower.indexOf(tp.phrase.toLowerCase());
+      if (idx >= 0 && idx < bestIndex) {
+        bestIndex = idx;
+        bestMatch = tp;
+      }
+    }
+    if (bestMatch) {
+      const tp = bestMatch;
+      {
+        console.log(`[session:${this.config.callId}] Trigger phrase matched: "${tp.phrase}" → ${tp.toolName} (position ${bestIndex})`);
         // Find the tool definition
         const tool = this.config.tools.find(t => t.name === tp.toolName || t.type === tp.toolName);
         if (tool) {
@@ -1054,7 +1067,6 @@ export class CallSession extends EventEmitter {
             this.emit("transfer", { destination: this.config.fallbackDestination });
           });
         }
-        return; // Only trigger the first match
       }
     }
   }

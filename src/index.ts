@@ -1551,18 +1551,26 @@ function handleIPC(req: IncomingMessage, res: ServerResponse): void {
 
           if (useTriggerPhrases && triggerPhrases && triggerPhrases.length > 0) {
             const lower = reply.toLowerCase();
+            // Find trigger phrase that appears earliest in the response text
+            // (not earliest in array) so correct tool fires when multiple phrases match
+            let bestTp: any = null;
+            let bestIdx = lower.length;
             for (const tp of triggerPhrases) {
-              if (lower.includes(tp.phrase.toLowerCase())) {
-                console.log(`[test-chat] Trigger phrase matched: "${tp.phrase}" → ${tp.toolName}`);
-                const tool = safeTools.find((t: any) => t.name === tp.toolName || t.type === tp.toolName);
-                if (tool) {
-                  responseToolCalls.push({ name: tool.name || tp.toolName, action: tool.type === "endCall" ? "endCall" : tool.type === "transferCall" ? "transfer" : tool.type === "dtmf" ? "dtmf" : "function" });
-                } else if (tp.toolName === "end_call" || tp.toolName === "endCall") {
-                  responseToolCalls.push({ name: "end_call", action: "endCall" });
-                } else if (tp.toolName === "transfer" || tp.toolName === "transferCall") {
-                  responseToolCalls.push({ name: "transferCall", action: "transfer" });
-                }
-                break; // Only first match
+              const idx = lower.indexOf(tp.phrase.toLowerCase());
+              if (idx >= 0 && idx < bestIdx) {
+                bestIdx = idx;
+                bestTp = tp;
+              }
+            }
+            if (bestTp) {
+              console.log(`[test-chat] Trigger phrase matched: "${bestTp.phrase}" → ${bestTp.toolName} (position ${bestIdx})`);
+              const tool = safeTools.find((t: any) => t.name === bestTp.toolName || t.type === bestTp.toolName);
+              if (tool) {
+                responseToolCalls.push({ name: tool.name || bestTp.toolName, action: tool.type === "endCall" ? "endCall" : tool.type === "transferCall" ? "transfer" : tool.type === "dtmf" ? "dtmf" : "function" });
+              } else if (bestTp.toolName === "end_call" || bestTp.toolName === "endCall") {
+                responseToolCalls.push({ name: "end_call", action: "endCall" });
+              } else if (bestTp.toolName === "transfer" || bestTp.toolName === "transferCall") {
+                responseToolCalls.push({ name: "transferCall", action: "transfer" });
               }
             }
           }
