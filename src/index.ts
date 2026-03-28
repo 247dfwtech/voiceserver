@@ -238,8 +238,37 @@ wss.on("connection", (ws: WebSocket) => {
               console.log(`[voice-server] [${callId}] Transfer already initiated, skipping duplicate`);
               return;
             }
+            // Mark transfer immediately so stream-stop uses "call-forwarded" even if
+            // the async transferCallWithDial hasn't resolved yet (race condition fix)
+            if (existingEntry) existingEntry.transferInitiated = true;
             const callProvider = config.provider || "twilio";
-            console.log(`[voice-server] [${callId}] Transfer requested (${callProvider}), destination=${transferData.destination || "NONE"}`);
+            console.log(`[voice-server] [${callId}] Transfer requested (${callProvider}), destination=${transferData.destination || "NONE"} — marked as transferred`);
+
+            // Notify vapiclone immediately so dialer4clone can trigger auto phone lookup
+            // while the customer's phone is still ringing (real-time, not post-call)
+            if (VAPICLONE_API_URL) {
+              fetch(`${VAPICLONE_API_URL}/api/webhooks/call-events`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${VAPICLONE_API_KEY}`,
+                  ...(IPC_SECRET ? { "x-ipc-secret": IPC_SECRET } : {}),
+                },
+                body: JSON.stringify({
+                  type: "transfer-initiated",
+                  callId,
+                  data: {
+                    customerNumber: config.customerNumber,
+                    customerName: config.customerName,
+                    subuserName: (config.metadata as Record<string, unknown>)?.subuserName || "",
+                    assistantId: config.assistantId,
+                    serverUrl: config.serverUrl,
+                    destination: transferData.destination,
+                  },
+                }),
+                signal: AbortSignal.timeout(5000),
+              }).catch((err) => console.error(`[voice-server] [${callId}] Transfer notification failed:`, err.message));
+            }
             if (transferData.destination) {
               try {
                 const providerCallSid = msg.start?.callSid;
@@ -256,9 +285,6 @@ wss.on("connection", (ws: WebSocket) => {
                     console.error(`[voice-server] [${callId}] Transfer failed:`, result.error);
                   } else {
                     console.log(`[voice-server] [${callId}] Transfer initiated successfully`);
-                    // Mark transfer so stream-stop uses "call-forwarded" instead of "customer-ended-call"
-                    const transferEntry = callId ? sessions.get(callId) : undefined;
-                    if (transferEntry) transferEntry.transferInitiated = true;
                   }
                 } else {
                   console.error(`[voice-server] [${callId}] Transfer failed: no callSid from ${callProvider}`);
