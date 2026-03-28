@@ -294,12 +294,12 @@ class VoicemailDetector {
       // Task 5: Direct beep frequency detection
       // Only consider beep valid after 100+ speech frames (~2s of speech heard) —
       // prevents false positives from ring tones / early call noise.
-      // Real voicemail beeps are sustained tones (~0.5-1s), so require 15+ consecutive
-      // beep frames (300ms) to filter out single-frame blips from speech harmonics.
+      // Real voicemail beeps are sustained tones (~0.5-1s), so require 10+ consecutive
+      // beep frames (200ms) to filter out single-frame blips from speech harmonics.
       if (!this.amdBeepReceived && this.speechFrameCount >= 100) {
         if (detectBeep(pcmAudio)) {
           this.consecutiveBeepFrames++;
-          if (this.consecutiveBeepFrames >= 15) {
+          if (this.consecutiveBeepFrames >= 10) {
             this.amdBeepReceived = true;
             console.log(`[vm-detect:${this.callId}] Beep tone confirmed (${this.consecutiveBeepFrames} consecutive frames, after ${this.speechFrameCount} speech frames)`);
           }
@@ -331,10 +331,10 @@ class VoicemailDetector {
         if (this.speechFrameCount > 50 && this.silenceAfterSpeechFrames > 125 && !this.waitingForBeepAfterSilence) {
           this.waitingForBeepAfterSilence = true;
           this.beepWaitAfterSilenceFrames = 0;
-          console.log(`[vm-detect:${this.callId}] Greeting ended (2.5s silence) — waiting up to 5s for beep before speaking`);
+          console.log(`[vm-detect:${this.callId}] Greeting ended (2.5s silence) — waiting up to 2s for beep before speaking`);
         }
 
-        // During beep-watch: keep listening for beep for up to 5s (250 frames)
+        // During beep-watch: keep listening for beep for up to 2s (100 frames)
         if (this.waitingForBeepAfterSilence) {
           this.beepWaitAfterSilenceFrames++;
           // Beep detected during watch → resolve immediately (beep + silence already confirmed)
@@ -343,9 +343,9 @@ class VoicemailDetector {
             this.resolve("voicemail");
             return;
           }
-          // 5s (250 frames) elapsed with no beep — resolve anyway
-          if (this.beepWaitAfterSilenceFrames >= 250) {
-            console.log(`[vm-detect:${this.callId}] No beep after 5s post-silence — resolving as voicemail`);
+          // 2s (100 frames) elapsed with no beep — resolve anyway
+          if (this.beepWaitAfterSilenceFrames >= 100) {
+            console.log(`[vm-detect:${this.callId}] No beep after 2s post-silence — resolving as voicemail`);
             this.resolve("voicemail");
             return;
           }
@@ -1602,7 +1602,7 @@ export class CallSession extends EventEmitter {
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
 
     if (this.config.voicemailMessage) {
-      // 1500ms pause after beep detected before speaking — ensures beep has fully passed
+      // 800ms pause after beep detected before speaking — ensures beep has fully passed
       setTimeout(async () => {
         if (this.state === "ended") return;
         console.log(`[session:${this.config.callId}] Delivering voicemail message`);
@@ -1621,7 +1621,7 @@ export class CallSession extends EventEmitter {
 
         // endCall guards against double-call internally
         this.endCall("voicemail");
-      }, 1500);
+      }, 800);
     } else {
       this.endCall("voicemail");
     }
