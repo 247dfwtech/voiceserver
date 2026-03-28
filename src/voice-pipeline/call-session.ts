@@ -476,6 +476,10 @@ class VoicemailDetector {
   }
 }
 
+// Per-dialer VM message counter — tracks actual VM detections for N/M ratio.
+// Resets on server restart (acceptable — minor drift, self-corrects quickly).
+const vmDialerCounters = new Map<string, number>();
+
 // ---- Session types ----
 
 type SessionState =
@@ -588,6 +592,9 @@ export class CallSession extends EventEmitter {
 
   // Ollama slot tracking — ensures slot is always released even if LLM onDone never fires
   private pendingOllamaRelease: (() => void) | null = null;
+
+  // No-response fallback: fires 8s after first message if user never speaks
+  private noResponseTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(config: CallSessionConfig) {
     super();
@@ -728,6 +735,19 @@ export class CallSession extends EventEmitter {
               this.state = "waiting_for_speech";
               this.resetSilenceTimer();
               console.log(`[session:${this.config.callId}] First message playback window ended (${estimatedPlaybackMs}ms)`);
+              // No-response fallback: if we confirmed "human" but get zero user speech
+              // for 8s after first message finishes, retroactively switch to voicemail.
+              if (this.voicemailDetector && this.config.voicemailMessage) {
+                this.noResponseTimer = setTimeout(() => {
+                  if (this.state === "ended" || this.deliveringVoicemail) return;
+                  const hasUserSpeech = this.fullTranscript.some(t => t.role === "User");
+                  if (!hasUserSpeech) {
+                    console.log(`[session:${this.config.callId}] No user speech 8s after first message — switching to voicemail`);
+                    this.cancelSpeaking();
+                    this.handleVoicemailDetected();
+                  }
+                }, 8000);
+              }
             }, estimatedPlaybackMs);
           }
           // If voicemail — handleVoicemailDetected() already handles the voicemail message
@@ -745,6 +765,19 @@ export class CallSession extends EventEmitter {
         this.state = "waiting_for_speech";
         this.resetSilenceTimer();
         console.log(`[session:${this.config.callId}] First message playback window ended (${estimatedPlaybackMs}ms)`);
+        // No-response fallback: if we confirmed "human" but get zero user speech
+        // for 8s after first message finishes, retroactively switch to voicemail.
+        if (this.voicemailDetector && this.config.voicemailMessage) {
+          this.noResponseTimer = setTimeout(() => {
+            if (this.state === "ended" || this.deliveringVoicemail) return;
+            const hasUserSpeech = this.fullTranscript.some(t => t.role === "User");
+            if (!hasUserSpeech) {
+              console.log(`[session:${this.config.callId}] No user speech 8s after first message — switching to voicemail`);
+              this.cancelSpeaking();
+              this.handleVoicemailDetected();
+            }
+          }, 8000);
+        }
       }, estimatedPlaybackMs);
       this.conversationHistory.push({ role: "assistant", content: firstMsg });
       this.fullTranscript.push({ role: "AI", content: firstMsg });
@@ -938,6 +971,12 @@ export class CallSession extends EventEmitter {
 
     // Reset STT error counter on successful transcription
     this.consecutiveSTTErrors = 0;
+
+    // Clear no-response timer on any user speech (even interim)
+    if (this.noResponseTimer) {
+      clearTimeout(this.noResponseTimer);
+      this.noResponseTimer = null;
+    }
 
     // Fallback: if detection resolved as "human" but transcript contains VM keywords,
     // retroactively treat as voicemail (catches short greetings the audio analyzer missed)
@@ -1593,36 +1632,39 @@ export class CallSession extends EventEmitter {
   private handleVoicemailDetected(): void {
     console.log(`[session:${this.config.callId}] Voicemail detected — delivering message after short pause`);
     this.emit("voicemail_detected");
-
-    // Cancel any ongoing speech (first message playing over greeting)
     this.cancelSpeaking();
-
-    // Disable silence timer — voicemail playback can be 30s+ and must not be interrupted
     this.deliveringVoicemail = true;
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
 
-    if (this.config.voicemailMessage) {
+    // --- N/M check: should we leave a voicemail message on this detection? ---
+    const vmN = (this.config as any).vmLeaveN ?? 0;
+    const vmM = (this.config as any).vmLeaveM ?? 1;
+    const dialerId = (this.config.metadata?.dialerId as string) || "default";
+    let shouldLeave = true; // Default: leave message if no N/M config
+
+    if (vmN > 0 && vmM >= 1) {
+      const count = vmDialerCounters.get(dialerId) || 0;
+      vmDialerCounters.set(dialerId, count + 1);
+      shouldLeave = count % vmM < vmN;
+      console.log(`[session:${this.config.callId}] VM N/M check: count=${count} N=${vmN} M=${vmM} → ${shouldLeave ? "LEAVE message" : "SKIP message"}`);
+    }
+
+    if (this.config.voicemailMessage && shouldLeave) {
       // 800ms pause after beep detected before speaking — ensures beep has fully passed
       setTimeout(async () => {
         if (this.state === "ended") return;
         console.log(`[session:${this.config.callId}] Delivering voicemail message`);
         this.speak(this.config.voicemailMessage!);
         this.fullTranscript.push({ role: "AI", content: `[Voicemail] ${this.config.voicemailMessage}` });
-
-        // Wait for TTS synthesis to finish AND for the audio to actually play on the phone.
-        // speak() sets isSpeaking=false when synthesis completes (~0.08s for Kokoro),
-        // but Twilio needs the full playback duration. pendingAudioDurationMs tracks the
-        // exact audio length — no artificial cap so any message length works.
-        // 2s buffer added for network latency between voiceserver and Twilio/SignalWire.
         await this.waitForTTSFinish(60000, 60000);
-        // Extra 2s buffer for network/jitter — audio may still be in transit
         await new Promise(r => setTimeout(r, 2000));
         console.log(`[session:${this.config.callId}] Voicemail message playback complete`);
-
-        // endCall guards against double-call internally
         this.endCall("voicemail");
       }, 800);
     } else {
+      if (this.config.voicemailMessage && !shouldLeave) {
+        console.log(`[session:${this.config.callId}] Skipping VM message (N/M ratio: ${vmN}/${vmM})`);
+      }
       this.endCall("voicemail");
     }
   }
@@ -1636,6 +1678,10 @@ export class CallSession extends EventEmitter {
     if (this.maxDurationTimer) clearTimeout(this.maxDurationTimer);
     if (this.endpointingTimer) clearTimeout(this.endpointingTimer);
     if (this.utteranceDelayTimer) clearTimeout(this.utteranceDelayTimer);
+    if (this.noResponseTimer) {
+      clearTimeout(this.noResponseTimer);
+      this.noResponseTimer = null;
+    }
 
     this.cancelSpeaking();
 
