@@ -291,9 +291,12 @@ class VoicemailDetector {
       const isSpeech = rms > this.speechThreshold;
 
       // Task 5: Direct beep frequency detection
-      if (!this.amdBeepReceived && detectBeep(pcmAudio)) {
+      // Only consider beep valid after 100+ speech frames (~2s of speech heard) —
+      // prevents false positives from ring tones / early call noise.
+      // Real voicemail beeps come AFTER the greeting (5-15s of speech).
+      if (!this.amdBeepReceived && this.speechFrameCount >= 100 && detectBeep(pcmAudio)) {
         this.amdBeepReceived = true;
-        console.log(`[vm-detect:${this.callId}] Beep tone detected via frequency analysis`);
+        console.log(`[vm-detect:${this.callId}] Beep tone detected via frequency analysis (after ${this.speechFrameCount} speech frames)`);
       }
 
       // If beep detected + now silence → resolve immediately
