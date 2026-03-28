@@ -183,6 +183,7 @@ class VoicemailDetector {
   private attemptsRemaining: number;
   private pendingMachineStart = false;
   private amdBeepReceived = false;
+  private consecutiveBeepFrames = 0;
   private beepWaitTimer: ReturnType<typeof setTimeout> | null = null;
   private silenceAfterSpeechFrames = 0;
   private waitingForBeepAfterSilence = false;
@@ -293,10 +294,18 @@ class VoicemailDetector {
       // Task 5: Direct beep frequency detection
       // Only consider beep valid after 100+ speech frames (~2s of speech heard) —
       // prevents false positives from ring tones / early call noise.
-      // Real voicemail beeps come AFTER the greeting (5-15s of speech).
-      if (!this.amdBeepReceived && this.speechFrameCount >= 100 && detectBeep(pcmAudio)) {
-        this.amdBeepReceived = true;
-        console.log(`[vm-detect:${this.callId}] Beep tone detected via frequency analysis (after ${this.speechFrameCount} speech frames)`);
+      // Real voicemail beeps are sustained tones (~0.5-1s), so require 15+ consecutive
+      // beep frames (300ms) to filter out single-frame blips from speech harmonics.
+      if (!this.amdBeepReceived && this.speechFrameCount >= 100) {
+        if (detectBeep(pcmAudio)) {
+          this.consecutiveBeepFrames++;
+          if (this.consecutiveBeepFrames >= 15) {
+            this.amdBeepReceived = true;
+            console.log(`[vm-detect:${this.callId}] Beep tone confirmed (${this.consecutiveBeepFrames} consecutive frames, after ${this.speechFrameCount} speech frames)`);
+          }
+        } else {
+          this.consecutiveBeepFrames = 0;
+        }
       }
 
       // If beep detected + now silence → resolve immediately
