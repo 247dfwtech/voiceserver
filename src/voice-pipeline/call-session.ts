@@ -522,6 +522,7 @@ export class CallSession extends EventEmitter {
   private currentLLMCancel: (() => void) | null = null;
   private isSpeaking = false;
   private deliveringVoicemail = false;
+  private isEndingCall = false;
 
   private costTracker: CostTracker;
   public voicemailDetector: VoicemailDetector | null = null;
@@ -544,6 +545,9 @@ export class CallSession extends EventEmitter {
   private overflowProvider: string | null = null;
   private overflowModel: string | null = null;
   private currentlyUsingOverflow = false; // true if the current/last LLM request used overflow
+
+  // Ollama slot tracking — ensures slot is always released even if LLM onDone never fires
+  private pendingOllamaRelease: (() => void) | null = null;
 
   constructor(config: CallSessionConfig) {
     super();
@@ -800,8 +804,9 @@ export class CallSession extends EventEmitter {
       `[session:${this.config.callId}] Switching to fallback STT: ${fallbackConfig.provider}/${fallbackConfig.model || "default"}`
     );
 
-    // Close current STT
+    // Close current STT — remove listeners first to prevent stale handler accumulation
     if (this.stt) {
+      this.stt.removeAllListeners();
       this.stt.close();
     }
 
@@ -1046,23 +1051,28 @@ export class CallSession extends EventEmitter {
             function: { name: tool.name || tp.toolName, arguments: "{}" },
           };
           this.waitForTTSFinish().then(async () => {
+            if (this.isEndingCall) return;
             // Extra buffer for network transit — audio may still be in Twilio/SignalWire buffer
             await new Promise(r => setTimeout(r, 1500));
+            if (this.isEndingCall) return;
             this.handleToolCall(toolCall);
           });
         } else if (tp.toolName === "end_call" || tp.toolName === "endCall") {
           // Built-in end call — wait for full TTS playback before hanging up
           this.waitForTTSFinish().then(async () => {
+            if (this.isEndingCall) return;
             // Wait for pending audio to play on the phone + network buffer
             const audioWait = Math.max(this.pendingAudioDurationMs + 2000, 1500);
             await new Promise(r => setTimeout(r, audioWait));
+            if (this.isEndingCall) return;
             this.endCall("assistant-ended-call");
           });
         } else if (tp.toolName === "transfer" || tp.toolName === "transferCall") {
           // Built-in transfer with fallback destination
           this.waitForTTSFinish().then(async () => {
-            if (this.state === "transferring") return; // Guard: prevent double transfer
+            if (this.isEndingCall || this.state === "transferring") return;
             await new Promise(r => setTimeout(r, 1500));
+            if (this.isEndingCall) return;
             this.state = "transferring";
             this.emit("transfer", { destination: this.config.fallbackDestination });
           });
@@ -1165,8 +1175,11 @@ export class CallSession extends EventEmitter {
       if (decrementOnComplete && !decremented) {
         decremented = true;
         decrementOllama();
+        this.pendingOllamaRelease = null;
       }
     };
+    // Track so endCall() can release even if onDone never fires
+    if (decrementOnComplete) this.pendingOllamaRelease = releaseOllamaSlot;
 
     const { cancel } = llmToUse.streamCompletion({
       messages: this.conversationHistory,
@@ -1222,7 +1235,7 @@ export class CallSession extends EventEmitter {
             content: "Respond naturally to the customer. Do not attempt to call any functions or tools. Just speak.",
           });
           // Direct LLM call with NO tools parameter at all
-          this.llm!.streamCompletion({
+          const retryResult = this.llm!.streamCompletion({
             messages: cleanMessages,
             onToken: (token: string) => {
               fullResponse += token;
@@ -1251,6 +1264,8 @@ export class CallSession extends EventEmitter {
               this.resetSilenceTimer();
             },
           });
+          // Store cancel so endCall() can abort this retry
+          this.currentLLMCancel = () => retryResult.cancel();
           return;
         }
 
@@ -1266,7 +1281,7 @@ export class CallSession extends EventEmitter {
             role: "system",
             content: "Respond naturally to the customer. Do not attempt to call any functions or tools. Just speak your response out loud.",
           });
-          this.llm!.streamCompletion({
+          const retryResult2 = this.llm!.streamCompletion({
             messages: cleanMessages,
             onToken: (token: string) => {
               fullResponse += token;
@@ -1289,9 +1304,11 @@ export class CallSession extends EventEmitter {
                 this.fullTranscript.push({ role: "AI", content: retryText });
               }
               // NOW execute the deferred tool (after text has been queued for TTS)
-              this.handleToolCall(savedToolCall);
+              if (this.state !== "ended") this.handleToolCall(savedToolCall);
             },
           });
+          // Store cancel so endCall() can abort this retry
+          this.currentLLMCancel = () => retryResult2.cancel();
           return;
         }
 
@@ -1571,7 +1588,8 @@ export class CallSession extends EventEmitter {
   }
 
   endCall(reason: string): void {
-    if (this.state === "ended") return;
+    if (this.state === "ended" || this.isEndingCall) return;
+    this.isEndingCall = true;
     this.state = "ended";
 
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
@@ -1581,7 +1599,16 @@ export class CallSession extends EventEmitter {
 
     this.cancelSpeaking();
 
-    if (this.stt) this.stt.close();
+    // Release Ollama slot if LLM was mid-stream (onDone never fired)
+    if (this.pendingOllamaRelease) {
+      this.pendingOllamaRelease();
+      this.pendingOllamaRelease = null;
+    }
+
+    if (this.stt) {
+      this.stt.removeAllListeners();
+      this.stt.close();
+    }
 
     const transcriptStr = this.fullTranscript
       .map((t) => `${t.role}: ${t.content}`)

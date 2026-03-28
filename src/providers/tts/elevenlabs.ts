@@ -157,8 +157,9 @@ export class ElevenLabsTTS implements TTSProvider {
         }
       } catch (err: any) {
         if (!cancelled && !controller.signal.aborted) {
-          console.error(`[tts/elevenlabs] Error: ${err.message}`);
-          onError?.(err);
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[tts/elevenlabs] Error: ${msg}`);
+          onError?.(err instanceof Error ? err : new Error(msg));
         }
       }
     })();

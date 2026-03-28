@@ -177,7 +177,7 @@ wss.on("connection", (ws: WebSocket) => {
 
           if (!callId) {
             console.error("[voice-server] No callId in stream parameters");
-            ws.close();
+            if (ws.readyState === WebSocket.OPEN) ws.close();
             return;
           }
 
@@ -202,9 +202,17 @@ wss.on("connection", (ws: WebSocket) => {
           const pendingEntry = pendingConfigs.get(callId);
           if (!pendingEntry) {
             console.error(`[voice-server] No pending config for callId=${callId}`);
-            ws.close();
+            if (ws.readyState === WebSocket.OPEN) ws.close();
             return;
           }
+
+          // Reject duplicate WS for same callId
+          if (sessions.has(callId)) {
+            console.error(`[voice-server] Session already exists for callId=${callId} — rejecting duplicate`);
+            if (ws.readyState === WebSocket.OPEN) ws.close(1008, "Session already active");
+            return;
+          }
+
           pendingConfigs.delete(callId);
           const config = pendingEntry.config;
 
