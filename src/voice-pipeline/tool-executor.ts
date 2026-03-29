@@ -130,6 +130,7 @@ export async function executeTool(
 
   // Function type -- call the webhook URL
   const url = toolDef.config?.url || toolDef.serverUrl;
+  console.log(`[tool-executor] Function tool "${toolCall.function.name}": url=${url || "NONE"}, config.url=${toolDef.config?.url || "NONE"}, serverUrl=${toolDef.serverUrl || "NONE"}`);
   if (!url) {
     return {
       toolCallId: toolCall.id,
@@ -180,6 +181,7 @@ export async function executeTool(
       },
     };
 
+    console.log(`[tool-executor] POSTing to ${url}...`);
     const response = await fetch(url, {
       method: toolDef.config?.method || "POST",
       headers: {
@@ -190,21 +192,27 @@ export async function executeTool(
       signal: AbortSignal.timeout(30000),
     });
 
+    console.log(`[tool-executor] Response: ${response.status} ${response.statusText}`);
+
     if (!response.ok) {
+      const errText = await response.text();
+      console.log(`[tool-executor] Error body: ${errText}`);
       return {
         toolCallId: toolCall.id,
         name: toolCall.function.name,
-        result: `Tool webhook returned ${response.status}: ${await response.text()}`,
+        result: `Tool webhook returned ${response.status}: ${errText}`,
       };
     }
 
     const data = await response.json();
+    console.log(`[tool-executor] Success: ${JSON.stringify(data)}`);
     return {
       toolCallId: toolCall.id,
       name: toolCall.function.name,
       result: typeof data === "string" ? data : JSON.stringify(data),
     };
   } catch (err) {
+    console.error(`[tool-executor] EXCEPTION for "${toolCall.function.name}": ${err instanceof Error ? err.message : String(err)}`);
     return {
       toolCallId: toolCall.id,
       name: toolCall.function.name,
