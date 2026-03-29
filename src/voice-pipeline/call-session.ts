@@ -201,6 +201,9 @@ class VoicemailDetector {
   private wordCountThreshold: number;
   private confidenceThreshold: number;
 
+  // Callback to notify CallSession when beep-wait phase starts (silence timer race fix)
+  private beepWaitStartCallback: (() => void) | null = null;
+
   private callId: string;
 
   constructor(config: {
@@ -332,6 +335,8 @@ class VoicemailDetector {
           this.waitingForBeepAfterSilence = true;
           this.beepWaitAfterSilenceFrames = 0;
           console.log(`[vm-detect:${this.callId}] Greeting ended (2.5s silence) — waiting up to 2s for beep before speaking`);
+          // Notify CallSession to pause silence timer during beep-watch phase
+          if (this.beepWaitStartCallback) this.beepWaitStartCallback();
         }
 
         // During beep-watch: keep listening for beep for up to 2s (100 frames)
@@ -460,6 +465,7 @@ class VoicemailDetector {
   isResolved(): boolean { return this.resolved; }
   getCurrentResult(): VMDetectionResult { return this.result; }
   forceResult(result: VMDetectionResult): void { this.resolve(result); }
+  onBeepWaitStart(cb: () => void): void { this.beepWaitStartCallback = cb; }
 
   /** Handle AMD result that arrives after construction (via /amd-result endpoint) */
   forceAmdResult(answeredBy: string): void {
@@ -675,6 +681,17 @@ export class CallSession extends EventEmitter {
         callId: this.config.callId,
       });
 
+      // Pause silence timer when VM detector enters beep-wait phase (race condition fix:
+      // the 20s silence timer can fire mid-beep-wait, killing calls the VM detector already
+      // identified as voicemail but hasn't formally resolved yet)
+      this.voicemailDetector.onBeepWaitStart(() => {
+        if (this.silenceTimer) {
+          clearTimeout(this.silenceTimer);
+          this.silenceTimer = null;
+          console.log(`[session:${this.config.callId}] Silence timer paused — VM detector in beep-wait phase`);
+        }
+      });
+
       if (this.voicemailDetector.isResolved() && this.voicemailDetector.getCurrentResult() === "voicemail") {
         await sttReady; // Ensure STT is ready before returning
         this.handleVoicemailDetected();
@@ -685,6 +702,10 @@ export class CallSession extends EventEmitter {
         this.voicemailDetector.getResult().then((result) => {
           if (result === "voicemail" && this.state !== "ended") {
             this.handleVoicemailDetected();
+          } else if (result === "human" && this.state !== "ended" && !this.silenceTimer) {
+            // Re-arm silence timer after beep-wait phase cleared it (race condition fix)
+            this.resetSilenceTimer();
+            console.log(`[session:${this.config.callId}] Silence timer re-armed after VM human resolution`);
           }
         });
       }
