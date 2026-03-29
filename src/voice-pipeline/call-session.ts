@@ -1145,10 +1145,15 @@ export class CallSession extends EventEmitter {
         const tool = this.config.tools.find(t => t.name === tp.toolName || t.type === tp.toolName);
         if (tool) {
           // Synthesize a tool call — wait for TTS to finish so caller hears the phrase
+          // Include recent transcript for webhook context (useful for callback tools etc.)
+          const recentTranscript = this.conversationHistory
+            .filter(m => m.role === "user" || m.role === "assistant")
+            .slice(-6)
+            .map(m => ({ role: m.role, content: m.content }));
           const toolCall: LLMToolCall = {
             id: `trigger-${Date.now()}`,
             type: "function",
-            function: { name: tool.name || tp.toolName, arguments: "{}" },
+            function: { name: tool.name || tp.toolName, arguments: JSON.stringify({ transcript: recentTranscript }) },
           };
           this.waitForTTSFinish().then(async () => {
             if (this.isEndingCall) return;
