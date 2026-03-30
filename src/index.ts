@@ -17,7 +17,7 @@ dotenvConfig({ override: true }); // Load .env file, override PM2-injected empty
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { CallSession, type CallSessionConfig, type CostBreakdown } from "./voice-pipeline/call-session";
-import { runPostCallAnalysis } from "./voice-pipeline/analysis-runner";
+import { runPostCallAnalysis, hasCustomerSpeech } from "./voice-pipeline/analysis-runner";
 import { transferCallWithDial } from "./voice-pipeline/call-transfer";
 import { getOllamaActiveRequests, getOllamaMaxParallel, incrementOllama, decrementOllama } from "./ollama-concurrency";
 import { createLLMProvider, createTTSProvider } from "./providers";
@@ -290,7 +290,11 @@ wss.on("connection", (ws: WebSocket) => {
                     provider: callProvider as "twilio" | "signalwire",
                   });
                   if (!result.success) {
-                    console.error(`[voice-server] [${callId}] Transfer failed:`, result.error);
+                    if (result.error?.startsWith("transfer-missed")) {
+                      console.log(`[voice-server] [${callId}] Transfer missed — customer left before redirect`);
+                    } else {
+                      console.error(`[voice-server] [${callId}] Transfer failed:`, result.error);
+                    }
                   } else {
                     console.log(`[voice-server] [${callId}] Transfer initiated successfully`);
                   }
@@ -430,6 +434,9 @@ async function notifyCallEnded(
     console.log(`[analysis] Skipped for ${callId}: endedReason=${endData.endedReason} (in skip list)`);
   } else if (!hasRealConversation) {
     console.log(`[analysis] Skipped for ${callId}: no real conversation (${lineCount} lines)`);
+  } else if (!hasCustomerSpeech(endData.transcript)) {
+    console.log(`[analysis] Skipped for ${callId}: no customer speech in transcript`);
+    analysis = { summary: "No customer response captured", successEvaluation: "Fail" };
   } else {
     try {
       analysis = await runPostCallAnalysis(endData.transcript, analysisConfig);

@@ -101,6 +101,11 @@ export async function transferCallWithDial(opts: TransferOptions): Promise<{ suc
     return { success: true };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    // Twilio timing race: customer hung up before redirect could execute
+    if (message.includes("not in-progress") || message.includes("Cannot redirect")) {
+      console.log(`[call-transfer] Transfer missed (${opts.provider || "twilio"}): customer already left — ${message}`);
+      return { success: false, error: `transfer-missed: ${message}` };
+    }
     console.error(`[call-transfer] Dial transfer failed (${opts.provider || "twilio"}):`, message);
     return { success: false, error: message };
   }

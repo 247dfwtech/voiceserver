@@ -1631,13 +1631,28 @@ export class CallSession extends EventEmitter {
       return;
     }
 
-    // Feed tool result back to LLM
+    // Feed tool result back to LLM — but skip if call is ending
+    if (this.isEndingCall || this.state === "ended") return;
+
     this.conversationHistory.push({
       role: "tool",
       content: result.result,
       tool_call_id: toolCall.id,
       name: toolCall.function.name,
     });
+
+    // Don't re-dispatch to LLM if the AI already said a closing phrase
+    // (prevents double response when callback tool fires alongside endCall phrase)
+    const lastAiMsg = this.fullTranscript.filter((m: any) => m.role === "AI").pop();
+    const closingPhrases = (this.config.endCallPhrases || []).map((p: string) => p.toLowerCase());
+    const hasClosingPhrase = lastAiMsg && closingPhrases.some((p: string) => lastAiMsg.content.toLowerCase().includes(p));
+    if (hasClosingPhrase) {
+      console.log(`[session:${this.config.callId}] Suppressing LLM re-dispatch — closing phrase detected after tool execution`);
+      await this.waitForTTSFinish();
+      await new Promise(r => setTimeout(r, 1500));
+      this.endCall("assistant-ended-call");
+      return;
+    }
 
     this.processWithLLM();
   }
@@ -1683,6 +1698,11 @@ export class CallSession extends EventEmitter {
         this.speak(this.config.voicemailMessage!);
         this.fullTranscript.push({ role: "AI", content: `[Voicemail] ${this.config.voicemailMessage}` });
         await this.waitForTTSFinish(60000, 60000);
+        // Close STT immediately to prevent hearing VM system prompts (P1-5 fix)
+        if (this.stt) {
+          try { this.stt.removeAllListeners(); this.stt.close(); } catch {}
+          this.stt = null;
+        }
         await new Promise(r => setTimeout(r, 2000));
         console.log(`[session:${this.config.callId}] Voicemail message playback complete`);
         this.endCall("voicemail");

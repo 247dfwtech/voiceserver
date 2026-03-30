@@ -134,6 +134,30 @@ function createLocalClient(): { client: OpenAI; model: string } | null {
   };
 }
 
+/** Check if transcript contains actual customer speech (not just VM system prompts). */
+export function hasCustomerSpeech(transcript: string): boolean {
+  if (!transcript) return false;
+  const VM_SYSTEM_PHRASES = [
+    "at the tone",
+    "please leave your message",
+    "please record your message",
+    "the person you are trying to reach",
+    "the mailbox is full",
+    "press pound",
+    "leave a message",
+  ];
+  const lines = transcript.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("User:") || trimmed.startsWith("Human:")) {
+      const content = trimmed.replace(/^(User|Human):\s*/, "").toLowerCase();
+      if (VM_SYSTEM_PHRASES.some((phrase) => content.includes(phrase))) continue;
+      if (content.length > 0) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Run post-call analysis: generate summary and success evaluation using LLM.
  *
@@ -202,7 +226,7 @@ export async function runPostCallAnalysis(
     try {
       const prompt =
         config.summaryPrompt ||
-        "Summarize the following phone call transcript in 2-3 sentences. Focus on what was discussed and the outcome.";
+        "Summarize the following phone call transcript in 1-2 sentences. Focus on the customer's bill status and outcome. If the transcript shows no customer speech or only the AI's message, return exactly: 'No customer response captured'. Do NOT invent hypothetical scenarios or possible outcomes.";
 
       const completion = await client.chat.completions.create({
         model,
@@ -227,7 +251,7 @@ export async function runPostCallAnalysis(
       const rubric = config.successEvaluationRubric || "PassFail";
       const prompt =
         config.successEvaluationPrompt ||
-        `Evaluate the success of this phone call based on the transcript. Return ONLY "${rubric === "PassFail" ? "Pass" : "1-10"}" or "${rubric === "PassFail" ? "Fail" : "a number"}" with no explanation.`;
+        `Evaluate this phone call transcript. Default to Fail. Only return Pass if the transcript clearly shows ONE of: (1) customer confirmed electric bills are under $100, (2) customer was successfully transferred to a live agent, (3) customer explicitly expressed satisfaction. If the transcript is ambiguous, incomplete, or shows no customer response, return Fail. Return ONLY "${rubric === "PassFail" ? "Pass" : "1-10"}" or "${rubric === "PassFail" ? "Fail" : "a number"}" with no explanation.`;
 
       const completion = await client.chat.completions.create({
         model,
