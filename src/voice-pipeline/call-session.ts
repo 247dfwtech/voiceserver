@@ -334,12 +334,13 @@ class VoicemailDetector {
         if (this.speechFrameCount > 50 && this.silenceAfterSpeechFrames > 125 && !this.waitingForBeepAfterSilence) {
           this.waitingForBeepAfterSilence = true;
           this.beepWaitAfterSilenceFrames = 0;
-          console.log(`[vm-detect:${this.callId}] Greeting ended (2.5s silence) — waiting up to 2s for beep before speaking`);
+          console.log(`[vm-detect:${this.callId}] Greeting ended (2.5s silence) — waiting up to 4s for beep before speaking`);
           // Notify CallSession to pause silence timer during beep-watch phase
           if (this.beepWaitStartCallback) this.beepWaitStartCallback();
         }
 
-        // During beep-watch: keep listening for beep for up to 2s (100 frames)
+        // During beep-watch: keep listening for beep for up to 4s (200 frames)
+        // (was 2s/100 frames — extended to catch delayed carrier beeps from complex IVRs)
         if (this.waitingForBeepAfterSilence) {
           this.beepWaitAfterSilenceFrames++;
           // Beep detected during watch → resolve immediately (beep + silence already confirmed)
@@ -348,9 +349,9 @@ class VoicemailDetector {
             this.resolve("voicemail");
             return;
           }
-          // 2s (100 frames) elapsed with no beep — resolve anyway
-          if (this.beepWaitAfterSilenceFrames >= 100) {
-            console.log(`[vm-detect:${this.callId}] No beep after 2s post-silence — resolving as voicemail`);
+          // 4s (200 frames) elapsed with no beep — resolve anyway
+          if (this.beepWaitAfterSilenceFrames >= 200) {
+            console.log(`[vm-detect:${this.callId}] No beep after 4s post-silence — resolving as voicemail`);
             this.resolve("voicemail");
             return;
           }
@@ -602,6 +603,13 @@ export class CallSession extends EventEmitter {
   // No-response fallback: fires 8s after first message if user never speaks
   private noResponseTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Repetition detection: tracks last LLM response to detect loops
+  private lastLLMResponse = "";
+  private consecutiveRepeatCount = 0;
+
+  // Double-message prevention: true if first message was already spoken after human detection
+  private humanDetectedFirstMessageDelivered = false;
+
   constructor(config: CallSessionConfig) {
     super();
     this.config = config;
@@ -746,6 +754,7 @@ export class CallSession extends EventEmitter {
           if (result === "human" && this.state !== "ended") {
             console.log(`[session:${this.config.callId}] Human confirmed — delivering first message`);
             deliverFirstMessage();
+            this.humanDetectedFirstMessageDelivered = true;
             this.conversationHistory.push({ role: "assistant", content: firstMsg });
             this.fullTranscript.push({ role: "AI", content: firstMsg });
             const estimatedPlaybackMs = Math.max(firstMsg.length * 60, 5000);
@@ -1098,6 +1107,20 @@ export class CallSession extends EventEmitter {
     this.speechStartedAt = null;
     this.interimWordCount = 0;
 
+    // Filter noise/garbage STT transcripts that aren't meaningful speech.
+    // These cause LLM repetition loops — the LLM gets "." or random single words
+    // and regenerates its last response verbatim.
+    const words = userText.split(/\s+/).filter(Boolean);
+    const meaningfulKeywords = new Set(["yes", "yeah", "no", "nah", "hello", "hi", "hey", "okay", "ok", "sure", "stop", "transfer", "help", "what", "who", "why", "how", "bye"]);
+    const isNoise = /^[.\-*#\s]+$/.test(userText) ||
+      (words.length === 1 && userText.length <= 4 && !meaningfulKeywords.has(userText.toLowerCase()));
+    if (isNoise) {
+      console.log(`[session:${this.config.callId}] Noise input filtered: "${userText}"`);
+      this.state = "waiting_for_speech";
+      this.resetSilenceTimer();
+      return;
+    }
+
     this.state = "processing";
     this.fullTranscript.push({ role: "User", content: userText });
     this.conversationHistory.push({ role: "user", content: userText });
@@ -1420,6 +1443,23 @@ export class CallSession extends EventEmitter {
         if (remaining && !this.isSpeaking) {
           this.speak(remaining);
         }
+
+        // Repetition detection: if the LLM produces the same response consecutively,
+        // the "customer" isn't engaging (likely noise/VM misclassified as human).
+        // End the call after 2 consecutive identical responses.
+        if (text && text === this.lastLLMResponse) {
+          this.consecutiveRepeatCount++;
+          if (this.consecutiveRepeatCount >= 2) {
+            console.log(`[session:${this.config.callId}] LLM repeated same response ${this.consecutiveRepeatCount + 1}x — ending call (likely noise/undetected VM)`);
+            this.cancelSpeaking();
+            this.endCall("silence-timed-out");
+            return;
+          }
+        } else {
+          this.consecutiveRepeatCount = 0;
+        }
+        if (text) this.lastLLMResponse = text;
+
         if (text) {
           this.conversationHistory.push({ role: "assistant", content: text });
           this.fullTranscript.push({ role: "AI", content: text });
@@ -1690,8 +1730,9 @@ export class CallSession extends EventEmitter {
       console.log(`[session:${this.config.callId}] VM N/M check: count=${count} N=${vmN} M=${vmM} → ${shouldLeave ? "LEAVE message" : "SKIP message"}`);
     }
 
-    if (this.config.voicemailMessage && shouldLeave) {
-      // 800ms pause after beep detected before speaking — ensures beep has fully passed
+    if (this.config.voicemailMessage && shouldLeave && !this.humanDetectedFirstMessageDelivered) {
+      // 1200ms pause after beep detected before speaking — ensures carrier IVR has finished
+      // (was 800ms, increased to handle carriers with delayed post-beep announcements)
       setTimeout(async () => {
         if (this.state === "ended") return;
         console.log(`[session:${this.config.callId}] Delivering voicemail message`);
@@ -1706,7 +1747,12 @@ export class CallSession extends EventEmitter {
         await new Promise(r => setTimeout(r, 2000));
         console.log(`[session:${this.config.callId}] Voicemail message playback complete`);
         this.endCall("voicemail");
-      }, 800);
+      }, 1200);
+    } else if (this.humanDetectedFirstMessageDelivered) {
+      // No-response fallback: first message was already spoken as the "human" conversation opener.
+      // Don't speak a SECOND voicemail message — the first message already serves as the VM drop.
+      console.log(`[session:${this.config.callId}] Skipping VM message (first message already delivered as human — avoiding double-message)`);
+      this.endCall("voicemail");
     } else {
       if (this.config.voicemailMessage && !shouldLeave) {
         console.log(`[session:${this.config.callId}] Skipping VM message (N/M ratio: ${vmN}/${vmM})`);
