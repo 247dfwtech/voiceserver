@@ -379,7 +379,15 @@ wss.on("connection", (ws: WebSocket) => {
           if (callId) {
             const entry = sessions.get(callId);
             if (entry) {
-              const reason = entry.transferInitiated ? "call-forwarded" : "customer-ended-call";
+              let reason: string;
+              if (entry.transferInitiated) {
+                reason = "call-forwarded";
+              } else {
+                // Check if this was a voicemail call — transcript contains [Voicemail] marker
+                // or session was in the middle of delivering a VM message
+                const transcript = entry.session.getTranscript();
+                reason = transcript.includes("[Voicemail]") ? "voicemail" : "customer-ended-call";
+              }
               console.log(`[voice-server] Stream stopped: callId=${callId} reason=${reason} (transferInitiated=${!!entry.transferInitiated})`);
               entry.session.endCall(reason);
             } else {

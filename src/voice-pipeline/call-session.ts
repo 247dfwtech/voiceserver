@@ -1121,6 +1121,27 @@ export class CallSession extends EventEmitter {
       return;
     }
 
+    // Detect VM system phrases in "user" speech — if the AI is talking to a voicemail
+    // system instead of a real person, end the call immediately instead of looping.
+    const VM_SYSTEM_HANGUP_PHRASES = [
+      "at the tone", "record your message", "press pound",
+      "please leave your message", "leave a message after",
+      "the mailbox is full", "is not available",
+      "the person you are trying to reach", "the person you are calling",
+      "record your name", "hang up or press",
+      "press one", "press two", "press three", "press four",
+      "to replay your message", "to continue recording",
+      "when you have finished recording", "to send a fax",
+    ];
+    const lowerUser = userText.toLowerCase();
+    if (VM_SYSTEM_HANGUP_PHRASES.some(phrase => lowerUser.includes(phrase))) {
+      console.log(`[session:${this.config.callId}] VM system phrase detected in user speech: "${userText}" — ending call as voicemail`);
+      this.fullTranscript.push({ role: "User", content: userText });
+      this.cancelSpeaking();
+      this.endCall("voicemail");
+      return;
+    }
+
     this.state = "processing";
     this.fullTranscript.push({ role: "User", content: userText });
     this.conversationHistory.push({ role: "user", content: userText });
